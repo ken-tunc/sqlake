@@ -11,3 +11,6 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true
