@@ -11,3 +11,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+sqlake-core.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+time = { workspace = true, features = ["macros"] }

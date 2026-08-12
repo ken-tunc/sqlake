@@ -1242,6 +1242,11 @@ version = "0.1.0"
 [[package]]
 name = "sqlake-app"
 version = "0.1.0"
+dependencies = [
+ "sqlake-core",
+ "time",
+ "unicode-width",
+]
 
 [[package]]
 name = "sqlake-core"
