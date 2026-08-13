@@ -754,8 +754,17 @@ Because `sqlake-driver-mock` exists, every other test runs with no database and 
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
 | **M7** | SQL templates (feature 7) | Save, parameter entry, insert from the palette |
 | **M8** | Query history (feature 8) | FTS search, re-run, promote to template |
-| **M9** | Agent surface: CLI and socket API | One-shot subcommands against both drivers with JSON output, attaching to a running session, generated schema, read-only by default. See [design-agent.md](design-agent.md) |
-| **M10** | Agent surface: MCP | `sqlake mcp` exposes the same operations as MCP tools |
+
+The agent surface (§9) runs as a track alongside these rather than after them, because each
+of its parts becomes possible at a different point:
+
+| # | Lands after | Content |
+| --- | --- | --- |
+| **A1** | M2 | Read-only CLI and socket API. Needs no terminal, and exercises `sqlake-app` through a second front-end while the interactive client is still half-written |
+| **A2** | M4 | Query execution over the API, where `ApprovedQuery` and the byte budget arrive |
+| **A3** | A2 | MCP server |
+
+Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
 
 **M0 determines the feel of everything else.** `HitMap`, the data grid and the staged types in
 §4 are all expensive to replace later, so they are the parts worth finishing properly first.

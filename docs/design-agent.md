@@ -186,17 +186,48 @@ on them — the TUI only needs to know how to start a listener, which is `sqlake
 
 ## 7. Milestones
 
-| # | Content | Done when |
-| --- | --- | --- |
-| **M9** | CLI and socket API | One-shot subcommands work against both drivers with JSON output; a running session can be attached to; `api schema` is generated from the types; read-only by default; truncation is explicit |
-| **M10** | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
+The agent surface does not arrive in one piece. Each part becomes possible at a different
+point, so it is **a track alongside M1–M8 rather than a milestone after them** — which also
+keeps M1–M8 aligned one-to-one with the eight features.
 
-**M9's read-only subset could be pulled forward to just after M2** — connection, schema and
-table listing plus preview need no TUI at all, and building them early would exercise
-`sqlake-app` end to end through a second front-end while the interactive client is still being
-written. Query execution has to wait for M4, since that is where `ApprovedQuery` arrives.
+| # | Lands after | Content | Done when |
+| --- | --- | --- | --- |
+| **A1** | M2 | Read-only CLI and socket API | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
+| **A2** | M4 | Query execution over the API | `query estimate\|run\|status\|wait\|cancel`, the byte budget and `NeedsApproval`, read-only enforcement, `issuer` in history |
+| **A3** | A2 | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
----
+Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
+
+A3 sitting before M5 is a preference, not a constraint; it can slide later if the interactive
+client turns out to want the attention more.
+
+### Why A1 lands after M2
+
+Nothing in A1 needs a terminal. Connecting, walking the object tree and reading a page of a
+relation are the three use cases M0 already builds, and M2 is the point at which the real
+drivers implement them. Preview is available then too: `Session::preview` exists from M0, and
+M3 is about the *interactive* preview — paging, sorting, cell detail, copying — not about
+whether a page of rows can be fetched.
+
+Building A1 there is worth more than the feature itself: it exercises `sqlake-app` end to end
+through a second front-end while the interactive client is still half-written. A layering
+mistake shows up as "the CLI cannot do this without reaching into the TUI", which is exactly
+the failure the architecture is meant to prevent, and it is much cheaper to hear about in M2
+than once eight milestones are built on top of it.
+
+It also front-loads the honest version of the store's headless story. `Store::spawn` is
+already used without a terminal by its own tests; A1 makes that a shipped path rather than a
+test-only one.
+
+### What pulling it forward forces
+
+**`api snapshot` prints a wire type, not `Snapshot`.** The internal snapshot holds `Instant`
+and `Arc<RenderedGrid>` — neither of which means anything on the far side of a socket — and
+deriving `Serialize` on it would make every future field change a protocol change. So
+`sqlake-api` owns a separate wire representation and the conversion into it.
+
+That decision would have been easy to get wrong by default. Making it in M2, before anything
+depends on the shape, is most of the reason to pull A1 forward at all.
 
 ## 8. Open questions
 
