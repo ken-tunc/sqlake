@@ -31,14 +31,17 @@ impl TerminalGuard {
     /// would take native text selection away from the user.
     pub fn enter(mouse: bool) -> io::Result<(Self, Tui)> {
         enable_raw_mode()?;
+        // The guard exists from the first mode change onwards, so every `?`
+        // below returns through its `Drop`. Constructing it only after the last
+        // step would leave the terminal in raw mode on the alternate screen
+        // whenever one of them failed.
+        let mut guard = Self { mouse: false };
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen, Hide)?;
         if mouse {
             execute!(out, EnableMouseCapture)?;
+            guard.mouse = true;
         }
-        // Constructed only after every step has succeeded, so a partial setup
-        // is undone by the `?` above rather than by a half-initialised guard.
-        let guard = Self { mouse };
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         Ok((guard, terminal))
     }
@@ -59,11 +62,18 @@ impl Drop for TerminalGuard {
 /// independently and the errors are reported, not acted on.
 pub fn restore(mouse: bool) -> io::Result<()> {
     let mut out = io::stdout();
-    if mouse {
-        execute!(out, DisableMouseCapture)?;
-    }
-    execute!(out, LeaveAlternateScreen, Show)?;
-    disable_raw_mode()
+    // Every step runs even when an earlier one failed, and the first error is
+    // returned afterwards. Short-circuiting on `?` here is how a terminal ends
+    // up left in raw mode: the one write that failed would take the rest of the
+    // teardown with it, on the path that runs while the process is panicking.
+    let capture = if mouse {
+        execute!(out, DisableMouseCapture)
+    } else {
+        Ok(())
+    };
+    let screen = execute!(out, LeaveAlternateScreen, Show);
+    let raw = disable_raw_mode();
+    capture.and(screen).and(raw)
 }
 
 /// Restore the terminal before the default hook prints anything.

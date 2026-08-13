@@ -38,6 +38,7 @@ impl From<Action> for Intent {
 pub enum ViewCmd {
     FocusPane(PaneId),
     FocusNextPane,
+    FocusPrevPane,
 
     /// Positive scrolls towards the end of the content.
     ScrollBy {
@@ -142,7 +143,9 @@ impl IntentKind {
     pub const fn of(intent: &Intent) -> Self {
         match intent {
             Intent::View(cmd) => match cmd {
-                ViewCmd::FocusPane(_) | ViewCmd::FocusNextPane => Self::Focus,
+                ViewCmd::FocusPane(_) | ViewCmd::FocusNextPane | ViewCmd::FocusPrevPane => {
+                    Self::Focus
+                }
                 ViewCmd::ScrollBy { .. } | ViewCmd::ScrollToRatio { .. } => Self::Scroll,
                 ViewCmd::ScrollToStart(_) | ViewCmd::ScrollToEnd(_) => Self::ScrollEdge,
                 ViewCmd::ScrollXBy { .. } => Self::ScrollHorizontally,

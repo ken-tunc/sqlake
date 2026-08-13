@@ -15,8 +15,9 @@ use crate::hit::{HitMap, Target};
 /// Two clicks further apart than this are two clicks.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
 
-/// How far the pointer may drift between the two clicks of a double click.
-const DOUBLE_CLICK_SLOP: u16 = 1;
+/// How far the pointer may drift and still count as the same spot: between a
+/// press and its release, and between the two clicks of a double click.
+const POINTER_SLOP: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gesture {
@@ -27,6 +28,9 @@ pub enum Gesture {
     Click,
     DoubleClick,
     RightClick,
+    /// Emitted on press, like [`Gesture::RightClick`]: a middle button has no
+    /// drag or double-click meaning, so there is nothing to wait for.
+    MiddleClick,
     /// Movement since the last report, while a button is held.
     DragBy {
         dx: i16,
@@ -80,8 +84,14 @@ impl MouseState {
 
     /// Forget any in-flight press. Called when the layout changes underneath a
     /// drag, since the captured target may no longer mean anything.
+    ///
+    /// The remembered click goes too: a `Target` carries an index, and after
+    /// the layout moved, the same index is a different row. Keeping it would
+    /// turn the user's next single click into a double click on something they
+    /// only pointed at once.
     pub fn reset(&mut self) {
         self.pressed = None;
+        self.last_click = None;
         self.hover = None;
     }
 
@@ -104,12 +114,16 @@ impl MouseState {
                 .at(position)
                 .map(|t| vec![(t, Gesture::RightClick)])
                 .unwrap_or_default(),
+            MouseEventKind::Down(MouseButton::Middle) => map
+                .at(position)
+                .map(|t| vec![(t, Gesture::MiddleClick)])
+                .unwrap_or_default(),
             MouseEventKind::Moved => self.moved(position, map),
             MouseEventKind::ScrollDown => wheel(map, position, Gesture::Scroll(1)),
             MouseEventKind::ScrollUp => wheel(map, position, Gesture::Scroll(-1)),
             MouseEventKind::ScrollRight => wheel(map, position, Gesture::ScrollX(1)),
             MouseEventKind::ScrollLeft => wheel(map, position, Gesture::ScrollX(-1)),
-            // Middle and right releases, and drags with other buttons, carry
+            // Releases of the other buttons, and drags with them, carry
             // nothing this application acts on.
             _ => Vec::new(),
         }
@@ -149,7 +163,7 @@ impl MouseState {
         )]
     }
 
-    fn up(&mut self, _position: Position, now: Instant) -> Vec<(Target, Gesture)> {
+    fn up(&mut self, position: Position, now: Instant) -> Vec<(Target, Gesture)> {
         let Some(press) = self.pressed.take() else {
             // A release with no press: the button was already down when the
             // application started, or the press was reset under it.
@@ -157,9 +171,12 @@ impl MouseState {
         };
 
         let mut out = vec![(press.target, Gesture::Up)];
-        if press.moved {
-            // A drag is not a click. Emitting both would fire the row's action
-            // every time the user finished resizing something on it.
+        // A drag is not a click. Emitting both would fire the row's action
+        // every time the user finished resizing something on it — and a
+        // release that landed somewhere else is the same gesture reported by a
+        // terminal that sends presses and releases but no motion: pressing a
+        // button, changing your mind and letting go elsewhere must not press it.
+        if press.moved || !near(press.origin, position) {
             self.last_click = None;
             return out;
         }
@@ -218,7 +235,7 @@ fn narrow(v: i32) -> i16 {
 }
 
 fn near(a: Position, b: Position) -> bool {
-    a.x.abs_diff(b.x) <= DOUBLE_CLICK_SLOP && a.y.abs_diff(b.y) <= DOUBLE_CLICK_SLOP
+    a.x.abs_diff(b.x) <= POINTER_SLOP && a.y.abs_diff(b.y) <= POINTER_SLOP
 }
 
 #[cfg(test)]
@@ -404,6 +421,19 @@ mod tests {
     }
 
     #[test]
+    fn a_release_somewhere_else_is_not_a_click() {
+        // Terminals that report presses and releases but no motion never send
+        // a drag, so the release position is the only evidence that the user
+        // moved off the thing they pressed and let go somewhere else.
+        let (map, mut s, t) = (map(), MouseState::new(), t0());
+        s.feed(down(3, 0), &map, t);
+        assert_eq!(
+            s.feed(up(15, 1), &map, t),
+            [(Target::TreeRow { index: 0 }, Gesture::Up)]
+        );
+    }
+
+    #[test]
     fn a_release_without_a_press_is_ignored() {
         let (map, mut s, t) = (map(), MouseState::new(), t0());
         assert!(s.feed(up(3, 0), &map, t).is_empty());
@@ -495,5 +525,21 @@ mod tests {
         s.reset();
         assert!(s.feed(drag(9, 0), &map, t).is_empty());
         assert!(s.feed(up(9, 0), &map, t).is_empty());
+    }
+
+    #[test]
+    fn resetting_also_forgets_the_click_a_double_click_would_pair_with() {
+        // The row at index 0 after the reset is a different row: the tree was
+        // reloaded under the pointer. One more click on it is one click.
+        let (map, mut s, t) = (map(), MouseState::new(), t0());
+        s.feed(down(3, 0), &map, t);
+        s.feed(up(3, 0), &map, t);
+        s.reset();
+
+        let t2 = t + Duration::from_millis(50);
+        s.feed(down(3, 0), &map, t2);
+        let out = s.feed(up(3, 0), &map, t2);
+        assert!(out.contains(&(Target::TreeRow { index: 0 }, Gesture::Click)));
+        assert!(!out.contains(&(Target::TreeRow { index: 0 }, Gesture::DoubleClick)));
     }
 }

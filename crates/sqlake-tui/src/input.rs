@@ -219,6 +219,11 @@ pub struct InputContext<'a> {
     /// The connection the explorer is showing.
     pub connection: Option<ConnId>,
     pub tree_selection: Option<usize>,
+    /// The column of the selected grid cell. The keyboard equivalents of
+    /// clicking a header and dragging a column edge act on it, which is the
+    /// only thing that makes them equivalent: without it every key press would
+    /// sort and resize column zero whatever the user had selected.
+    pub grid_column: Option<usize>,
 }
 
 impl InputContext<'_> {
@@ -254,6 +259,16 @@ impl InputContext<'_> {
 pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec<Intent> {
     match (target, gesture) {
         (Target::Pane(pane), Gesture::Click) => vec![ViewCmd::FocusPane(pane).into()],
+        // The wheel over the part of a pane its content does not fill. Without
+        // this, a five-row result in a forty-row grid ignores the wheel
+        // everywhere below the last row.
+        (Target::Pane(pane), Gesture::Scroll(delta)) => vec![scroll(pane, delta)],
+        (Target::Pane(PaneId::Grid), Gesture::ScrollX(delta)) => vec![
+            ViewCmd::ScrollXBy {
+                delta: i32::from(delta),
+            }
+            .into(),
+        ],
 
         (Target::TreeRow { index }, Gesture::Click) => vec![
             ViewCmd::FocusPane(PaneId::Explorer).into(),
@@ -342,7 +357,11 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
         (Target::Splitter(split), Gesture::DoubleClick) => vec![ViewCmd::EvenSplit(split).into()],
 
         (Target::Tab(id), Gesture::Click) => vec![Action::SelectTab(id).into()],
-        (Target::TabClose(id), Gesture::Click) => vec![Action::CloseTab(id).into()],
+        (Target::TabClose(id), Gesture::Click)
+        // The operation matrix in design.md §6.5 offers middle-click as the
+        // second way to close a tab, and it is the one that does not require
+        // hitting a one-cell `×`.
+        | (Target::Tab(id), Gesture::MiddleClick) => vec![Action::CloseTab(id).into()],
 
         (Target::Button(ButtonId::Cancel(busy)), Gesture::Click) => {
             vec![Action::Cancel(busy).into()]
@@ -414,17 +433,20 @@ pub fn on_key(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
     }
 
     let context = ctx.key_context();
-    let bound = KEYMAP
-        .iter()
-        .filter(|b| b.context == context || b.context == Context::Global)
-        // A pane binding beats the global one for the same key, so `Esc` in a
-        // modal dismisses the modal rather than a toast behind it.
-        .find(|b| b.context == context && b.keys.iter().any(|k| k.matches(event)))
-        .or_else(|| {
-            KEYMAP
-                .iter()
-                .find(|b| b.context == Context::Global && b.keys.iter().any(|k| k.matches(event)))
-        });
+    let matching = |wanted: Context| {
+        KEYMAP
+            .iter()
+            .find(|b| b.context == wanted && b.keys.iter().any(|k| k.matches(event)))
+    };
+
+    // A pane binding beats the global one for the same key, so `Esc` in a modal
+    // dismisses the modal rather than a toast behind it. A modal is the one
+    // context with no fallback: it has the keyboard, so `q` behind a "discard
+    // these changes?" dialog must not quit instead of answering it.
+    let bound = matching(context).or_else(|| match context {
+        Context::Modal => None,
+        _ => matching(Context::Global),
+    });
 
     let Some(binding) = bound else {
         return Vec::new();
@@ -441,10 +463,14 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
     let backwards = matches!(
         event.code,
         KeyCode::Up | KeyCode::PageUp | KeyCode::Left | KeyCode::Home | KeyCode::BackTab
-    ) || matches!(event.code, KeyCode::Char('k' | 'K' | '<' | 'g' | '['));
+    ) || matches!(event.code, KeyCode::Char('h' | 'k' | 'K' | '<' | 'g' | '['));
 
     match kind {
-        IntentKind::Focus => vec![ViewCmd::FocusNextPane.into()],
+        IntentKind::Focus => vec![if backwards {
+            ViewCmd::FocusPrevPane.into()
+        } else {
+            ViewCmd::FocusNextPane.into()
+        }],
         IntentKind::Scroll => {
             let magnitude = if matches!(event.code, KeyCode::PageUp | KeyCode::PageDown) {
                 PAGE_LINES
@@ -480,16 +506,13 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             }
             .into(),
         ],
-        IntentKind::ResizeColumn => {
-            let col = ctx.snapshot.active().map_or(0, |_| 0);
-            vec![
-                ViewCmd::ResizeColumn {
-                    col,
-                    delta: if backwards { -1 } else { 1 },
-                }
-                .into(),
-            ]
-        }
+        IntentKind::ResizeColumn => vec![
+            ViewCmd::ResizeColumn {
+                col: ctx.grid_column.unwrap_or(0),
+                delta: if backwards { -1 } else { 1 },
+            }
+            .into(),
+        ],
         IntentKind::MoveSplit => vec![
             ViewCmd::MoveSplit {
                 split: SplitId::Explorer,
@@ -515,7 +538,15 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .unwrap_or_default(),
         IntentKind::SortPreview => ctx
             .active_tab()
-            .map(|tab| vec![Action::SortPreview { tab, column: 0 }.into()])
+            .map(|tab| {
+                vec![
+                    Action::SortPreview {
+                        tab,
+                        column: ctx.grid_column.unwrap_or(0),
+                    }
+                    .into(),
+                ]
+            })
             .unwrap_or_default(),
         IntentKind::LoadMore => ctx
             .active_tab()
@@ -549,10 +580,14 @@ fn neighbouring_tab(ctx: &InputContext<'_>, backwards: bool) -> Option<TabId> {
     if tabs.is_empty() {
         return None;
     }
-    let current = ctx
+    let Some(current) = ctx
         .active_tab()
         .and_then(|id| tabs.iter().position(|t| t.id == id))
-        .unwrap_or(0);
+    else {
+        // Nothing is active — the last tab was just closed. Stepping from an
+        // assumed index 0 would skip the first tab entirely.
+        return tabs.first().map(|t| t.id);
+    };
     let next = if backwards {
         (current + tabs.len() - 1) % tabs.len()
     } else {
@@ -663,6 +698,7 @@ mod tests {
             modal_open: false,
             connection: snapshot.connections.first().map(|c| c.id),
             tree_selection: Some(0),
+            grid_column: Some(2),
         }
     }
 
@@ -869,6 +905,94 @@ mod tests {
         c.modal_open = true;
         // `s` sorts in the grid, but the grid is not what has the keyboard.
         assert!(on_key(press(KeyCode::Char('s')), &c).is_empty());
+        // And neither is the global map, which is where the dangerous ones are.
+        assert!(on_key(press(KeyCode::Char('q')), &c).is_empty());
+        assert!(on_key(press_ctrl(KeyCode::Char('c')), &c).is_empty());
+    }
+
+    #[test]
+    fn sorting_and_resizing_act_on_the_selected_column() {
+        // The mouse can sort any header and resize any edge. Bound to column
+        // zero, the keys would only look like the same capability.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char('s')), &c),
+            [Intent::App(Action::SortPreview {
+                tab: TabId::new(1),
+                column: 2
+            })]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('>')), &c),
+            [Intent::View(ViewCmd::ResizeColumn { col: 2, delta: 1 })]
+        );
+    }
+
+    #[test]
+    fn shift_tab_moves_focus_the_other_way() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Tab), &c),
+            [Intent::View(ViewCmd::FocusNextPane)]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::BackTab), &c),
+            [Intent::View(ViewCmd::FocusPrevPane)]
+        );
+        assert_eq!(
+            on_key(press_ctrl(KeyCode::Char('h')), &c),
+            [Intent::View(ViewCmd::FocusPrevPane)]
+        );
+    }
+
+    #[test]
+    fn a_middle_click_closes_the_tab_it_lands_on() {
+        // The operation matrix offers this as the second way to close a tab,
+        // and it is the one that does not require hitting a one-cell `×`.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        let tab = TabId::new(2);
+        assert_eq!(
+            on_mouse(Target::Tab(tab), Gesture::MiddleClick, &c),
+            [Intent::App(Action::CloseTab(tab))]
+        );
+        // A left click still selects rather than closes.
+        assert_eq!(
+            on_mouse(Target::Tab(tab), Gesture::Click, &c),
+            [Intent::App(Action::SelectTab(tab))]
+        );
+    }
+
+    #[test]
+    fn switching_tabs_with_nothing_active_lands_on_the_first_one() {
+        // The active tab was just closed. Stepping from an assumed index 0
+        // would skip the tab the user is looking at.
+        let mut snap = snapshot();
+        snap.active_tab = None;
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char(']')), &c),
+            [Intent::App(Action::SelectTab(TabId::new(1)))]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('[')), &c),
+            [Intent::App(Action::SelectTab(TabId::new(1)))]
+        );
+    }
+
+    #[test]
+    fn the_wheel_works_over_the_empty_part_of_a_pane() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_mouse(Target::Pane(PaneId::Explorer), Gesture::Scroll(1), &c),
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::Explorer,
+                delta: WHEEL_LINES
+            })]
+        );
     }
 
     #[test]
@@ -945,6 +1069,7 @@ mod tests {
             modal_open: false,
             connection: None,
             tree_selection: None,
+            grid_column: None,
         };
         for code in [
             KeyCode::Char('s'),
@@ -959,92 +1084,65 @@ mod tests {
 
     // ── the rule this whole module exists to keep ──────────────────────────
 
-    /// Exhaustive: adding a `Target` variant stops this compiling, which forces
-    /// the sample list below to grow with it.
-    const fn target_variant(target: &Target) -> u8 {
-        match target {
-            Target::Pane(_) => 0,
-            Target::TreeRow { .. } => 1,
-            Target::TreeToggle { .. } => 2,
-            Target::GridCell { .. } => 3,
-            Target::GridHeader { .. } => 4,
-            Target::GridColEdge { .. } => 5,
-            Target::Scrollbar { .. } => 6,
-            Target::Splitter(_) => 7,
-            Target::Tab(_) => 8,
-            Target::TabClose(_) => 9,
-            Target::Button(_) => 10,
-            Target::Toast(_) => 11,
-            Target::Backdrop => 12,
-        }
+    /// Declares the sample values for an enum next to an exhaustive match over
+    /// it, from one list.
+    ///
+    /// The samples have to be generated from the same arms that make the match
+    /// exhaustive. Counting variants against a literal instead would let a new
+    /// variant be given a match arm and no sample: the count would still equal
+    /// the literal, and the sweep below would silently stop covering it.
+    macro_rules! samples {
+        ($ty:ty, $all:ident, $exhaustive:ident, $($pattern:pat => [$($sample:expr),+ $(,)?]),+ $(,)?) => {
+            fn $all() -> Vec<$ty> {
+                vec![$($($sample),+),+]
+            }
+
+            /// Never called: it exists so that adding a variant stops this
+            /// module compiling until the arm — and therefore the sample —
+            /// is written.
+            #[allow(dead_code)]
+            const fn $exhaustive(value: &$ty) {
+                match value {
+                    $($pattern => ()),+
+                }
+            }
+        };
     }
 
-    const fn gesture_variant(gesture: &Gesture) -> u8 {
-        match gesture {
-            Gesture::Down => 0,
-            Gesture::Up => 1,
-            Gesture::Click => 2,
-            Gesture::DoubleClick => 3,
-            Gesture::RightClick => 4,
-            Gesture::DragBy { .. } => 5,
-            Gesture::Scroll(_) => 6,
-            Gesture::ScrollX(_) => 7,
-            Gesture::HoverEnter => 8,
-            Gesture::HoverLeave => 9,
-        }
+    samples! {
+        Target, all_targets, every_target_is_sampled,
+        Target::Pane(_) => [Target::Pane(PaneId::Grid), Target::Pane(PaneId::Explorer)],
+        Target::TreeRow { .. } => [Target::TreeRow { index: 0 }],
+        Target::TreeToggle { .. } => [Target::TreeToggle { index: 0 }],
+        Target::GridCell { .. } => [Target::GridCell { row: 0, col: 0 }],
+        Target::GridHeader { .. } => [Target::GridHeader { col: 0 }],
+        Target::GridColEdge { .. } => [Target::GridColEdge { col: 0 }],
+        Target::Scrollbar { .. } => [
+            Target::Scrollbar { pane: PaneId::Grid, part: ScrollPart::Thumb },
+            Target::Scrollbar { pane: PaneId::Grid, part: ScrollPart::TrackBefore },
+            Target::Scrollbar { pane: PaneId::Grid, part: ScrollPart::TrackAfter },
+        ],
+        Target::Splitter(_) => [Target::Splitter(SplitId::Explorer)],
+        Target::Tab(_) => [Target::Tab(TabId::new(1))],
+        Target::TabClose(_) => [Target::TabClose(TabId::new(1))],
+        Target::Button(_) => [Target::Button(ButtonId::Cancel(BusyId::new(1)))],
+        Target::Toast(_) => [Target::Toast(ToastId::new(1))],
+        Target::Backdrop => [Target::Backdrop],
     }
 
-    fn all_targets() -> Vec<Target> {
-        let mut targets = vec![
-            Target::Pane(PaneId::Grid),
-            Target::TreeRow { index: 0 },
-            Target::TreeToggle { index: 0 },
-            Target::GridCell { row: 0, col: 0 },
-            Target::GridHeader { col: 0 },
-            Target::GridColEdge { col: 0 },
-            Target::Splitter(SplitId::Explorer),
-            Target::Tab(TabId::new(1)),
-            Target::TabClose(TabId::new(1)),
-            Target::Button(ButtonId::Cancel(BusyId::new(1))),
-            Target::Toast(ToastId::new(1)),
-            Target::Backdrop,
-        ];
-        for part in [
-            ScrollPart::Thumb,
-            ScrollPart::TrackBefore,
-            ScrollPart::TrackAfter,
-        ] {
-            targets.push(Target::Scrollbar {
-                pane: PaneId::Grid,
-                part,
-            });
-        }
-
-        let covered: BTreeSet<_> = targets.iter().map(target_variant).collect();
-        assert_eq!(
-            covered.len(),
-            13,
-            "a Target variant is missing from the sample"
-        );
-        targets
-    }
-
-    fn all_gestures() -> Vec<Gesture> {
-        let gestures = vec![
-            Gesture::Down,
-            Gesture::Up,
-            Gesture::Click,
-            Gesture::DoubleClick,
-            Gesture::RightClick,
-            Gesture::DragBy { dx: 1, dy: 1 },
-            Gesture::Scroll(1),
-            Gesture::ScrollX(1),
-            Gesture::HoverEnter,
-            Gesture::HoverLeave,
-        ];
-        let covered: BTreeSet<_> = gestures.iter().map(gesture_variant).collect();
-        assert_eq!(covered.len(), 10, "a Gesture variant is missing");
-        gestures
+    samples! {
+        Gesture, all_gestures, every_gesture_is_sampled,
+        Gesture::Down => [Gesture::Down],
+        Gesture::Up => [Gesture::Up],
+        Gesture::Click => [Gesture::Click],
+        Gesture::DoubleClick => [Gesture::DoubleClick],
+        Gesture::RightClick => [Gesture::RightClick],
+        Gesture::MiddleClick => [Gesture::MiddleClick],
+        Gesture::DragBy { .. } => [Gesture::DragBy { dx: 1, dy: 1 }, Gesture::DragBy { dx: -1, dy: -1 }],
+        Gesture::Scroll(_) => [Gesture::Scroll(1), Gesture::Scroll(-1)],
+        Gesture::ScrollX(_) => [Gesture::ScrollX(1), Gesture::ScrollX(-1)],
+        Gesture::HoverEnter => [Gesture::HoverEnter],
+        Gesture::HoverLeave => [Gesture::HoverLeave],
     }
 
     #[test]
@@ -1085,6 +1183,76 @@ mod tests {
     fn every_key_binding_is_reachable_from_some_key() {
         for binding in KEYMAP {
             assert!(!binding.keys.is_empty(), "{:?} has no keys", binding.kind);
+        }
+    }
+
+    /// Every focus, selection and modal state a keystroke can be read in.
+    fn every_context(snap: &Snapshot) -> Vec<InputContext<'_>> {
+        let mut out = Vec::new();
+        for focus in [
+            PaneId::TabBar,
+            PaneId::Explorer,
+            PaneId::Grid,
+            PaneId::StatusBar,
+        ] {
+            for selection in [None, Some(0), Some(1)] {
+                for modal_open in [false, true] {
+                    let mut c = ctx(snap, focus);
+                    c.tree_selection = selection;
+                    c.modal_open = modal_open;
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_binding_produces_the_capability_it_claims() {
+        // The sweep above compares the set of kinds the mouse reaches against
+        // the set of kinds the map *names*. On its own that is satisfiable by a
+        // binding that names a kind and produces nothing — a key that is listed
+        // in the help and does not work. This closes that half.
+        let snap = snapshot();
+        let contexts = every_context(&snap);
+
+        for binding in KEYMAP {
+            for combo in binding.keys {
+                let event = KeyEvent::new(combo.code, combo.modifiers);
+                let works = contexts.iter().any(|c| {
+                    let intents = on_key(event, c);
+                    !intents.is_empty() && intents.iter().all(|i| IntentKind::of(i) == binding.kind)
+                });
+                assert!(
+                    works,
+                    "{:?} in {:?} never produces {:?}",
+                    combo.code, binding.context, binding.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_modal_leaves_no_key_bound_to_anything_else() {
+        // "A modal takes the keyboard over" is a claim about every key, not
+        // just the ones belonging to a pane: `q` behind a dialog must answer
+        // the dialog or do nothing, never quit.
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Grid);
+        c.modal_open = true;
+
+        for binding in KEYMAP {
+            for combo in binding.keys {
+                let event = KeyEvent::new(combo.code, combo.modifiers);
+                for intent in on_key(event, &c) {
+                    assert_eq!(
+                        IntentKind::of(&intent),
+                        IntentKind::DismissModal,
+                        "{:?} still reaches {intent:?} with a modal open",
+                        combo.code
+                    );
+                }
+            }
         }
     }
 
