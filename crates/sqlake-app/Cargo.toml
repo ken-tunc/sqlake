@@ -11,8 +11,12 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 serde_json.workspace = true
 sqlake-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
@@ -20,3 +24,4 @@ unicode-width.workspace = true
 # run against them here rather than against values written to suit it.
 sqlake-driver-mock.workspace = true
 time = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
