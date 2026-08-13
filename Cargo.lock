@@ -1309,14 +1309,12 @@ name = "sqlake-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "serde_json",
  "sqlake-core",
  "sqlake-driver-mock",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
- "unicode-width",
 ]
 
 [[package]]
@@ -1349,10 +1347,14 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "serde_json",
  "sqlake-app",
  "sqlake-core",
+ "sqlake-driver-mock",
+ "time",
  "tokio",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]

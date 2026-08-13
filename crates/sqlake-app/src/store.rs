@@ -23,7 +23,7 @@ use tokio::task::AbortHandle;
 
 use crate::action::{Action, BusyId, ToastId};
 use crate::error::{AppError, AppResult};
-use crate::grid::RenderedGrid;
+use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
     BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot,
@@ -179,7 +179,7 @@ struct Tab {
     /// The last page successfully loaded, never a page merely asked for.
     page: PageRequest,
     pending: Option<PendingPage>,
-    data: LoadState<Arc<RenderedGrid>>,
+    data: LoadState<Arc<PagedResult>>,
     loaded_rows: usize,
 }
 
@@ -681,27 +681,27 @@ impl Runtime {
 
             match result {
                 Ok(out) => {
-                    let grid = if pending.append {
+                    let rows = if pending.append {
                         match tab.data.ready() {
-                            Some(existing) => match existing.append(&out.grid) {
+                            Some(existing) => match existing.append(&out.result) {
                                 Some(merged) => merged,
                                 None => {
                                     toast = Some(format!(
                                         "{} changed shape; showing the new page only",
                                         tab.table
                                     ));
-                                    out.grid
+                                    PagedResult::new(&out.result)
                                 }
                             },
-                            None => out.grid,
+                            None => PagedResult::new(&out.result),
                         }
                     } else {
-                        out.grid
+                        PagedResult::new(&out.result)
                     };
                     tab.page = page;
-                    let grid = Arc::new(grid);
-                    tab.loaded_rows = grid.row_count();
-                    tab.data = LoadState::Ready(grid);
+                    let rows = Arc::new(rows);
+                    tab.loaded_rows = rows.row_count();
+                    tab.data = LoadState::Ready(rows);
                 }
                 Err(err) => {
                     let message = err.user_message();
@@ -1052,7 +1052,7 @@ mod tests {
         let grid = preview.data.ready().unwrap();
         for row in 0..grid.row_count() {
             assert_eq!(
-                grid.raw(row, 0),
+                grid.value(row, 0),
                 Some(&Value::Int(row as i64)),
                 "row {row} is not contiguous"
             );

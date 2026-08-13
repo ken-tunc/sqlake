@@ -1,11 +1,10 @@
-//! Fetch a page of a relation and prepare it for display.
+//! Fetch a page of a relation.
 
 use async_trait::async_trait;
 use sqlake_core::node::TableRef;
-use sqlake_core::result::PageRequest;
+use sqlake_core::result::{PageRequest, ResultSet};
 
 use crate::error::AppResult;
-use crate::grid::RenderedGrid;
 use crate::session::SessionHandle;
 use crate::usecase::UseCase;
 
@@ -24,8 +23,9 @@ pub struct PreviewTableInput {
 pub struct PreviewTableOutput {
     pub table: TableRef,
     pub page: PageRequest,
-    /// Already prepared for display: the UI never sees a `Value`.
-    pub grid: RenderedGrid,
+    /// The rows as the driver returned them. Preparing them for a screen is
+    /// the front-end's business, and the two front-ends disagree about it.
+    pub result: ResultSet,
 }
 
 #[async_trait]
@@ -41,7 +41,7 @@ impl UseCase for PreviewTable {
         Ok(PreviewTableOutput {
             table: input.table,
             page: input.page,
-            grid: RenderedGrid::new(result),
+            result,
         })
     }
 }
@@ -53,7 +53,6 @@ mod tests {
     use sqlake_driver_mock::{Behaviour, MockDriver};
 
     use super::*;
-    use crate::grid::Align;
 
     async fn use_case(behaviour: Behaviour) -> PreviewTable {
         let driver = MockDriver::new(behaviour);
@@ -73,9 +72,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(out.grid.row_count(), 50);
-        assert_eq!(out.grid.columns()[0].name, "id");
-        assert_eq!(out.grid.columns()[0].align, Align::Right);
+        assert_eq!(out.result.rows.len(), 50);
+        assert_eq!(out.result.columns[0].name, "id");
     }
 
     #[tokio::test]
@@ -93,8 +91,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(out.grid.row_count(), 100);
-        assert_eq!(out.grid.total_rows(), Some(200_000));
+        assert_eq!(out.result.rows.len(), 100);
+        assert_eq!(out.result.total_rows, Some(200_000));
     }
 
     #[tokio::test]
@@ -126,8 +124,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(out.grid.is_empty());
-        assert_eq!(out.grid.columns().len(), 2);
+        assert!(out.result.rows.is_empty());
+        assert_eq!(out.result.columns.len(), 2);
     }
 
     #[tokio::test]

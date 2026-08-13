@@ -12,7 +12,11 @@ These are load-bearing. Breaking one silently undoes a design decision.
   with `sqlake-driver-*` depending only on `sqlake-core`.
 - **No driver branching in the UI.** `if driver == Postgres` never appears in `sqlake-tui`.
   Express the difference as a field on `Capabilities` instead.
-- **The UI never sees `Value`.** It receives `RenderedGrid`, which formats cells on demand.
+- **Drawing code never sees `Value`.** It receives `RenderedGrid`, which formats cells on
+  demand. `sqlake-api` *does* see `Value`: an agent wants the document, not `{2 keys}`.
+- **Nothing in `sqlake-app` assumes a character-cell display.** No widths, no glyphs, no
+  elision. `sqlake-tui` and `sqlake-api` are peers over that layer and want opposite
+  renderings of the same rows, so anything that picks one belongs in the front-end.
 - **Mouse and keyboard produce the same `Intent`.** Anything reachable by mouse must have a
   `KEYMAP` entry; the coverage test in `input.rs` enforces this.
 - **View-local state does not round-trip through the store.** Scrolling, selection, column

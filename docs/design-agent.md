@@ -222,9 +222,15 @@ test-only one.
 ### What pulling it forward forces
 
 **`api snapshot` prints a wire type, not `Snapshot`.** The internal snapshot holds `Instant`
-and `Arc<RenderedGrid>` — neither of which means anything on the far side of a socket — and
+and `Arc<PagedResult>` — neither of which means anything on the far side of a socket — and
 deriving `Serialize` on it would make every future field change a protocol change. So
 `sqlake-api` owns a separate wire representation and the conversion into it.
+
+`PagedResult` is where the rows stop and the front-end begins: it carries `Value`s and no
+display decision, so the TUI turns it into a `RenderedGrid` and `sqlake-api` serialises it as
+JSON. Those two want opposite things from the same rows — a collapsed `{2 keys}` is right on
+screen and destroys what an agent asked for — which is why nothing above `PagedResult` is
+shared between them.
 
 That decision would have been easy to get wrong by default. Making it in M2, before anything
 depends on the shape, is most of the reason to pull A1 forward at all.

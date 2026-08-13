@@ -2,7 +2,9 @@
 //!
 //! This crate owns everything the terminal does not: what is connected, what
 //! has been loaded, and what the user asked for. It has no dependency on
-//! ratatui, and nothing here knows how wide the terminal is.
+//! ratatui, and **nothing here assumes a character-cell display** — no widths,
+//! no glyphs, no truncation. `sqlake-tui` and the agent surface are peers over
+//! this layer and want opposite renderings of the same rows.
 //!
 //! `Intent` and `ViewCmd` deliberately live in `sqlake-tui` rather than here.
 //! Only [`action::Action`] crosses the boundary, so no UI vocabulary — panes,
@@ -10,7 +12,7 @@
 
 pub mod action;
 pub mod error;
-pub mod grid;
+pub mod pages;
 pub mod session;
 pub mod snapshot;
 pub mod store;
@@ -19,7 +21,7 @@ pub mod usecase;
 
 pub use action::{Action, BusyId, ToastId};
 pub use error::{AppError, AppResult};
-pub use grid::{Align, Cell, CellKind, RenderedColumn, RenderedGrid};
+pub use pages::PagedResult;
 pub use session::SessionHandle;
 pub use snapshot::{
     BusyItem, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot, TabContent,

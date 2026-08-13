@@ -14,7 +14,7 @@ use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::result::Sort;
 
 use crate::action::{BusyId, ToastId};
-use crate::grid::RenderedGrid;
+use crate::pages::PagedResult;
 use crate::tree::TreeView;
 
 /// Something that is fetched asynchronously.
@@ -82,7 +82,7 @@ pub struct PreviewTab {
     pub sort: Option<Sort>,
     /// Rows fetched so far. Paging appends, so this only grows.
     pub loaded_rows: usize,
-    pub data: LoadState<Arc<RenderedGrid>>,
+    pub data: LoadState<Arc<PagedResult>>,
 }
 
 #[derive(Debug, Clone)]

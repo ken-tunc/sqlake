@@ -205,7 +205,7 @@ pub trait UseCase {
 | --- | --- |
 | SQL | `RawSql` → `ValidatedSql` → `PreparedSql` → **`ApprovedQuery`** |
 | Identifiers | `Ident` → **`QuotedIdent`** |
-| Results | `RowBatch` → `ResultSet` → **`RenderedGrid`** |
+| Results | `RowBatch` → `ResultSet` → `PagedResult` → **`RenderedGrid`** |
 | Connection info | `Profile` → **`ResolvedProfile`** |
 | Templates | `Template` → `BoundTemplate` → **`RawSql`** |
 
@@ -218,6 +218,7 @@ The guarantees each stage carries:
 | `ApprovedQuery` | Estimated cost within threshold, or explicitly approved by the user |
 | `QuotedIdent` | Quoted and escaped |
 | `ResultSet` | Column definitions and row count fixed |
+| `PagedResult` | Pages accumulated; still driver data, no display decisions |
 | `RenderedGrid` | Column widths, alignment and truncation settled |
 | `ResolvedProfile` | Secrets resolved from keyring or command; subject to `zeroize` |
 
@@ -228,19 +229,29 @@ Three things become **impossible to write**:
   is prevented structurally.
 - SQL assembly accepts only `QuotedIdent`
   → forgetting to quote is a compile error, so an upper-case table name cannot break a query.
-- The UI receives only `RenderedGrid`
+- Drawing code receives only `RenderedGrid`
   → rendering code cannot start formatting `Value` on its own.
 
 Conversions go through `TryFrom` or a dedicated function carrying a failure reason, and
 **constructors are not `pub`**: `ApprovedQuery::new` is callable only from the approval logic
 in the same module.
 
-### 4.2 `RenderedGrid` formats lazily
+### 4.2 `RenderedGrid` formats lazily, and lives in the front-end
+
+The last stage sits in `sqlake-tui`, not in `sqlake-app`, because every decision it makes is a
+terminal decision: widths in character cells, control characters replaced by glyphs, long
+values elided, JSON collapsed to a summary. The agent surface reads the same `PagedResult` and
+wants the opposite of all four — collapsing a document to `{2 keys}` destroys exactly what an
+agent asked for, and `∅` is not `null` to anything that parses JSON (§9).
+
+`PagedResult` is the seam. It accumulates pages as they arrive — one `Arc` per page, so
+appending never copies the rows already held — and makes no display decision at all.
 
 The obvious implementation materialises `Vec<Vec<Cell>>`. At 200k rows by 60 columns that
-allocates twelve million strings in order to display thirty of them. So `RenderedGrid` owns
-the `ResultSet` and formats cells on access; only column widths are computed eagerly, from a
-sample of the first rows.
+allocates twelve million strings in order to display thirty of them. So `RenderedGrid` holds
+the rows and formats cells on access; only column widths are computed eagerly, from a sample
+of the first rows. It is rebuilt only when the rows themselves change: snapshots arrive for
+unrelated reasons, and re-sampling on every frame would make columns twitch.
 
 Widths are sampled rather than measured over everything for a second reason: a column that
 resized itself as pages arrived would be unusable.
