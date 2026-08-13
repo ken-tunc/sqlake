@@ -13,6 +13,7 @@ pub mod error;
 pub mod grid;
 pub mod session;
 pub mod snapshot;
+pub mod store;
 pub mod tree;
 pub mod usecase;
 
@@ -24,5 +25,6 @@ pub use snapshot::{
     BusyItem, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot, TabContent,
     TabView, Toast,
 };
+pub use store::{Drivers, Store};
 pub use tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 pub use usecase::UseCase;

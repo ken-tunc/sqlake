@@ -149,6 +149,36 @@ impl RenderedGrid {
     pub fn raw(&self, row: usize, col: usize) -> Option<&Value> {
         self.result.rows.get(row).and_then(|r| r.get(col))
     }
+
+    /// The underlying result set.
+    ///
+    /// For the application layer, which needs it to append a page. The rule
+    /// that the UI never sees a [`Value`] is about the TUI crate, not about
+    /// this one.
+    #[must_use]
+    pub fn result(&self) -> &ResultSet {
+        &self.result
+    }
+
+    /// This grid with `more` appended, keeping the original column widths.
+    ///
+    /// Widths are sampled from the first rows, so they stay put as pages
+    /// arrive — a column that resized itself on every scroll would be
+    /// unusable.
+    #[must_use]
+    pub fn append(&self, more: &ResultSet) -> Self {
+        let mut rows = self.result.rows.as_ref().clone();
+        rows.extend(more.rows.iter().cloned());
+        let merged = ResultSet::new(
+            self.result.columns.as_ref().clone(),
+            rows,
+            more.total_rows.or(self.result.total_rows),
+        );
+        Self {
+            result: Arc::new(merged),
+            columns: self.columns.clone(),
+        }
+    }
 }
 
 /// A column is right-aligned when its values are numbers. Decided from the
