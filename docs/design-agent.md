@@ -18,8 +18,16 @@ below is transport, serialisation and policy. If any of it needs a new use case,
 sign the interactive client is missing a feature too.
 
 This is what the UI/logic split in §1 of the architecture was for. It is worth stating
-explicitly so it stays true: no query construction, no driver knowledge and no result
-formatting may live in the agent surface.
+explicitly so it stays true: **no query construction and no driver knowledge** may live in the
+agent surface.
+
+Rendering is the opposite case, and the distinction is easy to get backwards. The shared type
+is `PagedResult` — the rows as the driver returned them, with no display decision attached —
+and **each front-end renders it for itself**. The TUI's rules are actively wrong here: `∅` does
+not parse as null, a JSON document collapsed to `{2 keys}` destroys exactly what was asked
+for, and a newline replaced by `␊` corrupts the text. So `sqlake-api` owns its own
+`Value` → JSON serialisation, and reaching for `sqlake-tui`'s formatter would be a bug rather
+than reuse (architecture §4.2).
 
 ---
 
@@ -181,6 +189,10 @@ crates/
 
 Both depend on `sqlake-app`. Neither depends on `sqlake-tui`, and `sqlake-tui` does not depend
 on them — the TUI only needs to know how to start a listener, which is `sqlake-api`'s job.
+
+That rule has teeth rather than being decorative: `sqlake-tui` holds the only existing
+`Value` formatter, so "neither depends on `sqlake-tui`" is what stops `sqlake-api` reusing it.
+Value serialisation is `sqlake-api`'s own module (§1).
 
 ---
 
