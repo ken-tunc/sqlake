@@ -1,7 +1,13 @@
-//! Turning a result set into something a grid can draw.
+//! Turning fetched rows into something a grid can draw.
 //!
-//! The UI never sees a [`Value`]. It sees [`RenderedGrid`], which owns the
-//! result set and formats cells on demand.
+//! Drawing code never sees a [`Value`]. It sees [`RenderedGrid`], which holds
+//! the rows and formats cells on demand.
+//!
+//! This lives in the terminal crate because every decision in it is a terminal
+//! decision: widths in character cells, control characters replaced with
+//! glyphs, long values elided, JSON collapsed to a summary. The agent surface
+//! reads the same [`PagedResult`] and wants the opposite of all four —
+//! collapsing a document to `{2 keys}` destroys exactly what it asked for.
 //!
 //! The obvious implementation materialises `Vec<Vec<Cell>>`. At 200k rows by 60
 //! columns that allocates twelve million strings in order to display thirty of
@@ -11,7 +17,8 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use sqlake_core::result::{Column, ResultSet, Row};
+use sqlake_app::PagedResult;
+use sqlake_core::result::Row;
 use sqlake_core::value::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -70,37 +77,30 @@ pub struct RenderedColumn {
     pub align: Align,
 }
 
-/// A result set prepared for display.
-/// A result set prepared for display.
+/// Rows prepared for display.
+///
+/// Cheap to build and cheap to hold: the rows stay behind the `Arc` they
+/// arrived in, and only the column widths are computed up front.
 #[derive(Debug, Clone)]
 pub struct RenderedGrid {
     columns: Vec<RenderedColumn>,
-    /// The driver's own column list, kept so that a page arriving with a
-    /// different shape can be recognised rather than concatenated.
-    source: Arc<Vec<Column>>,
-    /// One entry per page fetched.
-    ///
-    /// Appending pushes an `Arc`; the rows already held are never touched. The
-    /// obvious version keeps one `Vec<Row>` and extends it, which copies every
-    /// row fetched so far on every page — quadratic in the page count, run on
-    /// the store task, which is the only writer there is.
-    pages: Vec<Arc<Vec<Row>>>,
-    rows: usize,
-    total_rows: Option<u64>,
+    rows: Arc<PagedResult>,
 }
 
 impl RenderedGrid {
     #[must_use]
-    pub fn new(result: ResultSet) -> Self {
-        let columns = result
-            .columns
+    pub fn new(rows: Arc<PagedResult>) -> Self {
+        // The first page only, never the accumulated result: widths and
+        // alignment are decided once, so that a page arriving later cannot
+        // re-lay out the grid under the reader.
+        let sample = rows.sample(WIDTH_SAMPLE_ROWS);
+        let columns = rows
+            .columns()
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let sampled = result
-                    .rows
+                let sampled = sample
                     .iter()
-                    .take(WIDTH_SAMPLE_ROWS)
                     .map(|row| display_width(&format_value(row.get(i))))
                     .max()
                     .unwrap_or(0);
@@ -114,18 +114,23 @@ impl RenderedGrid {
                     type_name: sanitise(&col.type_name),
                     name,
                     natural_width: sampled.max(header).clamp(MIN_WIDTH, MAX_WIDTH),
-                    align: column_align(&result.rows, i),
+                    align: column_align(sample, i),
                 }
             })
             .collect();
 
-        Self {
-            columns,
-            source: Arc::clone(&result.columns),
-            rows: result.rows.len(),
-            pages: vec![Arc::clone(&result.rows)],
-            total_rows: result.total_rows,
-        }
+        Self { columns, rows }
+    }
+
+    /// Whether this grid was built from `rows`.
+    ///
+    /// Snapshots arrive for unrelated reasons — a spinner tick republishes
+    /// everything — so the view keeps its grid and rebuilds only when the rows
+    /// themselves change. Re-sampling widths on every frame would also make
+    /// columns twitch as pages arrive.
+    #[must_use]
+    pub fn is_for(&self, rows: &Arc<PagedResult>) -> bool {
+        Arc::ptr_eq(&self.rows, rows)
     }
 
     #[must_use]
@@ -135,35 +140,24 @@ impl RenderedGrid {
 
     #[must_use]
     pub fn row_count(&self) -> usize {
-        self.rows
+        self.rows.row_count()
     }
 
     /// Rows in the underlying relation, when the driver knew.
     #[must_use]
     pub fn total_rows(&self) -> Option<u64> {
-        self.total_rows
+        self.rows.total_rows()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows == 0
-    }
-
-    fn row(&self, index: usize) -> Option<&Row> {
-        let mut remaining = index;
-        for page in &self.pages {
-            if remaining < page.len() {
-                return page.get(remaining);
-            }
-            remaining -= page.len();
-        }
-        None
+        self.rows.is_empty()
     }
 
     /// Formatted on demand. Only cells that are actually drawn are ever built.
     #[must_use]
     pub fn cell(&self, row: usize, col: usize) -> Cell {
-        let value = self.row(row).and_then(|r| r.get(col));
+        let value = self.rows.value(row, col);
         Cell {
             text: format_value(value),
             kind: value.map_or(CellKind::Null, kind_of),
@@ -175,39 +169,8 @@ impl RenderedGrid {
     /// to reach for it.
     #[must_use]
     pub fn raw(&self, row: usize, col: usize) -> Option<&Value> {
-        self.row(row).and_then(|r| r.get(col))
+        self.rows.value(row, col)
     }
-
-    /// This grid with `more` appended, keeping the original column widths.
-    ///
-    /// Widths are sampled from the first rows, so they stay put as pages
-    /// arrive — a column that resized itself on every scroll would be
-    /// unusable.
-    ///
-    /// `None` when the two disagree about their columns, which means the
-    /// relation changed underneath the tab: DDL ran, or the driver altered its
-    /// projection. Concatenating them anyway would leave the rows and the
-    /// headers describing different things, and `cell` would render the
-    /// difference as nulls without anyone noticing.
-    #[must_use]
-    pub fn append(&self, more: &Self) -> Option<Self> {
-        if !same_columns(&self.source, &more.source) {
-            return None;
-        }
-        let mut pages = self.pages.clone();
-        pages.extend(more.pages.iter().cloned());
-        Some(Self {
-            columns: self.columns.clone(),
-            source: Arc::clone(&self.source),
-            rows: self.rows + more.rows,
-            pages,
-            total_rows: more.total_rows.or(self.total_rows),
-        })
-    }
-}
-
-fn same_columns(a: &[Column], b: &[Column]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
 }
 
 /// A column is right-aligned when its values are numbers. Decided from the
@@ -215,7 +178,7 @@ fn same_columns(a: &[Column], b: &[Column]) -> bool {
 /// own business.
 fn column_align(rows: &[Row], col: usize) -> Align {
     let mut saw_value = false;
-    for row in rows.iter().take(WIDTH_SAMPLE_ROWS) {
+    for row in rows {
         match row.get(col) {
             None | Some(Value::Null) => {}
             Some(v) => {
@@ -378,7 +341,11 @@ mod tests {
     use super::*;
 
     fn grid(columns: Vec<Column>, rows: Vec<Row>) -> RenderedGrid {
-        RenderedGrid::new(ResultSet::new(columns, rows, None))
+        paged(ResultSet::new(columns, rows, None))
+    }
+
+    fn paged(result: ResultSet) -> RenderedGrid {
+        RenderedGrid::new(Arc::new(PagedResult::new(&result)))
     }
 
     fn one(value: Value) -> RenderedGrid {
@@ -565,83 +532,71 @@ mod tests {
     }
 
     #[test]
-    fn cloning_a_grid_shares_its_rows() {
-        let g = one(Value::Int(1));
-        let c = g.clone();
-        assert!(Arc::ptr_eq(&g.pages[0], &c.pages[0]));
-    }
-
-    #[test]
-    fn appending_a_page_does_not_copy_the_rows_already_held() {
-        let first = grid(
-            vec![Column::new("id", "int8", false)],
-            (0..100).map(|i| Row(vec![Value::Int(i)])).collect(),
-        );
-        let second = grid(
-            vec![Column::new("id", "int8", false)],
-            (100..200).map(|i| Row(vec![Value::Int(i)])).collect(),
-        );
-
-        let merged = first.append(&second).unwrap();
-        assert_eq!(merged.row_count(), 200);
-        // The point of the whole arrangement: page one is shared, not copied.
-        // Extending a single Vec would make every page cost every row fetched
-        // so far, on the store task.
-        assert!(Arc::ptr_eq(&merged.pages[0], &first.pages[0]));
-        assert!(Arc::ptr_eq(&merged.pages[1], &second.pages[0]));
-    }
-
-    #[test]
-    fn rows_read_correctly_across_a_page_boundary() {
-        let first = grid(
-            vec![Column::new("id", "int8", false)],
-            (0..3).map(|i| Row(vec![Value::Int(i)])).collect(),
-        );
-        let second = grid(
-            vec![Column::new("id", "int8", false)],
-            (3..6).map(|i| Row(vec![Value::Int(i)])).collect(),
-        );
-        let merged = first.append(&second).unwrap();
-
-        for i in 0..6 {
-            assert_eq!(merged.raw(i, 0), Some(&Value::Int(i as i64)), "row {i}");
-            assert_eq!(merged.cell(i, 0).text, i.to_string());
-        }
-        assert_eq!(merged.raw(6, 0), None);
-    }
-
-    #[test]
-    fn a_page_with_different_columns_is_refused() {
-        let first = grid(
-            vec![Column::new("id", "int8", false)],
+    fn a_grid_is_recognised_as_belonging_to_its_rows() {
+        let rows = Arc::new(PagedResult::new(&ResultSet::new(
+            vec![Column::new("v", "any", true)],
             vec![Row(vec![Value::Int(1)])],
-        );
-        let renamed = grid(
-            vec![Column::new("identifier", "int8", false)],
-            vec![Row(vec![Value::Int(2)])],
-        );
-        // DDL ran, or the driver changed its projection. Concatenating would
-        // leave rows and headers describing different things.
-        assert!(first.append(&renamed).is_none());
+            None,
+        )));
+        let g = RenderedGrid::new(Arc::clone(&rows));
+        assert!(g.is_for(&rows));
+
+        // A snapshot arriving for an unrelated reason must not cost a rebuild,
+        // and rebuilding would make the columns twitch as pages land.
+        let other = Arc::new(PagedResult::new(&ResultSet::new(
+            vec![Column::new("v", "any", true)],
+            vec![Row(vec![Value::Int(1)])],
+            None,
+        )));
+        assert!(!g.is_for(&other));
     }
 
     #[test]
-    fn appending_keeps_the_original_widths_and_takes_the_newer_total() {
-        let first = RenderedGrid::new(ResultSet::new(
+    fn widths_survive_a_page_arriving() {
+        let first = ResultSet::new(
             vec![Column::new("v", "text", false)],
             vec![Row(vec![Value::Text("short".into())])],
             Some(2),
-        ));
-        let width = first.columns()[0].natural_width;
-        let second = RenderedGrid::new(ResultSet::new(
+        );
+        let rows = PagedResult::new(&first);
+        let width = RenderedGrid::new(Arc::new(rows.clone())).columns()[0].natural_width;
+
+        let second = ResultSet::new(
             vec![Column::new("v", "text", false)],
             vec![Row(vec![Value::Text("a much longer value".into())])],
             None,
-        ));
+        );
+        let grown = RenderedGrid::new(Arc::new(rows.append(&second).unwrap()));
+        // A column that resized itself every time a page landed would be
+        // unusable, so the sample is the first page and nothing else — even
+        // though the second page is wider and the first is far short of
+        // `WIDTH_SAMPLE_ROWS`.
+        assert_eq!(grown.row_count(), 2);
+        assert_eq!(grown.columns()[0].natural_width, width);
+    }
 
-        let merged = first.append(&second).unwrap();
-        assert_eq!(merged.columns()[0].natural_width, width);
-        assert_eq!(merged.total_rows(), Some(2));
+    #[test]
+    fn alignment_survives_a_page_arriving() {
+        let numbers = ResultSet::new(
+            vec![Column::new("v", "any", true)],
+            vec![Row(vec![Value::Int(1)])],
+            None,
+        );
+        let rows = PagedResult::new(&numbers);
+        assert_eq!(
+            RenderedGrid::new(Arc::new(rows.clone())).columns()[0].align,
+            Align::Right
+        );
+
+        // A text value on page two must not flip the whole column to the left
+        // under a reader who is looking at page one.
+        let text = ResultSet::new(
+            vec![Column::new("v", "any", true)],
+            vec![Row(vec![Value::Text("x".into())])],
+            None,
+        );
+        let grown = RenderedGrid::new(Arc::new(rows.append(&text).unwrap()));
+        assert_eq!(grown.columns()[0].align, Align::Right);
     }
 
     #[test]
@@ -712,7 +667,7 @@ mod tests {
         fn rendered(schema: &str, table: &str) -> RenderedGrid {
             let cat = catalog();
             let t = cat.table(schema, table).unwrap();
-            RenderedGrid::new(ResultSet::new(
+            paged(ResultSet::new(
                 t.columns.clone(),
                 t.all_rows(),
                 t.total_rows(),

@@ -31,3 +31,10 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # Intra-doc links are the part of a doc comment that can actually break,
+      # and nothing else in this job looks at them.
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

@@ -11,6 +11,7 @@ is reachable with the mouse, and every one of those actions also has a key bindi
 
 - [Design](docs/design.md) — architecture, driver model, type design, milestones
 - [M0 — Foundation](docs/design-m0.md) — the current milestone
+- [Agent surface](docs/design-agent.md) — driving sqlake from an AI agent
 
 ## Planned features
 
@@ -22,6 +23,9 @@ is reachable with the mouse, and every one of those actions also has a key bindi
 6. Proxy and tunnel settings
 7. SQL templates
 8. Query history
+
+Plus an agent surface: the same operations as a socket API, CLI subcommands and an MCP server,
+so an AI agent can use the connections and guardrails the interactive client already has.
 
 ## License
 

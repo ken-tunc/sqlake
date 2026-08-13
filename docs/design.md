@@ -5,8 +5,8 @@ A mouse-friendly database client that runs in the terminal.
 Scope is deliberately narrow: PostgreSQL and BigQuery, built as a personal tool. Where a
 trade-off exists, prefer "hard to break" and "possible to finish" over "extensible".
 
-This document holds the architecture. Milestone plans hold only what is specific to a
-milestone: [M0 — Foundation](design-m0.md).
+This document holds the architecture. Companion documents hold only what is specific to their
+subject: [M0 — Foundation](design-m0.md), [Agent surface](design-agent.md).
 
 ---
 
@@ -36,6 +36,8 @@ sqlake/
     ├── sqlake-core/              # domain types, Driver/Session traits. No DB dependencies
     ├── sqlake-app/               # use cases, state, actions. UI-agnostic and testable
     ├── sqlake-tui/               # rendering and input, on ratatui
+    ├── sqlake-api/               # agent surface: protocol, schema, socket client and server
+    ├── sqlake-mcp/               # agent surface: MCP stdio server over sqlake-api
     ├── sqlake-config/            # profile and settings persistence, secret resolution
     ├── sqlake-store/             # SQLite: history, templates, session restore
     ├── sqlake-driver-postgres/
@@ -46,12 +48,19 @@ sqlake/
 Dependencies flow one way:
 
 ```
-sqlake(bin) → sqlake-tui → sqlake-app → sqlake-core ← sqlake-driver-*
-                                     ↘ sqlake-config, sqlake-store
+              ┌ sqlake-tui ┐
+sqlake(bin) ──┤            ├──→ sqlake-app ──→ sqlake-core ←── sqlake-driver-*
+              └ sqlake-api ┘         ↘ sqlake-config, sqlake-store
+                    ↑
+              sqlake-mcp
 ```
 
+`sqlake-tui` and `sqlake-api` are **peers**: two front-ends over the same application layer,
+neither depending on the other (§9). The TUI only needs to know how to start a listener, which
+is `sqlake-api`'s job.
+
 `sqlake-core` depends on little more than `serde`, `tokio` (sync only) and `async-trait`.
-`sqlake-driver-mock` is what lets both the UI and the use cases be developed and tested
+`sqlake-driver-mock` is what lets both front-ends and the use cases be developed and tested
 without standing up a database.
 
 ---
@@ -196,7 +205,7 @@ pub trait UseCase {
 | --- | --- |
 | SQL | `RawSql` → `ValidatedSql` → `PreparedSql` → **`ApprovedQuery`** |
 | Identifiers | `Ident` → **`QuotedIdent`** |
-| Results | `RowBatch` → `ResultSet` → **`RenderedGrid`** |
+| Results | `RowBatch` → `ResultSet` → `PagedResult` → **`RenderedGrid`** |
 | Connection info | `Profile` → **`ResolvedProfile`** |
 | Templates | `Template` → `BoundTemplate` → **`RawSql`** |
 
@@ -209,6 +218,7 @@ The guarantees each stage carries:
 | `ApprovedQuery` | Estimated cost within threshold, or explicitly approved by the user |
 | `QuotedIdent` | Quoted and escaped |
 | `ResultSet` | Column definitions and row count fixed |
+| `PagedResult` | Pages accumulated; still driver data, no display decisions |
 | `RenderedGrid` | Column widths, alignment and truncation settled |
 | `ResolvedProfile` | Secrets resolved from keyring or command; subject to `zeroize` |
 
@@ -219,19 +229,29 @@ Three things become **impossible to write**:
   is prevented structurally.
 - SQL assembly accepts only `QuotedIdent`
   → forgetting to quote is a compile error, so an upper-case table name cannot break a query.
-- The UI receives only `RenderedGrid`
+- Drawing code receives only `RenderedGrid`
   → rendering code cannot start formatting `Value` on its own.
 
 Conversions go through `TryFrom` or a dedicated function carrying a failure reason, and
 **constructors are not `pub`**: `ApprovedQuery::new` is callable only from the approval logic
 in the same module.
 
-### 4.2 `RenderedGrid` formats lazily
+### 4.2 `RenderedGrid` formats lazily, and lives in the front-end
+
+The last stage sits in `sqlake-tui`, not in `sqlake-app`, because every decision it makes is a
+terminal decision: widths in character cells, control characters replaced by glyphs, long
+values elided, JSON collapsed to a summary. The agent surface reads the same `PagedResult` and
+wants the opposite of all four — collapsing a document to `{2 keys}` destroys exactly what an
+agent asked for, and `∅` is not `null` to anything that parses JSON (§9).
+
+`PagedResult` is the seam. It accumulates pages as they arrive — one `Arc` per page, so
+appending never copies the rows already held — and makes no display decision at all.
 
 The obvious implementation materialises `Vec<Vec<Cell>>`. At 200k rows by 60 columns that
-allocates twelve million strings in order to display thirty of them. So `RenderedGrid` owns
-the `ResultSet` and formats cells on access; only column widths are computed eagerly, from a
-sample of the first rows.
+allocates twelve million strings in order to display thirty of them. So `RenderedGrid` holds
+the rows and formats cells on access; only column widths are computed eagerly, from a sample
+of the first rows. It is rebuilt only when the rows themselves change: snapshots arrive for
+unrelated reasons, and re-sampling on every frame would make columns twitch.
 
 Widths are sampled rather than measured over everything for a second reason: a column that
 resized itself as pages arrived would be unusable.
@@ -293,7 +313,7 @@ cannot race with a sort already in flight.
   as an internal event, so one slow expansion cannot block every other action.
 - One actor task per connection owns the `Box<dyn Session>` and serialises access, so drivers
   need not be internally concurrent. Holding more than one physical connection is a
-  driver-level concern (§10.1), not something the application layer arranges.
+  driver-level concern (§11.1), not something the application layer arranges.
 
 ### 5.2 Render loop
 
@@ -557,7 +577,31 @@ adds a dependency.
 
 ---
 
-## 9. Configuration and secrets (`sqlake-config`)
+## 9. A second front-end: the agent surface
+
+The application layer has no idea a terminal exists, so the TUI is one front-end over it
+rather than the only possible one. An AI agent driving sqlake — listing tables, previewing
+data, running a query — is **a second front-end over the same `sqlake-app`, not new logic**.
+
+Two things follow, and both are load-bearing:
+
+- Nothing in the agent surface may construct a query, know a driver, or format a result. If
+  something there needs a new use case, the interactive client is missing a feature too.
+- The guards already in the type system apply unchanged. `Session::execute` accepts only an
+  `ApprovedQuery`, so an agent cannot run an unestimated BigQuery scan any more than a human
+  can; what differs is that approval is granted by a byte budget rather than by a dialog, and
+  that going over it returns `NeedsApproval` (§4.3) for a human to answer.
+
+The surface is a socket API against a running session, thin noun-verb subcommands over it, and
+an MCP server wrapping the same client — modelled on herdr. Attaching to a running session is
+the point: connections behind a bastion, an MFA prompt or a `gcloud auth` flow are expensive
+to establish, and for anything interactive, impossible to re-establish per command.
+
+Detail, including the safety policy for agents, is in [design-agent.md](design-agent.md).
+
+---
+
+## 10. Configuration and secrets (`sqlake-config`)
 
 ```
 ~/.config/sqlake/
@@ -602,9 +646,9 @@ masking lives in exactly one function and never reaches the log.
 
 ---
 
-## 10. Drivers
+## 11. Drivers
 
-### 10.1 PostgreSQL
+### 11.1 PostgreSQL
 
 - `tokio-postgres` with `tokio-postgres-rustls`; `sslmode` maps onto the rustls configuration.
 - Hold **two connections: one for queries, one for metadata**, so that expanding the tree is
@@ -622,7 +666,7 @@ masking lives in exactly one function and never reaches the log.
   be assembled through `QuotedIdent` (§4.1).
 - Show the `EXPLAIN` row estimate first; run an exact `COUNT(*)` only on explicit request.
 
-### 10.2 BigQuery
+### 11.2 BigQuery
 
 - `gcp-bigquery-client` with `yup-oauth2` (ADC, service account, or impersonation). Where the
   crate lags the API, wrap REST calls thinly inside the driver so `reqwest` can be used
@@ -641,7 +685,7 @@ masking lives in exactly one function and never reaches the log.
 
 ---
 
-## 11. Proxies and tunnels (feature 6)
+## 12. Proxies and tunnels (feature 6)
 
 ```rust
 #[async_trait]
@@ -670,7 +714,7 @@ timeout = "20s"
 
 ---
 
-## 12. History and templates (features 7 and 8)
+## 13. History and templates (features 7 and 8)
 
 One SQLite file (`rusqlite`, bundled).
 
@@ -699,7 +743,7 @@ CREATE TABLE templates (
 
 ---
 
-## 13. Testing
+## 14. Testing
 
 **In-source tests by default**, in a `#[cfg(test)] mod tests` at the bottom of each file.
 Private pure functions can then be tested directly, with no need to widen visibility for the
@@ -717,7 +761,7 @@ Because `sqlake-driver-mock` exists, every other test runs with no database and 
 
 ---
 
-## 14. Milestones
+## 15. Milestones
 
 | # | Content | Done when |
 | --- | --- | --- |
@@ -731,12 +775,23 @@ Because `sqlake-driver-mock` exists, every other test runs with no database and 
 | **M7** | SQL templates (feature 7) | Save, parameter entry, insert from the palette |
 | **M8** | Query history (feature 8) | FTS search, re-run, promote to template |
 
+The agent surface (§9) runs as a track alongside these rather than after them, because each
+of its parts becomes possible at a different point:
+
+| # | Lands after | Content |
+| --- | --- | --- |
+| **A1** | M2 | Read-only CLI and socket API. Needs no terminal, and exercises `sqlake-app` through a second front-end while the interactive client is still half-written |
+| **A2** | M4 | Query execution over the API, where `ApprovedQuery` and the byte budget arrive |
+| **A3** | A2 | MCP server |
+
+Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
+
 **M0 determines the feel of everything else.** `HitMap`, the data grid and the staged types in
 §4 are all expensive to replace later, so they are the parts worth finishing properly first.
 
 ---
 
-## 15. Risks
+## 16. Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
@@ -753,7 +808,7 @@ Because `sqlake-driver-mock` exists, every other test runs with no database and 
 
 ---
 
-## 16. Dependencies
+## 17. Dependencies
 
 The UI layer depends on **`ratatui` and `crossterm`, and nothing else**. The data grid, tree,
 modals, scrollbar handling and focus are written here, because each has requirements specific
@@ -810,7 +865,7 @@ statement is enough; reach for `sqlparser` only if it is not.
 
 ---
 
-## 17. References
+## 18. References
 
 - [ratatui](https://ratatui.rs/) and [awesome-ratatui](https://github.com/ratatui/awesome-ratatui)
 - [rainfrog](https://github.com/achristmascarl/rainfrog) — a PostgreSQL TUI in Rust and

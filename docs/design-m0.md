@@ -33,8 +33,8 @@ M0 ships **no real database driver**. Everything is exercised against `sqlake-dr
 | Workspace | 5 crates, pinned toolchain, shared lints, CI |
 | `sqlake-core` | ids, `Value`, `ResultSet`, tree types, `Capabilities`, the M0 subset of `Driver`/`Session` |
 | `sqlake-driver-mock` | fixtures covering every `Value` variant, injectable latency and failures |
-| `sqlake-app` | `Snapshot`, `Action`, store task, session actor, three use cases, `RenderedGrid` |
-| `sqlake-tui` | `TerminalGuard`, render loop, `HitMap`, gesture synthesis, input mapping, `UiState`, nine widgets |
+| `sqlake-app` | `Snapshot`, `Action`, store task, session actor, three use cases, `PagedResult` |
+| `sqlake-tui` | `TerminalGuard`, render loop, `HitMap`, gestures, input mapping, `RenderedGrid`, `UiState`, nine widgets |
 | Tests | in-source unit tests, `insta` screen snapshots, the intent-coverage test |
 
 Widgets built in M0: `Pane`, `Splitter`, `Scrollbar`, `Tree`, `DataGrid`, `TabBar`,
@@ -44,8 +44,10 @@ palette, help modal.
 Use cases built in M0: `Connect`, `ExpandNode`, `PreviewTable`.
 
 Staged types built in M0: `Ident` → `QuotedIdent`, and
-`RowBatch` → `ResultSet` → `RenderedGrid`. The others arrive with the milestone that
-constructs them — the SQL pipeline in M4, `ResolvedProfile` in M1, templates in M7.
+`RowBatch` → `ResultSet` → `PagedResult` → `RenderedGrid`, whose last stage lives in
+`sqlake-tui` because every decision in it is a terminal decision. The others arrive with the
+milestone that constructs them — the SQL pipeline in M4, `ResolvedProfile` in M1, templates in
+M7.
 
 ### Out of scope
 
@@ -83,7 +85,7 @@ than a broken layout.
 
 ## 3. Decisions
 
-**D1 — create five crates, not nine.** `sqlake-config`, `sqlake-store` and the two real
+**D1 — create five crates, not eleven.** `sqlake-config`, `sqlake-store` and the two real
 drivers are created in the milestone that first needs them. Empty placeholder crates are dead
 weight and hide which parts actually exist.
 
@@ -99,7 +101,7 @@ round trip to every wheel tick and make the UI feel laggy. This is what the
 
 **D4 — format cells lazily; sample widths eagerly.** The naive version materialises
 `Vec<Vec<Cell>>`, which at 200k rows by 60 columns allocates twelve million strings to display
-thirty of them. `RenderedGrid` owns the `ResultSet` and formats on access. No cache in M0; if
+thirty of them. `RenderedGrid` holds the rows and formats on access. No cache in M0; if
 profiling in M3 shows formatting cost during fast scrolling, a row-window cache goes behind
 the same API and the signature does not change.
 
@@ -261,7 +263,7 @@ Ordered by dependency; each is roughly one commit.
 | T4 | `sqlake-driver-mock`: fixtures, latency and failure injection | T3 |
 | T5 | `sqlake-app`: `Snapshot`, `Action`, `TreeState` | T2, T7 |
 | T6 | `sqlake-app`: store task, session actor, event loop | T4, T5 |
-| T7 | `sqlake-app`: `RenderedGrid`, width sampling, `Value → Cell` | T2 |
+| T7 | `sqlake-tui`: `RenderedGrid`, width sampling, `Value → Cell` | T2 |
 | T8 | `sqlake-app`: the three use cases | T6, T7 |
 | T9 | `sqlake-tui`: `TerminalGuard`, panic hook, `--panic-test` | T1 |
 | T10 | `sqlake-tui`: `HitMap`, `Target`, z levels | T9 |
