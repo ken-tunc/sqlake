@@ -11,3 +11,12 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+serde_json.workspace = true
+sqlake-core.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+# Test-only. The fixtures exist to break naive formatting, so the formatter is
+# run against them here rather than against values written to suit it.
+sqlake-driver-mock.workspace = true
+time = { workspace = true, features = ["macros"] }
