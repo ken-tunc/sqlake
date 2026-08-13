@@ -36,6 +36,8 @@ sqlake/
     ├── sqlake-core/              # domain types, Driver/Session traits. No DB dependencies
     ├── sqlake-app/               # use cases, state, actions. UI-agnostic and testable
     ├── sqlake-tui/               # rendering and input, on ratatui
+    ├── sqlake-api/               # agent surface: protocol, schema, socket client and server
+    ├── sqlake-mcp/               # agent surface: MCP stdio server over sqlake-api
     ├── sqlake-config/            # profile and settings persistence, secret resolution
     ├── sqlake-store/             # SQLite: history, templates, session restore
     ├── sqlake-driver-postgres/
@@ -46,12 +48,19 @@ sqlake/
 Dependencies flow one way:
 
 ```
-sqlake(bin) → sqlake-tui → sqlake-app → sqlake-core ← sqlake-driver-*
-                                     ↘ sqlake-config, sqlake-store
+              ┌ sqlake-tui ┐
+sqlake(bin) ──┤            ├──→ sqlake-app ──→ sqlake-core ←── sqlake-driver-*
+              └ sqlake-api ┘         ↘ sqlake-config, sqlake-store
+                    ↑
+              sqlake-mcp
 ```
 
+`sqlake-tui` and `sqlake-api` are **peers**: two front-ends over the same application layer,
+neither depending on the other (§9). The TUI only needs to know how to start a listener, which
+is `sqlake-api`'s job.
+
 `sqlake-core` depends on little more than `serde`, `tokio` (sync only) and `async-trait`.
-`sqlake-driver-mock` is what lets both the UI and the use cases be developed and tested
+`sqlake-driver-mock` is what lets both front-ends and the use cases be developed and tested
 without standing up a database.
 
 ---

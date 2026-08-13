@@ -83,7 +83,7 @@ than a broken layout.
 
 ## 3. Decisions
 
-**D1 — create five crates, not nine.** `sqlake-config`, `sqlake-store` and the two real
+**D1 — create five crates, not eleven.** `sqlake-config`, `sqlake-store` and the two real
 drivers are created in the milestone that first needs them. Empty placeholder crates are dead
 weight and hide which parts actually exist.
 
