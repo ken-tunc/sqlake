@@ -568,8 +568,8 @@ mod tests {
 
     use sqlake_app::action::{BusyId, ToastId};
     use sqlake_app::snapshot::{
-        BusyItem, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, TabContent, TabView,
-        Toast,
+        BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity,
+        TabContent, TabView, Toast,
     };
     use sqlake_app::tree::{NodeState, TreeView, VisibleNode};
     use sqlake_core::capability::DriverKind;
@@ -642,6 +642,7 @@ mod tests {
             active_tab: Some(tab),
             busy: vec![BusyItem {
                 id: BusyId::new(1),
+                owner: BusyOwner::Tab(tab),
                 label: "loading".into(),
                 started_at: std::time::Instant::now(),
             }],
