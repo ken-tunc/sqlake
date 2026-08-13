@@ -1,22 +1,8 @@
-# sqlake — working conventions
+# sqlake
 
 A mouse-friendly TUI database client for PostgreSQL and BigQuery, written in Rust.
 Read [docs/design.md](docs/design.md) before making architectural decisions;
 [docs/design-m0.md](docs/design-m0.md) is the current milestone.
-
-## Language
-
-**English only** — documentation, code comments, commit messages, PR descriptions, test names.
-
-## Commits
-
-Conventional Commits, scoped by crate where it helps:
-
-```
-feat(tui): add HitMap z-order resolution
-fix(app): stop scroll position resetting on snapshot update
-docs: add M0 design
-```
 
 ## Architecture rules
 
@@ -28,7 +14,7 @@ These are load-bearing. Breaking one silently undoes a design decision.
   Express the difference as a field on `Capabilities` instead.
 - **The UI never sees `Value`.** It receives `RenderedGrid`, which formats cells on demand.
 - **Mouse and keyboard produce the same `Intent`.** Anything reachable by mouse must have a
-  `KEYMAP` entry; the test in `input.rs` enforces this.
+  `KEYMAP` entry; the coverage test in `input.rs` enforces this.
 - **View-local state does not round-trip through the store.** Scrolling, selection, column
   widths and split positions are `ViewCmd`, applied synchronously to `UiState`.
 - **Terminal mode changes happen only in `TerminalGuard`.** The panic hook and the `$EDITOR`
@@ -42,15 +28,3 @@ These are load-bearing. Breaking one silently undoes a design decision.
 - `tests/` is reserved for behaviour observable from outside the crate (driver conformance).
 - Screen snapshots use `insta` with ratatui's `TestBackend`.
 - `sqlake-driver-mock` means every test runs with no database and no network.
-
-## Before committing
-
-```
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace
-```
-
-## Pushing
-
-Do not push without being asked.

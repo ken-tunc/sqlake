@@ -5,7 +5,8 @@ A mouse-friendly database client that runs in the terminal.
 Scope is deliberately narrow: PostgreSQL and BigQuery, built as a personal tool. Where a
 trade-off exists, prefer "hard to break" and "possible to finish" over "extensible".
 
-Milestone-level plans live alongside this document: [M0 — Foundation](design-m0.md).
+This document holds the architecture. Milestone plans hold only what is specific to a
+milestone: [M0 — Foundation](design-m0.md).
 
 ---
 
@@ -24,52 +25,7 @@ Milestone-level plans live alongside this document: [M0 — Foundation](design-m
 
 ---
 
-## 2. Choosing the UI foundation (ADR-001)
-
-**Decision: ratatui 0.30.x.**
-
-### Candidates
-
-| Candidate | Assessment |
-| --- | --- |
-| **ratatui 0.30.2** | 5.6M downloads/month, 5,878 dependent crates. More boilerplate than the alternatives, but it stays confined to `sqlake-tui`. **Adopted** |
-| iocraft 0.8.4 | Declarative, flexbox layout — both appealing. But the only components are `View`, `Text` and `TextInput`: no table, tree, scrolling, modal or focus handling. What this project needs is widgets, not layout |
-| cursive | Mouse-first by design, with event routing built in. But it is a poor fit for dense data grids, and its `cb_sink` callback model does not compose with a tokio-based design |
-| rat-salsa / rat-widget | Serious work — event handling, focus and scrolling included. But 229 downloads/month and effectively a single maintainer. Kept as a fallback, not a foundation |
-| reratui, rxtui, reactive_tui, revue | Several new "React-like" frameworks exist. All 0.x, single-author, no track record. Not a foundation |
-
-### What decided it
-
-1. **Mouse hit testing is easier on ratatui** — counterintuitive, and the deciding factor.
-   iocraft computes layout inside Taffy, so a component can only read its own rectangle
-   through `use_component_rect()`, which returns *the previous frame's* value. A hit-testing
-   layer still has to be written by hand, but under worse conditions: one frame of lag and
-   no z-ordering. ratatui is immediate mode, so the `Rect`s returned by `Layout::split()` are
-   already in hand — hit testing is `rect.contains(pos)`, and z-order is draw order.
-
-2. **There is a way out.** The parts exist in the ecosystem (`rat-ftable` for large tables,
-   `tui-tree-widget`, `tui-overlay`, `rat-focus`). The plan is to write them, but a stuck
-   component can be swapped for an existing crate. iocraft offers no such escape hatch.
-
-3. **A reference implementation exists.** `rainfrog` (a PostgreSQL TUI in Rust and ratatui,
-   with a mouse mode) solves the same problem and can be read when a decision is unclear.
-
-### Policy on third-party widgets
-
-| Part | Policy |
-| --- | --- |
-| SQL editor | **None. Delegated to `$EDITOR`** (§9). Zero dependency on editor crates |
-| Data grid | **Own** — a thin wrapper over ratatui's `Table` and `TableState`. Width computation, per-type alignment and column resizing are all specific to this project. Swap in `rat-ftable` if performance demands it |
-| Tree | **Own.** Holding the lazy-load state directly is simpler. A flattened `Vec<VisibleNode>` plus an offset is roughly 200 lines |
-| Modal / menu | **Own** — `Clear` widget plus a centred `Rect`. Tens of lines |
-| Scrollbar | ratatui's own `Scrollbar` plus hand-written hit regions |
-| Focus | **Own** — a `FocusId` enum and an ordered array. No crate needed |
-
-The result: the UI layer depends on **`ratatui` and `crossterm`, and nothing else**.
-
----
-
-## 3. Workspace layout
+## 2. Workspace layout
 
 ```
 sqlake/
@@ -95,19 +51,19 @@ sqlake(bin) → sqlake-tui → sqlake-app → sqlake-core ← sqlake-driver-*
 ```
 
 `sqlake-core` depends on little more than `serde`, `tokio` (sync only) and `async-trait`.
-**Building `sqlake-driver-mock` in M0 is the key move** — with it, both the UI and the use
-cases can be developed without standing up a database.
+`sqlake-driver-mock` is what lets both the UI and the use cases be developed and tested
+without standing up a database.
 
 ---
 
-## 4. Domain model (`sqlake-core`)
+## 3. Domain model (`sqlake-core`)
 
-### 4.1 Driver abstraction
+### 3.1 Driver abstraction
 
 ```rust
 #[async_trait]
 pub trait Driver: Send + Sync {
-    fn kind(&self) -> DriverKind;                       // Postgres | BigQuery | Mock
+    fn kind(&self) -> DriverKind;
     fn capabilities(&self) -> Capabilities;
     async fn connect(&self, p: &ResolvedProfile) -> Result<Box<dyn Session>>;
 }
@@ -126,27 +82,24 @@ pub trait Session: Send + Sync {
     /// Estimation. pg: EXPLAIN, bq: dryRun.
     async fn estimate(&self, sql: &PreparedSql) -> Result<Estimate>;
 
-    /// Execution. Accepts approved queries only (§5).
+    /// Execution. Accepts approved queries only (§4).
     async fn execute(&self, q: &ApprovedQuery) -> Result<QueryStream>;
 
     async fn close(self: Box<Self>);
 }
-
-pub struct QueryStream {
-    pub meta:    ResultMeta,                   // column definitions, job id, start time
-    pub batches: mpsc::Receiver<Result<RowBatch>>,
-    pub cancel:  CancelHandle,                 // pg: CancelToken, bq: jobs.cancel
-}
 ```
 
-### 4.2 Capabilities
+A method is added to `Session` by the milestone that first needs it. Declaring the whole
+surface up front would force stub types into existence months before anything constructs one.
+
+### 3.2 Capabilities
 
 The UI consults this to decide what to show. `if driver == Postgres` never appears in the UI.
 
 ```rust
 pub struct Capabilities {
-    pub hierarchy: &'static [NodeKind],  // pg: [Database, Schema, Relation]
-                                         // bq: [Project, Dataset, Table]
+    /// The levels below the root, outermost first.
+    pub hierarchy: &'static [HierarchyLevel],
     pub indexes: bool,
     pub triggers: bool,
     pub constraints: bool,
@@ -158,9 +111,19 @@ pub struct Capabilities {
     pub free_preview: bool,              // bq tabledata.list, which is not billed
     pub quote_style: QuoteStyle,         // "ident" vs `ident`
 }
+
+pub struct HierarchyLevel {
+    pub kind: NodeKind,          // Root | Catalog | Namespace | Relation
+    pub label: &'static str,     // "schema" or "dataset", "database" or "project"
+}
 ```
 
-### 4.3 Value model
+`NodeKind` is structural and `label` is what the user reads. Keeping them apart is what lets
+BigQuery call a namespace a "dataset" and PostgreSQL call it a "schema" without either word
+reaching a `match` in the UI. It also means the hierarchy can be a different *depth* per
+driver, not just differently named.
+
+### 3.3 Value model
 
 One representation so that database-specific types never leak into the UI. The property that
 matters most is **never crashing on an unknown type**.
@@ -170,8 +133,10 @@ pub enum Value {
     Null,
     Bool(bool),
     Int(i64), Float(f64), Decimal(String),   // string, to avoid losing precision
-    Text(String), Bytes(Bytes),
-    Date(..), Time(..), Timestamp(..), Interval(..),
+    Text(String), Bytes(Vec<u8>),
+    Date(..), Time(..),
+    Timestamp(..),                           // no zone: pg timestamp, bq DATETIME
+    TimestampTz(..),                         // with zone: pg timestamptz, bq TIMESTAMP
     Json(serde_json::Value),
     Array(Vec<Value>),
     Struct(Vec<(String, Value)>),            // bq RECORD, pg composite
@@ -179,17 +144,17 @@ pub enum Value {
 }
 ```
 
-Numbers are right-aligned; `NULL` renders as a dimmed `∅`. `Struct` and `Array` collapse to
-`{...}` and `[3 items]` in the grid, and clicking the cell opens a formatted-JSON popover.
+Timestamps stay split because both engines have both concepts, and collapsing them loses
+whether a value was anchored to an instant or to a wall clock.
 
-### 4.4 Table definition (feature 5)
+### 3.4 Table definition (feature 5)
 
 ```rust
 pub struct TableDetail {
     pub table: TableRef,
     pub kind: RelationKind,           // Table | View | MatView | Routine | External
     pub comment: Option<String>,
-    pub columns: Vec<ColumnDef>,      // name, type, nullable, default, pk, comment, ordinal
+    pub columns: Vec<ColumnDef>,
     pub sections: Vec<DetailSection>, // variable; drivers fill in only what they have
     pub ddl: Option<String>,
     pub stats: Vec<(String, String)>, // row count, size, last modified, ...
@@ -204,7 +169,7 @@ partitioning and clustering and leaves the rest empty.
 
 ---
 
-## 5. Use cases and types (`sqlake-app`)
+## 4. Use cases and types (`sqlake-app`)
 
 Every operation in the app layer is a `UseCase` whose input and output are expressed as types.
 Making "before" and "after" distinct types turns a skipped step into a compile error.
@@ -222,8 +187,10 @@ pub trait UseCase {
 - `Input` and `Output` are types specific to the use case. No tuples like
   `(String, u32, bool)`, and no generic `serde_json::Value`.
 - Inject the mock driver and a use case can be verified in isolation, input to output.
+- Outputs echo the request back with the result. Without that, a late reply is applied to
+  whatever is selected now, and a stale page overwrites a newer one.
 
-### 5.1 Stages as types
+### 4.1 Stages as types
 
 | Pipeline | Stages |
 | --- | --- |
@@ -255,58 +222,56 @@ Three things become **impossible to write**:
 - The UI receives only `RenderedGrid`
   → rendering code cannot start formatting `Value` on its own.
 
-Conversions go through `TryFrom` or a dedicated function carrying a failure reason
-(`fn prepare(sql: ValidatedSql, params: &Params) -> Result<PreparedSql, PrepareError>`), and
+Conversions go through `TryFrom` or a dedicated function carrying a failure reason, and
 **constructors are not `pub`**: `ApprovedQuery::new` is callable only from the approval logic
 in the same module.
 
-### 5.2 "Needs approval" is an output, not an error
+### 4.2 `RenderedGrid` formats lazily
+
+The obvious implementation materialises `Vec<Vec<Cell>>`. At 200k rows by 60 columns that
+allocates twelve million strings in order to display thirty of them. So `RenderedGrid` owns
+the `ResultSet` and formats cells on access; only column widths are computed eagerly, from a
+sample of the first rows.
+
+Widths are sampled rather than measured over everything for a second reason: a column that
+resized itself as pages arrived would be unusable.
+
+Three details that only surface against real data:
+
+- Width is measured in **display columns, not characters**. Seven CJK characters occupy
+  fourteen terminal columns.
+- Newlines and tabs are replaced before they reach the terminal, and cell text is clamped, so
+  a megabyte-long value is not re-measured on every frame.
+- `NULL` renders as a glyph. A blank cell is indistinguishable from an empty string.
+
+### 4.3 "Needs approval" is an output, not an error
 
 ```rust
-pub struct RunQueryInput {
-    pub tab: TabId,
-    pub sql: RawSql,
-    pub approval: Approval,          // Ask | Approved { up_to_bytes: u64 }
-}
-
 pub enum RunQueryOutput {
     Started       { handle: QueryHandle },
     NeedsApproval { estimate: Estimate, prepared: PreparedSql },
 }
 ```
 
-"Over the threshold, so confirmation is needed" is not a failure — it is **a normal branch**,
-so it is a variant of `Output` rather than an `Err`. The UI shows a confirmation dialog on
-`NeedsApproval` and calls the same use case again with `Approval::Approved`.
+"Over the threshold, so confirmation is needed" is not a failure — it is **a normal branch**.
+The UI shows a confirmation dialog on `NeedsApproval` and calls the same use case again with
+`Approval::Approved`.
 
-### 5.3 Layout, and the relationship to `Action`
-
-```
-crates/sqlake-app/src/
-├── action.rs            # intents raised by the UI
-├── store.rs             # applies actions, invokes use cases, updates the snapshot
-├── snapshot.rs
-└── usecase/
-    ├── mod.rs           # UseCase trait and AppError
-    ├── connect.rs
-    ├── expand_node.rs
-    ├── preview_table.rs
-    ├── describe_table.rs
-    ├── run_query.rs
-    ├── save_template.rs
-    └── search_history.rs
-```
+### 4.4 The relationship to `Action`
 
 `Action` is a raw intent from the UI ("this button was pressed"); a use case `Input` is
 validated. **The UI never calls a use case directly.** The store builds an `Input` from an
-`Action`, invokes the use case, and folds the `Output` into the `Snapshot`. That step is one
-more raw-to-validated conversion.
+`Action`, invokes the use case, and folds the `Output` into the `Snapshot`.
+
+`Action` carries only what touches data or performs I/O. An action carries no parameter the
+store already owns: sorting names a column but not a direction, so two fast header clicks
+cannot race with a sort already in flight.
 
 ---
 
-## 6. Concurrency and state
+## 5. Concurrency and state
 
-### 6.1 Topology
+### 5.1 Topology
 
 ```
    ┌─────────────────── tokio multi-thread runtime ───────────────────┐
@@ -324,10 +289,13 @@ more raw-to-validated conversion.
   an immutable `Arc<Snapshot>` on a `tokio::sync::watch` channel.
 - Heavy data such as row buffers lives behind `Arc<Vec<Row>>` and is shared across snapshots,
   so cloning a snapshot is effectively a pointer copy.
-- Each connection is serialised by one task. Cancellation bypasses the queue: the UI invokes
-  `CancelHandle` directly.
+- **The store never awaits a use case inline.** Every call is spawned and its result returns
+  as an internal event, so one slow expansion cannot block every other action.
+- One actor task per connection owns the `Box<dyn Session>` and serialises access, so drivers
+  need not be internally concurrent. Holding more than one physical connection is a
+  driver-level concern (§10.1), not something the application layer arranges.
 
-### 6.2 Render loop
+### 5.2 Render loop
 
 ```rust
 let mut term_events = crossterm::event::EventStream::new();   // feature = "event-stream"
@@ -337,9 +305,8 @@ let mut dirty       = true;
 
 loop {
     if dirty {
-        let mut hits = HitMap::new();
+        hits.clear();
         terminal.draw(|f| views::shell::render(f, &snapshot.borrow(), &mut ui, &mut hits))?;
-        ui.hits = hits;             // the next event is resolved against these rectangles
         dirty = false;
     }
 
@@ -355,10 +322,10 @@ loop {
 ```
 
 **Do not run at a fixed frame rate.** Redraw only when an event arrives or state changes.
-Mouse-move events fire for every cell, so `dirty` is set **only when the hovered target
-actually changes**.
+Mouse-move events fire for every cell, so `dirty` is set only when the hovered target
+actually changes.
 
-### 6.3 Two kinds of state
+### 5.3 Two kinds of state
 
 | Kind | Owner | Examples |
 | --- | --- | --- |
@@ -368,82 +335,111 @@ actually changes**.
 Transient UI state does not go into the store. Mixing the two makes the scroll position jump
 on every asynchronous update.
 
-### 6.4 Logging and terminal restore
+The same split decides what an input event becomes: `Intent::View` is applied synchronously
+inside the render loop, `Intent::App` is dispatched to the store. Routing a wheel tick through
+an async task would add a round trip to every notch.
+
+Tree expansion is data, not appearance: it drives lazy loading. So the store owns it and
+publishes the tree already flattened, and drawing the tree is a slice and an index rather than
+a recursive walk.
+
+### 5.4 Terminal state, logging and panics
 
 - Writing to stdout while the TUI is up corrupts the screen, so `tracing` plus
   `tracing-appender` write to `~/.local/state/sqlake/sqlake.log` and nowhere else.
-  Controlled by `RUST_LOG`.
-- Terminal restore (`LeaveAlternateScreen`, `DisableMouseCapture`, `disable_raw_mode`) is
-  **concentrated in `TerminalGuard::drop`**. The panic hook and the `$EDITOR` launch both go
-  through that single path. **Write this first** — without it, development corrupts the
-  terminal constantly.
+- **Terminal mode changes happen in exactly one place.** Raw mode, the alternate screen and
+  mouse capture all have to be undone on every exit path — a clean quit, a panic, and handing
+  the terminal to `$EDITOR` (§8) — so all three go through one `restore` function, called from
+  `TerminalGuard::drop`.
+- The panic hook calls `restore` before delegating to the previous hook. The hook runs before
+  unwinding, so the screen is usable by the time the backtrace prints. Without this, a panic
+  leaves the message invisible on the alternate screen.
 
 ---
 
-## 7. Mouse foundation (`sqlake-tui::hit`)
+## 6. Mouse foundation
 
-ratatui has no hit testing, but the rectangles are in hand at draw time, so the layer is thin.
+ratatui has no hit testing, but it hands every rectangle to the code that draws it. So each
+widget records "this rectangle is this thing" while drawing, and a click is resolved against
+that record.
 
-### 7.1 HitMap
-
-Render functions take `&mut HitMap` and record which rectangle belongs to whom.
+### 6.1 HitMap
 
 ```rust
 pub struct HitMap { entries: Vec<(Rect, u8 /* z */, Target)> }
 
 pub enum Target {
     Pane(PaneId),
-    TreeRow    { conn: ConnId, idx: usize },
-    TreeToggle { conn: ConnId, idx: usize },
-    GridCell   { tab: TabId, row: usize, col: usize },
-    GridHeader { tab: TabId, col: usize },       // click to sort
-    GridColEdge{ tab: TabId, col: usize },       // drag to resize
-    Scrollbar  { pane: PaneId, part: ScrollPart },
+    TreeRow { index: usize }, TreeToggle { index: usize },
+    GridCell { row: usize, col: usize },
+    GridHeader { col: usize },      // click to sort
+    GridColEdge { col: usize },     // drag to resize
+    Scrollbar { pane: PaneId, part: ScrollPart },
     Splitter(SplitId),
     Tab(TabId), TabClose(TabId),
-    Button(ButtonId), MenuItem(MenuItemId),
-}
-
-impl HitMap {
-    pub fn push(&mut self, rect: Rect, z: u8, t: Target) { .. }
-    pub fn at(&self, pos: Position) -> Option<&Target> {
-        self.entries.iter().rev()
-            .filter(|(r, _, _)| r.contains(pos))
-            .max_by_key(|(_, z, _)| *z).map(|(_, _, t)| t)
-    }
+    Button(ButtonId), Toast(ToastId),
+    Backdrop,
 }
 ```
 
-Carrying `z` is what lets **modals and popovers reliably swallow clicks meant for what is
-behind them**. Deciding this up front avoids a guaranteed rewrite later.
+The highest `z` wins; between equal `z` the most recently pushed wins, which is whatever was
+drawn last and so is on top. Z levels are named constants, not magic numbers: content, chrome,
+backdrop, modal, menu.
 
-### 7.2 Gesture synthesis
+**A modal pushes a full-screen backdrop rectangle below itself.** Without it a click outside
+the modal falls through, and a confirmation dialog becomes a way to trigger the thing it was
+confirming. The backdrop resolves to `Target::Backdrop`, which dismisses the modal.
+
+Two hit targets need care:
+
+- The tree toggle glyph overlaps its row and must win. Same z, pushed later.
+- A column boundary is drawn one cell wide, but asking the user to land on a single cell is
+  asking too much. The hit area is three cells; the drawn line stays one.
+
+The map is cleared and reused each frame rather than reallocated.
+
+### 6.2 Gesture synthesis
+
+The terminal reports presses, releases and motion. The UI wants clicks, double clicks and
+drags. Translating once means no widget reasons about button state.
+
+- A drag keeps the target captured at button-down, **even after the pointer leaves the
+  rectangle**. Without this, resizing a column stops the moment the pointer outruns the cursor.
+- Releasing after a drag is not a click. Emitting both would fire the row's action every time
+  the user finished resizing something on it.
+- A double click is judged from where each click *started*, and consumes the pair, so a third
+  click begins a new one.
+- Hover reports only when the target changes. Motion within one row is the common case, and
+  reporting it would redraw on every cell of movement.
+
+### 6.3 One input pipeline
 
 ```rust
-pub struct MouseState {
-    pressed:    Option<(Target, Position)>,   // drag origin; tracked even outside the rect
-    last_click: Option<(Target, Instant)>,    // double click: 300ms, same target
-    hover:      Option<Target>,
-}
+fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext) -> Vec<Intent>
+fn on_key  (event: KeyEvent, ctx: &InputContext) -> Vec<Intent>
 ```
 
-`MouseEvent` is folded into
-`Gesture { Click, DoubleClick, RightClick, DragBy(dx,dy), Scroll(±), HoverEnter/Leave }`, and
-`(Target, Gesture)` is translated into intents.
+**Mouse and keyboard produce the same intents.** `IntentKind` names a *capability* rather than
+a variant, so clicking a tree row and arrowing onto it are the same kind. That is the level at
+which "reachable by keyboard" is a claim about what the user can do.
 
-### 7.3 One input pipeline — the most important decision here
+The mechanism is a chain, and each link is enforced by the compiler or a test:
 
-```rust
-// input.rs
-fn on_mouse(target: &Target, g: Gesture, ui: &UiState) -> Vec<Intent>
-fn on_key  (key: KeyEvent,   ui: &UiState) -> Vec<Intent>
-```
+1. The kind enum and its complete list are generated from one macro invocation, so they cannot
+   drift apart.
+2. `IntentKind::of` is an exhaustive match, so adding an `Intent` variant stops the crate
+   compiling until the new intent has a kind.
+3. A test sweeps every `Target` × `Gesture` pair and asserts that every kind it can reach has
+   a key binding. Exhaustive matches on both enums force the sample lists to grow with them.
 
-**Mouse and keyboard produce the same intents.** Nothing becomes mouse-only by construction,
-and a new feature cannot ship without a key binding. Both are pure functions, so tests can
-enforce it.
+The key map is **data, not code** — a table of `(keys, context, kind)`. Being enumerable is
+what makes the test possible, and it gives a help modal and user-defined bindings for free. A
+pane binding beats the global one for the same key, which is how `Esc` can dismiss a modal in
+one context and a toast in another without being ambiguous.
 
-### 7.4 Terminal caveats
+The reverse direction is deliberately not required: keyboard-only capabilities are fine.
+
+### 6.4 Terminal caveats
 
 - Mouse capture takes native text selection away from the terminal. The status bar
   permanently shows "Shift (or Option) + drag to select", **clipboard copy is implemented via
@@ -452,23 +448,23 @@ enforce it.
 - Some terminals and tmux configurations cannot deliver right-click, so every context menu
   entry also has a key binding.
 
-### 7.5 Operation matrix
+### 6.5 Operation matrix
 
 | Part | Mouse | Keyboard |
 | --- | --- | --- |
-| Pane | click to focus | `Ctrl-h/j/k/l` |
-| Splitter | drag to resize, double-click to even out | `Ctrl-←/→` |
+| Pane | click to focus | `Tab`, `Ctrl-h` |
+| Splitter | drag to resize, double-click to even out | `Ctrl-←/→`, `=` |
 | Scrolling | wheel, thumb drag, track click | `j/k`, `PgUp/PgDn`, `g/G` |
-| Grid | header click sorts, edge drag resizes, cell click selects, shift-click extends, right-click opens menu | arrows, `v`, `y` |
-| Tree | click `▸` to expand, double-click to preview | `Enter`, `←/→` |
-| Tabs | click to switch, `×` or middle-click to close | `Ctrl-Tab`, `Ctrl-w` |
+| Grid | header click sorts, edge drag resizes, cell click selects, right-click opens menu | `J/K`, `s`, `<`/`>` |
+| Tree | click `▸` to expand, double-click to open | `Space`, `Enter` |
+| Tabs | click to switch, `×` or middle-click to close | `]`/`[`, `Ctrl-w` |
 | Editor area | click to open `$EDITOR` | `e` |
 | Modal | click outside to dismiss | `Esc` |
 | Command palette | — | `Ctrl-p` |
 
 ---
 
-## 8. Screen layout
+## 7. Screen layout
 
 ```
 ┌ sqlake ── [● prod-pg] [○ bq-analytics] [+] ─────────────────────── ⚙ ─┐
@@ -487,8 +483,10 @@ enforce it.
 ```
 crates/sqlake-tui/src/
 ├── app.rs           # event loop, terminal setup, TerminalGuard
-├── hit.rs           # HitMap, Target, MouseState, Gesture
-├── input.rs         # (Target, Gesture) -> Intent, KeyEvent -> Intent
+├── hit.rs           # HitMap, Target, z levels
+├── mouse.rs         # MouseState, gesture synthesis
+├── intent.rs        # Intent, ViewCmd, IntentKind
+├── input.rs         # KEYMAP, on_key, on_mouse
 ├── editor.rs        # launching and returning from $EDITOR
 ├── ui_state.rs      # scroll, selection, column widths, splits, focus
 ├── theme.rs
@@ -502,59 +500,59 @@ crates/sqlake-tui/src/
     └── history.rs   # features 7 and 8
 ```
 
-The data grid **must be virtualised** — only visible rows are drawn. `TableState::offset` is
-managed by hand so that 100k rows cost the same as 100.
+The data grid **must be virtualised** — only visible rows are drawn — so that 100k rows cost
+the same as 100.
 
 ---
 
-## 9. No SQL editor: delegate to `$EDITOR` (feature 4)
+## 8. No SQL editor: delegate to `$EDITOR` (feature 4)
 
-Write the buffer to a temporary file, launch `$EDITOR` (neovim or whatever else), and read it
-back when the editor exits. The same mechanism as `git commit`.
+Write the buffer to a temporary file, launch `$EDITOR`, and read it back when the editor
+exits. The same mechanism as `git commit`.
 
-### 9.1 What this buys
+### 8.1 What this buys
 
 - Syntax highlighting, completion, snippets, LSP (`sqls`, `sqlfluff`), key bindings, macros —
   **the user's existing neovim configuration applies unchanged.**
 - No dependency on any editor crate, and no multi-line editing, undo/redo or search to write.
 - The temporary file carries a `.sql` extension, so filetype detection works automatically.
 
-### 9.2 Flow
+### 8.2 Flow
 
 1. `e`, or a click on the editor area → `Action::EditExternally { tab }`.
 2. **The main loop handles this synchronously** — it hands the terminal over, so ordering
    matters and it must not go through the store.
-   - Release `TerminalGuard` (`disable_raw_mode`, `LeaveAlternateScreen`, `DisableMouseCapture`)
+   - Release `TerminalGuard`
    - Write the buffer to `~/.local/state/sqlake/scratch/{tab_id}.sql`
    - `Command::new(editor).args(&args).arg(path).status()` and wait
    - Re-acquire `TerminalGuard` and `terminal.clear()` for a full redraw
 3. Read the file back into a `RawSql`. If it changed, record it as a draft in history.
 4. `Ctrl-Enter` or the run button hands off to the `RunQuery` use case: estimate, approve, run.
 
-### 9.3 Caveats
+### 8.3 Caveats
 
-- **Terminal restore is concentrated in `TerminalGuard::drop`.** Running the same code as the
-  panic path means an editor that dies abnormally still leaves a usable screen.
+- Restore runs through the same path as the panic hook (§5.4), so an editor that dies
+  abnormally still leaves a usable screen.
 - Editor resolution order: the `editor` setting, `$VISUAL`, `$EDITOR`, then `vi`. `editor_args`
   (e.g. `["--wait"]`) exists for GUI editors.
 - The store task keeps running while the editor is open, so streams from running queries are
   still consumed. The display catches up on return.
 - Scratch files are persisted per tab and reloaded on session restore.
 
-### 9.4 What the SQL tab does own
+### 8.4 What the SQL tab does own
 
 Everything except editing: a read-only preview of the buffer, run and cancel, the estimated
 byte count, error line highlighting, the result grid, and tab management.
 
-### 9.5 Possible later (out of scope for v1)
+### 8.5 Possible later (out of scope for v1)
 
 A watch mode: use `notify` to watch the scratch file and re-run automatically on every save,
 so neovim can stay open in another tmux pane. Genuinely useful for a personal tool, but it
-adds a dependency, so not in v1.
+adds a dependency.
 
 ---
 
-## 10. Configuration and secrets (`sqlake-config`)
+## 9. Configuration and secrets (`sqlake-config`)
 
 ```
 ~/.config/sqlake/
@@ -599,13 +597,13 @@ masking lives in exactly one function and never reaches the log.
 
 ---
 
-## 11. Drivers
+## 10. Drivers
 
-### 11.1 PostgreSQL
+### 10.1 PostgreSQL
 
 - `tokio-postgres` with `tokio-postgres-rustls`; `sslmode` maps onto the rustls configuration.
 - Hold **two connections: one for queries, one for metadata**, so that expanding the tree is
-  never blocked behind a long-running query.
+  never blocked behind a long-running query. Both sit behind one `Session`.
 - Cancellation uses `client.cancel_token()`. On connect, set `application_name = 'sqlake'`,
   a `statement_timeout`, and — when the profile is read-only —
   `SET default_transaction_read_only = on`.
@@ -616,10 +614,10 @@ masking lives in exactly one function and never reaches the log.
   true, holding `(Type, Vec<u8>)`. Decode the ~40 known OIDs strictly and route everything
   else to `Value::Opaque`. Extension and user-defined types then cannot crash the client.
 - Preview issues `SELECT * FROM "sch"."tbl" ORDER BY … LIMIT n OFFSET m`. Identifiers can only
-  be assembled through `QuotedIdent` (§5.1).
+  be assembled through `QuotedIdent` (§4.1).
 - Show the `EXPLAIN` row estimate first; run an exact `COUNT(*)` only on explicit request.
 
-### 11.2 BigQuery
+### 10.2 BigQuery
 
 - `gcp-bigquery-client` with `yup-oauth2` (ADC, service account, or impersonation). Where the
   crate lags the API, wrap REST calls thinly inside the driver so `reqwest` can be used
@@ -638,7 +636,7 @@ masking lives in exactly one function and never reaches the log.
 
 ---
 
-## 12. Proxies and tunnels (feature 6)
+## 11. Proxies and tunnels (feature 6)
 
 ```rust
 #[async_trait]
@@ -667,7 +665,7 @@ timeout = "20s"
 
 ---
 
-## 13. History and templates (features 7 and 8)
+## 12. History and templates (features 7 and 8)
 
 One SQLite file (`rusqlite`, bundled).
 
@@ -690,40 +688,35 @@ CREATE TABLE templates (
 
 - The history tab searches incrementally through FTS5. Clicking a row writes it to a scratch
   file; starring it promotes it to a template.
-- Templates carry `{{param}}` placeholders. As types this is
-  `Template` → `BoundTemplate` → `RawSql`, the same shape as §5.1. Placeholders like
-  `{{table}}` are completed from the currently selected tree node.
+- Templates carry `{{param}}` placeholders, staged like §4.1. Placeholders such as `{{table}}`
+  are completed from the currently selected tree node.
 - **Failed queries are recorded too** — in a personal tool, the failures are the useful part.
 
 ---
 
-## 14. Testing
+## 13. Testing
 
 **In-source tests by default**, in a `#[cfg(test)] mod tests` at the bottom of each file.
-Private pure functions can then be tested directly, with no need to widen visibility to
-`pub(crate)` for the sake of a test. This design is heavy on pure functions and type
-conversions, so the two fit well.
+Private pure functions can then be tested directly, with no need to widen visibility for the
+sake of a test. This design is heavy on pure functions and type conversions, so the two fit
+well.
 
-| Subject | Location | Content |
-| --- | --- | --- |
-| Stage conversions | in-source | `RawSql → ValidatedSql → PreparedSql`, `Ident → QuotedIdent` escaping, `Template → BoundTemplate` |
-| Use cases | in-source | Inject the mock driver and check input to output, including the `NeedsApproval` branch |
-| Input layer | in-source | `(Target, Gesture) -> Intent` and `KeyEvent -> Intent`. An exhaustive test enforces that **every intent has a keyboard path** |
-| Value formatting | in-source | `Value -> Cell`: unknown types, NULL, huge numbers, full-width characters, embedded newlines |
-| HitMap | in-source | z-order resolution and off-by-one errors at rectangle edges |
-| Screen snapshots | in-source + `insta` | Render to `TestBackend` at fixed sizes and compare the `Buffer` |
-| Driver conformance | `tests/` | One shared suite run against pg, bq and mock. `testcontainers` for pg; an emulator or `#[ignore]` for bq |
+`tests/` is reserved for behaviour observable from outside the crate — chiefly the shared
+driver conformance suite, run against PostgreSQL via `testcontainers`, against BigQuery via an
+emulator, and against the mock.
 
-`tests/` is reserved for behaviour observable from outside the crate. Because
-`sqlake-driver-mock` exists, use case and screen tests run in CI with no database.
+Screen snapshots use `insta` with ratatui's `TestBackend`. They are brittle by nature, so they
+cover a small number of representative screens rather than every state.
+
+Because `sqlake-driver-mock` exists, every other test runs with no database and no network.
 
 ---
 
-## 15. Milestones
+## 14. Milestones
 
 | # | Content | Done when |
 | --- | --- | --- |
-| **M0 — Foundation** | workspace, domain types, staged types, `UseCase` trait, store, render loop, `TerminalGuard`, **`HitMap` and one input pipeline**, base widgets, mock driver | The tree and the grid can be driven entirely by mouse against the mock connection, and every one of those operations also works from the keyboard. See [design-m0.md](design-m0.md) |
+| **M0 — Foundation** | workspace, domain types, staged types, `UseCase` trait, store, render loop, `TerminalGuard`, `HitMap` and one input pipeline, base widgets, mock driver | The tree and the grid can be driven entirely by mouse against the mock connection, and every one of those operations also works from the keyboard. See [design-m0.md](design-m0.md) |
 | **M1** | Connection management (feature 1) | `Profile → ResolvedProfile`, keyring, connection test, connection tabs |
 | **M2** | Table list (feature 2) | Lazy tree expansion for pg and bq, filter search |
 | **M3** | Table preview (feature 3) | Paging, sorting, cell detail, CSV/JSON copy via OSC 52 |
@@ -734,28 +727,33 @@ conversions, so the two fit well.
 | **M8** | Query history (feature 8) | FTS search, re-run, promote to template |
 
 **M0 determines the feel of everything else.** `HitMap`, the data grid and the staged types in
-§5 are all expensive to replace later, so they are the parts worth finishing properly first.
+§4 are all expensive to replace later, so they are the parts worth finishing properly first.
 
 ---
 
-## 16. Risks
+## 15. Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Terminal state corrupted after returning from the external editor | unusable | Concentrate restore in `TerminalGuard::drop` and run the same code as the panic path |
+| Terminal state corrupted after returning from the external editor | unusable | One restore path, shared with the panic hook (§5.4) |
 | `$EDITOR` is a GUI editor and returns immediately | annoyance | `editor_args` can supply a `--wait` equivalent; warn when the editor exits instantly |
 | Mouse capture steals native text selection | annoyance | OSC 52 copy as standard, a permanent hint about shift-drag, and `--no-mouse` |
-| Terminals and tmux configurations without right-click or hover | missing features | Every feature has a key binding, enforced by the exhaustive test in `input.rs` |
+| Terminals and tmux configurations without right-click or hover | missing features | Every feature has a key binding, enforced by the coverage test (§6.3) |
 | Event-driven rendering misses an update | looks frozen | `dirty` is only set in the three `select!` arms; nothing else draws |
-| Data grid performance (100k rows × 100 columns) | usability | Draw only visible rows; fix column widths by sampling the first N rows; swap in `rat-ftable` if that is not enough |
-| Too many staged types make the code verbose | velocity | Keep to the pipelines listed in §5.1; add a stage only when skipping it would cause a real accident |
+| Data grid performance (100k rows × 100 columns) | usability | Draw only visible rows; sample column widths; swap in `rat-ftable` if that is not enough |
+| Too many staged types make the code verbose | velocity | Keep to the pipelines listed in §4.1; add a stage only when skipping it would cause a real accident |
 | BigQuery billing accident | real cost | `tabledata.list` for preview; `ApprovedQuery` enforced by the type system; `maximumBytesBilled` |
 | Unknown PostgreSQL type crashes the client | unusable | `Value::Opaque` fallback enforced by the type system |
 | Accidental operation against production | real damage | `color` and `readonly` on the profile; read-only connections set `default_transaction_read_only = on` |
 
 ---
 
-## 17. Dependencies (provisional)
+## 16. Dependencies
+
+The UI layer depends on **`ratatui` and `crossterm`, and nothing else**. The data grid, tree,
+modals, scrollbar handling and focus are written here, because each has requirements specific
+to this project and each is a few hundred lines at most. `rat-ftable` is the fallback if the
+grid cannot be made fast enough.
 
 ```toml
 # shared
@@ -772,9 +770,10 @@ directories = "6"
 time = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# UI — these two and nothing else
+# UI
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
+unicode-width = "0.2"
 
 # configuration and secrets
 keyring = "3"
@@ -798,16 +797,17 @@ testcontainers = "0.25"
 insta = "1"
 ```
 
+`crossterm` is declared directly, pinned to the version ratatui re-exports, only to turn on
+the `event-stream` feature.
+
 For `ValidatedSql`, start by checking whether splitting on semicolons and classifying the
-statement is enough; reach for `sqlparser` only if it is not. Versions are pinned with
-`cargo add` at implementation time.
+statement is enough; reach for `sqlparser` only if it is not.
 
 ---
 
-## 18. References
+## 17. References
 
 - [ratatui](https://ratatui.rs/) and [awesome-ratatui](https://github.com/ratatui/awesome-ratatui)
 - [rainfrog](https://github.com/achristmascarl/rainfrog) — a PostgreSQL TUI in Rust and
-  ratatui with a mouse mode. **The closest reference implementation**
+  ratatui with a mouse mode. The closest reference implementation
 - [rat-salsa / rat-widget](https://lib.rs/crates/rat-widget) — fallback for large tables
-- [iocraft](https://github.com/ccbrown/iocraft) — not adopted; reasoning in §2

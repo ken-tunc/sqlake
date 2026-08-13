@@ -23,17 +23,6 @@ is reachable with the mouse, and every one of those actions also has a key bindi
 7. SQL templates
 8. Query history
 
-## Notable decisions
-
-- **Built on ratatui.** Immediate-mode rendering means layout rectangles are in hand at draw
-  time, which makes mouse hit testing a matter of `rect.contains(pos)`. See
-  [ADR-001](docs/design.md#2-choosing-the-ui-foundation-adr-001).
-- **No built-in SQL editor.** The buffer is handed to `$EDITOR`, the same way `git commit`
-  does it, so an existing neovim setup applies unchanged.
-- **Use case inputs and outputs are types.** "Before" and "after" are distinct types, so a
-  skipped step is a compile error — most importantly, a BigQuery query cannot be executed
-  without first being estimated and approved.
-
 ## License
 
 MIT
