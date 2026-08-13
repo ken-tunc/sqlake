@@ -118,8 +118,18 @@ pub const KEYMAP: &[KeyBinding] = &[
         context: Context::Explorer,
         kind: IntentKind::TreeSelection,
     },
+    // Upper case moves the selection, lower case and the arrows move the
+    // view: `H`/`L` are to `J`/`K` what `Left`/`Right` are to `j`/`k`. Without
+    // the horizontal pair the mouse can select any cell and the keyboard
+    // cannot, which the coverage sweep does not catch because both are the
+    // same capability.
     KeyBinding {
         keys: &[key('J'), key('K')],
+        context: Context::Grid,
+        kind: IntentKind::GridSelection,
+    },
+    KeyBinding {
+        keys: &[key('H'), key('L')],
         context: Context::Grid,
         kind: IntentKind::GridSelection,
     },
@@ -463,7 +473,10 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
     let backwards = matches!(
         event.code,
         KeyCode::Up | KeyCode::PageUp | KeyCode::Left | KeyCode::Home | KeyCode::BackTab
-    ) || matches!(event.code, KeyCode::Char('h' | 'k' | 'K' | '<' | 'g' | '['));
+    ) || matches!(
+        event.code,
+        KeyCode::Char('h' | 'H' | 'k' | 'K' | '<' | 'g' | '[')
+    );
 
     match kind {
         IntentKind::Focus => vec![if backwards {
@@ -499,13 +512,17 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         IntentKind::TreeSelection => {
             vec![ViewCmd::MoveTreeSelection(if backwards { -1 } else { 1 }).into()]
         }
-        IntentKind::GridSelection => vec![
-            ViewCmd::MoveCellSelection {
-                drow: if backwards { -1 } else { 1 },
-                dcol: 0,
-            }
-            .into(),
-        ],
+        IntentKind::GridSelection => {
+            let step = if backwards { -1 } else { 1 };
+            let sideways = matches!(event.code, KeyCode::Char('H' | 'L'));
+            vec![
+                ViewCmd::MoveCellSelection {
+                    drow: if sideways { 0 } else { step },
+                    dcol: if sideways { step } else { 0 },
+                }
+                .into(),
+            ]
+        }
         IntentKind::ResizeColumn => vec![
             ViewCmd::ResizeColumn {
                 col: ctx.grid_column.unwrap_or(0),
@@ -944,6 +961,35 @@ mod tests {
         assert_eq!(
             on_key(press_ctrl(KeyCode::Char('h')), &c),
             [Intent::View(ViewCmd::FocusPrevPane)]
+        );
+    }
+
+    #[test]
+    fn the_cell_cursor_moves_on_both_axes() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+
+        // A click selects any cell, so the keyboard has to reach any cell too.
+        // Both directions are `GridSelection`, so the coverage sweep cannot
+        // see the difference — it was missing until someone looked.
+        for (k, drow, dcol) in [('J', 1, 0), ('K', -1, 0), ('L', 0, 1), ('H', 0, -1)] {
+            assert_eq!(
+                on_key(press(KeyCode::Char(k)), &c),
+                [Intent::View(ViewCmd::MoveCellSelection { drow, dcol })],
+                "{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arrows_still_move_the_view_not_the_selection() {
+        // Lower case and the arrows scroll; upper case selects. Breaking that
+        // symmetry is how `Left` ends up meaning two things.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Right), &c),
+            [Intent::View(ViewCmd::ScrollXBy { delta: 1 })]
         );
     }
 
