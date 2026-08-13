@@ -49,10 +49,15 @@ pub enum CellKind {
     Opaque,
 }
 
+/// Alignment is deliberately absent: it is a property of the *column*, not of
+/// the value, and lives on [`RenderedColumn`].
+///
+/// Deciding it per value looks harmless and is not. A nullable integer column
+/// would right-align its numbers and left-align its `∅`, because a null is not
+/// numeric — so a perfectly ordinary column comes out ragged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     pub text: String,
-    pub align: Align,
     pub kind: CellKind,
 }
 
@@ -88,10 +93,15 @@ impl RenderedGrid {
                     .map(|row| display_width(&format_value(row.get(i))))
                     .max()
                     .unwrap_or(0);
-                let header = display_width(&col.name);
+                // Headers go through the same treatment as values. A driver's
+                // column name is data too: `SELECT 1 AS "a<LF>b"` is legal in
+                // PostgreSQL, and a raw newline in a header splits the grid
+                // apart exactly as one in a cell does.
+                let name = sanitise(&col.name);
+                let header = display_width(&name);
                 RenderedColumn {
-                    name: col.name.clone(),
-                    type_name: col.type_name.clone(),
+                    type_name: sanitise(&col.type_name),
+                    name,
                     natural_width: sampled.max(header).clamp(MIN_WIDTH, MAX_WIDTH),
                     align: column_align(&result, i),
                 }
@@ -128,7 +138,6 @@ impl RenderedGrid {
         let value = self.result.rows.get(row).and_then(|r| r.get(col));
         Cell {
             text: format_value(value),
-            align: value.map_or(Align::Left, align_of),
             kind: value.map_or(CellKind::Null, kind_of),
         }
     }
@@ -161,14 +170,6 @@ fn column_align(result: &ResultSet, col: usize) -> Align {
     if saw_value { Align::Right } else { Align::Left }
 }
 
-fn align_of(value: &Value) -> Align {
-    if value.is_numeric() {
-        Align::Right
-    } else {
-        Align::Left
-    }
-}
-
 fn kind_of(value: &Value) -> CellKind {
     match value {
         Value::Null => CellKind::Null,
@@ -192,14 +193,17 @@ fn format_value(value: Option<&Value>) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(n) => n.to_string(),
         Value::Float(f) => format_float(*f),
-        Value::Decimal(s) => s.clone(),
+        // PostgreSQL `numeric` goes to 131,072 digits. `raw` still hands the
+        // whole thing to the detail view and to copying; the *cell* is clamped
+        // like every other long value.
+        Value::Decimal(s) => sanitise(s),
         Value::Text(s) => sanitise(s),
         Value::Bytes(b) => format_bytes(b),
         Value::Date(d) => d.to_string(),
         Value::Time(t) => t.to_string(),
         Value::Timestamp(ts) => ts.to_string(),
         Value::TimestampTz(ts) => ts.to_string(),
-        Value::Json(j) => sanitise(&j.to_string()),
+        Value::Json(j) => format_json(j),
         Value::Array(items) => format!("[{} items]", items.len()),
         Value::Struct(fields) => format!("{{{} fields}}", fields.len()),
         Value::Opaque { text, type_name } => {
@@ -212,13 +216,40 @@ fn format_value(value: Option<&Value>) -> String {
     }
 }
 
+/// Magnitudes outside this range are shown in exponent form.
+///
+/// Rust's `Display` for `f64` never uses one, so `1e300` renders as 301 digits
+/// and `1e-300` as 302 — a cell wider than the terminal, carrying no
+/// information a reader can use.
+const FLOAT_EXP_ABOVE: f64 = 1e15;
+const FLOAT_EXP_BELOW: f64 = 1e-5;
+
 fn format_float(f: f64) -> String {
     if f.is_nan() {
-        "NaN".to_owned()
-    } else if f.is_infinite() {
-        if f.is_sign_negative() { "-∞" } else { "∞" }.to_owned()
+        return "NaN".to_owned();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_negative() { "-∞" } else { "∞" }.to_owned();
+    }
+    let magnitude = f.abs();
+    if magnitude != 0.0 && !(FLOAT_EXP_BELOW..FLOAT_EXP_ABOVE).contains(&magnitude) {
+        format!("{f:e}")
     } else {
         f.to_string()
+    }
+}
+
+/// Objects and arrays collapse to a count, which is what [`CellKind::Complex`]
+/// promises and what the detail view is for.
+///
+/// Collapsing is not only about width: `to_string` on a megabyte of `jsonb`
+/// allocates the whole document, and doing that for every visible cell on every
+/// frame is exactly the cost this module exists to avoid.
+fn format_json(json: &serde_json::Value) -> String {
+    match json {
+        serde_json::Value::Object(fields) => format!("{{{} keys}}", fields.len()),
+        serde_json::Value::Array(items) => format!("[{} items]", items.len()),
+        scalar => sanitise(&scalar.to_string()),
     }
 }
 
@@ -234,10 +265,28 @@ fn format_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Replace control characters and clamp the length.
+/// Whether a character rewrites the direction of the text that follows it.
 ///
-/// A raw newline or tab reaching the terminal breaks the grid apart, and a
-/// megabyte-long text value must not be measured in full on every frame.
+/// These are the bidirectional overrides and isolates. Left in place, an
+/// unterminated one — and a one-line grid cell never terminates anything —
+/// reorders the rest of the line, so a value can paint itself over the column
+/// beside it. `unicode-width` scores them zero, so they do not even show up in
+/// the width calculation.
+///
+/// Deliberately **not** "every `Cf` character": ZWJ (U+200D) is `Cf` too, and
+/// replacing it would take every emoji sequence apart. The directional *marks*
+/// U+200E/U+200F are left alone as well — they nudge the ordering of the run
+/// they sit in rather than overriding everything after them, and mixed-script
+/// text uses them legitimately.
+const fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Replace anything that would rewrite the terminal, and clamp the length.
+///
+/// A raw newline or tab breaks the grid apart, an escape sequence repaints it,
+/// a bidi override reorders it, and a megabyte-long value must not be measured
+/// in full on every frame.
 fn sanitise(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_CELL_CHARS));
     for (i, ch) in s.chars().enumerate() {
@@ -248,7 +297,9 @@ fn sanitise(s: &str) -> String {
         match ch {
             '\n' | '\r' => out.push('␊'),
             '\t' => out.push('␉'),
-            c if c.is_control() => out.push('·'),
+            // `is_control` is category Cc only, which is why the bidi test is
+            // separate: U+202E is Cf and sails straight through it.
+            c if c.is_control() || is_bidi_control(c) => out.push('·'),
             c => out.push(c),
         }
     }
@@ -466,5 +517,139 @@ mod tests {
         let g = one(Value::Int(7));
         assert_eq!(g.raw(0, 0), Some(&Value::Int(7)));
         assert_eq!(g.raw(1, 0), None);
+    }
+
+    #[test]
+    fn bidi_overrides_are_replaced_but_zero_width_joiners_survive() {
+        // U+202E is category Cf, so `char::is_control` is false for it and it
+        // sails through any check built on that alone.
+        assert!(!'\u{202e}'.is_control());
+        let reordered = text_of(Value::Text("total\u{202e}drawkcab".into()));
+        assert!(!reordered.contains('\u{202e}'), "{reordered:?}");
+
+        // The same category holds ZWJ, and replacing that would take every
+        // emoji sequence apart.
+        let family = text_of(Value::Text("👨\u{200d}👩\u{200d}👧".into()));
+        assert!(family.contains('\u{200d}'), "{family:?}");
+    }
+
+    #[test]
+    fn headers_are_sanitised_like_cells() {
+        let g = grid(
+            vec![Column::new("a\nb", "te\u{202e}xt", false)],
+            vec![Row(vec![Value::Int(1)])],
+        );
+        let col = &g.columns()[0];
+        assert_eq!(col.name, "a␊b");
+        assert!(!col.type_name.contains('\u{202e}'), "{:?}", col.type_name);
+    }
+
+    #[test]
+    fn extreme_magnitudes_use_an_exponent() {
+        // Rust's Display for f64 never does, so these are 301 and 302
+        // characters wide without the exponent form.
+        assert_eq!(text_of(Value::Float(1e300)), "1e300");
+        assert_eq!(text_of(Value::Float(1e-300)), "1e-300");
+        // Ordinary numbers are left alone.
+        assert_eq!(text_of(Value::Float(1.5)), "1.5");
+        assert_eq!(text_of(Value::Float(0.0)), "0");
+    }
+
+    #[test]
+    fn json_objects_and_arrays_collapse() {
+        assert_eq!(
+            text_of(Value::Json(serde_json::json!({"a": 1, "b": 2}))),
+            "{2 keys}"
+        );
+        assert_eq!(
+            text_of(Value::Json(serde_json::json!([1, 2, 3]))),
+            "[3 items]"
+        );
+        // A scalar is small and worth reading in place.
+        assert_eq!(text_of(Value::Json(serde_json::json!(42))), "42");
+    }
+
+    /// The fixtures were built to break naive formatting. Running the formatter
+    /// against values written in this file only proves it handles values
+    /// written in this file.
+    mod against_the_fixtures {
+        use sqlake_driver_mock::fixtures::catalog;
+
+        use super::*;
+
+        fn rendered(schema: &str, table: &str) -> RenderedGrid {
+            let cat = catalog();
+            let t = cat.table(schema, table).unwrap();
+            RenderedGrid::new(ResultSet::new(
+                t.columns.clone(),
+                t.all_rows(),
+                t.total_rows(),
+            ))
+        }
+
+        #[test]
+        fn nothing_in_the_unicode_table_reaches_the_terminal_raw() {
+            let g = rendered("public", "unicode");
+            for row in 0..g.row_count() {
+                for col in 0..g.columns().len() {
+                    let text = g.cell(row, col).text;
+                    assert!(
+                        !text.chars().any(|c| c.is_control() || is_bidi_control(c)),
+                        "row {row} col {col}: {text:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn column_widths_come_from_display_width_not_character_count() {
+            let g = rendered("public", "unicode");
+            let sample = &g.columns()[1];
+
+            // The fixture's widest row on screen is fullwidth text that is
+            // among its shortest in `char`s, so a sampler counting characters
+            // lands on a different, narrower answer.
+            let by_chars: usize = (0..g.row_count())
+                .map(|r| g.cell(r, 1).text.chars().count())
+                .max()
+                .unwrap();
+            assert!(
+                usize::from(sample.natural_width) > by_chars,
+                "width {} is not wider than the longest char count {by_chars}",
+                sample.natural_width
+            );
+        }
+
+        #[test]
+        fn the_wide_table_asks_for_unequal_columns() {
+            let g = rendered("public", "wide");
+            let widths: Vec<u16> = g.columns().iter().map(|c| c.natural_width).collect();
+            assert!(widths.iter().max() > widths.iter().min());
+        }
+
+        #[test]
+        fn a_relation_without_a_total_renders() {
+            let g = rendered("analytics", "unbounded");
+            assert_eq!(g.total_rows(), None);
+            assert!(g.row_count() > 0);
+        }
+
+        #[test]
+        fn awkward_identifiers_survive_becoming_headers() {
+            let g = rendered("public", "Mixed.Case");
+            let names: Vec<&str> = g.columns().iter().map(|c| c.name.as_str()).collect();
+            assert!(names.contains(&"Column With Spaces"), "{names:?}");
+            assert!(names.contains(&"列名"), "{names:?}");
+        }
+
+        #[test]
+        fn every_value_variant_formats_without_panicking() {
+            let g = rendered("public", "types_showcase");
+            for row in 0..g.row_count() {
+                for col in 0..g.columns().len() {
+                    assert!(!g.cell(row, col).text.is_empty(), "row {row} col {col}");
+                }
+            }
+        }
     }
 }

@@ -1243,7 +1243,9 @@ version = "0.1.0"
 name = "sqlake-app"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sqlake-core",
+ "sqlake-driver-mock",
  "time",
  "unicode-width",
 ]

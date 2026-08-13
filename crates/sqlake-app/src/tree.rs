@@ -8,7 +8,7 @@
 //! Scroll position and selection are deliberately *not* here. They belong to
 //! `UiState`; mixing them in makes the tree jump on every asynchronous update.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlake_core::node::{NodeRef, RelationKind, TreeNode};
 
@@ -93,8 +93,25 @@ impl TreeState {
     }
 
     /// Install the top level, as returned when a connection opens.
+    ///
+    /// Everything below is discarded. A reconnect can hand back a different
+    /// database, and keeping the old children would show the previous
+    /// connection's tables under a same-named schema — with `is_loaded`
+    /// reporting them as fresh, so nothing would ever refetch them.
     pub fn set_roots(&mut self, roots: Vec<TreeNode>) {
+        self.loaded.clear();
+        self.status.clear();
+        self.record_leaves(&roots);
         self.loaded.insert(NodeRef::root(), roots);
+    }
+
+    /// Leaves are recorded so that toggling one is a no-op rather than a fetch.
+    fn record_leaves(&mut self, children: &[TreeNode]) {
+        for child in children {
+            if !child.has_children {
+                self.status.insert(child.node_ref.clone(), NodeState::Leaf);
+            }
+        }
     }
 
     #[must_use]
@@ -123,7 +140,10 @@ impl TreeState {
                     Toggle::Load
                 }
             }
-            // Leaves are never recorded, so this is unreachable in practice.
+            // A relation has nothing to expand. Without this arm the `None`
+            // branch below would mark it `Loading` and ask the driver for its
+            // children — a click that should do nothing turning into a request
+            // the driver is entitled to answer with an error.
             Some(NodeState::Leaf) => Toggle::Local,
         }
     }
@@ -136,6 +156,7 @@ impl TreeState {
     pub fn finish_load(&mut self, node: &NodeRef, result: Result<Vec<TreeNode>, String>) {
         match result {
             Ok(children) => {
+                self.record_leaves(&children);
                 self.loaded.insert(node.clone(), children);
                 self.status.insert(node.clone(), NodeState::Expanded);
             }
@@ -152,14 +173,30 @@ impl TreeState {
     #[must_use]
     pub fn flatten(&self) -> TreeView {
         let mut nodes = Vec::new();
-        self.walk(&NodeRef::root(), 0, &mut nodes);
+        let mut open = HashSet::new();
+        self.walk(&NodeRef::root(), 0, &mut open, &mut nodes);
         TreeView { nodes }
     }
 
-    fn walk(&self, parent: &NodeRef, depth: u16, out: &mut Vec<VisibleNode>) {
+    /// `open` holds the ancestors currently being walked.
+    ///
+    /// A driver that returns a node as its own descendant — a path-building
+    /// bug, or a catalogue with a self-reference — would otherwise recurse
+    /// until the stack runs out. Flattening runs on every frame, so this has to
+    /// survive bad input rather than trust it.
+    fn walk(
+        &self,
+        parent: &NodeRef,
+        depth: u16,
+        open: &mut HashSet<NodeRef>,
+        out: &mut Vec<VisibleNode>,
+    ) {
         let Some(children) = self.loaded.get(parent) else {
             return;
         };
+        if !open.insert(parent.clone()) {
+            return;
+        }
         for child in children {
             let state = self.state_of(child);
             let expanded = state.is_expanded();
@@ -171,9 +208,10 @@ impl TreeState {
                 state,
             });
             if expanded {
-                self.walk(&child.node_ref, depth + 1, out);
+                self.walk(&child.node_ref, depth.saturating_add(1), open, out);
             }
         }
+        open.remove(parent);
     }
 
     fn state_of(&self, node: &TreeNode) -> NodeState {
@@ -363,5 +401,69 @@ mod tests {
     #[test]
     fn an_empty_tree_flattens_to_nothing() {
         assert!(TreeState::new().flatten().is_empty());
+    }
+
+    #[test]
+    fn toggling_a_relation_asks_the_driver_for_nothing() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        t.toggle(&public);
+        t.finish_load(&public, Ok(vec![table("public", "users")]));
+
+        // A relation has no children to fetch. Returning `Load` here would
+        // send the driver a request it is entitled to answer with an error,
+        // for a click that should do nothing at all.
+        let users = NodeRef::new(NodeKind::Relation, ["public", "users"]);
+        assert_eq!(t.toggle(&users), Toggle::Local);
+        assert_eq!(t.toggle(&users), Toggle::Local);
+        assert_eq!(t.flatten().nodes.len(), 3, "nothing appeared or vanished");
+    }
+
+    #[test]
+    fn new_roots_discard_what_was_loaded_under_the_old_ones() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        t.toggle(&public);
+        t.finish_load(&public, Ok(vec![table("public", "users")]));
+        assert!(t.is_loaded(&public));
+
+        // Reconnecting to a different database hands back a same-named schema.
+        // Keeping the old children would show the previous connection's tables
+        // and never refetch them, because `is_loaded` still says yes.
+        t.set_roots(vec![schema("public")]);
+        assert!(!t.is_loaded(&public));
+        assert_eq!(t.toggle(&public), Toggle::Load);
+        assert_eq!(labels(&t.flatten()), [(0, "public")]);
+    }
+
+    #[test]
+    fn a_node_that_contains_itself_does_not_recurse_forever() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        t.toggle(&public);
+        // A driver with a path-building bug, or a catalogue with a
+        // self-reference. Flattening runs every frame, so it has to survive
+        // bad input rather than trust it.
+        t.finish_load(&public, Ok(vec![schema("public")]));
+
+        let view = t.flatten();
+        assert!(view.nodes.iter().any(|n| n.label == "public"));
+    }
+
+    #[test]
+    fn a_retry_after_a_failure_can_succeed() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+
+        assert_eq!(t.toggle(&public), Toggle::Load);
+        t.finish_load(&public, Err("permission denied".to_owned()));
+        assert!(matches!(t.flatten().nodes[0].state, NodeState::Failed(_)));
+
+        assert_eq!(t.toggle(&public), Toggle::Load, "clicking an error retries");
+        t.finish_load(&public, Ok(vec![table("public", "users")]));
+        assert_eq!(
+            labels(&t.flatten()),
+            [(0, "public"), (1, "users"), (0, "analytics")]
+        );
     }
 }
