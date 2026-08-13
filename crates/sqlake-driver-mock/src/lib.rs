@@ -83,6 +83,12 @@ pub struct Behaviour {
     /// again. Clearing the error, populating the children and dropping the
     /// spinner — the part a user actually sees — needs a failure that stops.
     pub flaky_nodes: Vec<(Vec<String>, u32)>,
+    /// Node paths that succeed the first `n` calls and fail after that.
+    ///
+    /// The mirror of [`Behaviour::flaky_nodes`], and the only way to reach a
+    /// failure that arrives *after* something is already on screen — a second
+    /// page that does not come back, with the first page still displayed.
+    pub failing_after: Vec<(Vec<String>, u32)>,
     /// Node paths that take [`Behaviour::slow_latency`] instead.
     pub slow_nodes: Vec<Vec<String>>,
     pub slow_latency: Duration,
@@ -125,6 +131,7 @@ impl Behaviour {
             .iter()
             .chain(self.slow_nodes.iter())
             .chain(self.flaky_nodes.iter().map(|(p, _)| p))
+            .chain(self.failing_after.iter().map(|(p, _)| p))
     }
 
     fn matches(list: &[Vec<String>], path: &[String]) -> bool {
@@ -148,15 +155,20 @@ impl Behaviour {
         if Self::matches(&self.failing_nodes, path) {
             return true;
         }
-        let Some((_, times)) = self.flaky_nodes.iter().find(|(p, _)| p == path) else {
+        let flaky = self.flaky_nodes.iter().find(|(p, _)| p == path);
+        let late = self.failing_after.iter().find(|(p, _)| p == path);
+        if flaky.is_none() && late.is_none() {
             return false;
-        };
+        }
+
         let mut attempts = attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seen = attempts.entry(path.to_vec()).or_insert(0);
         *seen += 1;
-        *seen <= *times
+
+        flaky.is_some_and(|(_, times)| *seen <= *times)
+            || late.is_some_and(|(_, times)| *seen > *times)
     }
 }
 
@@ -498,6 +510,20 @@ mod tests {
         // children arrive.
         let nodes = s.children(&node).await.unwrap();
         assert!(nodes.iter().any(|n| n.label == "users"));
+    }
+
+    #[tokio::test]
+    async fn a_node_can_start_failing_after_it_has_worked() {
+        let driver = MockDriver::new(Behaviour {
+            failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
+            ..Behaviour::instant()
+        });
+        let s = driver.connect().await.unwrap();
+        let table = TableRef::new(["public", "big"]);
+
+        assert!(s.preview(&table, &PageRequest::first()).await.is_ok());
+        // The second page does not come back, with the first still on screen.
+        assert!(s.preview(&table, &PageRequest::first()).await.is_err());
     }
 
     #[tokio::test]

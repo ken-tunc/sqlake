@@ -11,7 +11,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use sqlake_core::result::ResultSet;
+use sqlake_core::result::{Column, ResultSet, Row};
 use sqlake_core::value::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -71,16 +71,27 @@ pub struct RenderedColumn {
 }
 
 /// A result set prepared for display.
+/// A result set prepared for display.
 #[derive(Debug, Clone)]
 pub struct RenderedGrid {
-    result: Arc<ResultSet>,
     columns: Vec<RenderedColumn>,
+    /// The driver's own column list, kept so that a page arriving with a
+    /// different shape can be recognised rather than concatenated.
+    source: Arc<Vec<Column>>,
+    /// One entry per page fetched.
+    ///
+    /// Appending pushes an `Arc`; the rows already held are never touched. The
+    /// obvious version keeps one `Vec<Row>` and extends it, which copies every
+    /// row fetched so far on every page — quadratic in the page count, run on
+    /// the store task, which is the only writer there is.
+    pages: Vec<Arc<Vec<Row>>>,
+    rows: usize,
+    total_rows: Option<u64>,
 }
 
 impl RenderedGrid {
     #[must_use]
     pub fn new(result: ResultSet) -> Self {
-        let result = Arc::new(result);
         let columns = result
             .columns
             .iter()
@@ -94,8 +105,8 @@ impl RenderedGrid {
                     .max()
                     .unwrap_or(0);
                 // Headers go through the same treatment as values. A driver's
-                // column name is data too: `SELECT 1 AS "a<LF>b"` is legal in
-                // PostgreSQL, and a raw newline in a header splits the grid
+                // column name is data too: a quoted identifier in PostgreSQL
+                // can carry a newline, and one in a header splits the grid
                 // apart exactly as one in a cell does.
                 let name = sanitise(&col.name);
                 let header = display_width(&name);
@@ -103,12 +114,18 @@ impl RenderedGrid {
                     type_name: sanitise(&col.type_name),
                     name,
                     natural_width: sampled.max(header).clamp(MIN_WIDTH, MAX_WIDTH),
-                    align: column_align(&result, i),
+                    align: column_align(&result.rows, i),
                 }
             })
             .collect();
 
-        Self { result, columns }
+        Self {
+            columns,
+            source: Arc::clone(&result.columns),
+            rows: result.rows.len(),
+            pages: vec![Arc::clone(&result.rows)],
+            total_rows: result.total_rows,
+        }
     }
 
     #[must_use]
@@ -118,24 +135,35 @@ impl RenderedGrid {
 
     #[must_use]
     pub fn row_count(&self) -> usize {
-        self.result.rows.len()
+        self.rows
     }
 
     /// Rows in the underlying relation, when the driver knew.
     #[must_use]
     pub fn total_rows(&self) -> Option<u64> {
-        self.result.total_rows
+        self.total_rows
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.result.rows.is_empty()
+        self.rows == 0
+    }
+
+    fn row(&self, index: usize) -> Option<&Row> {
+        let mut remaining = index;
+        for page in &self.pages {
+            if remaining < page.len() {
+                return page.get(remaining);
+            }
+            remaining -= page.len();
+        }
+        None
     }
 
     /// Formatted on demand. Only cells that are actually drawn are ever built.
     #[must_use]
     pub fn cell(&self, row: usize, col: usize) -> Cell {
-        let value = self.result.rows.get(row).and_then(|r| r.get(col));
+        let value = self.row(row).and_then(|r| r.get(col));
         Cell {
             text: format_value(value),
             kind: value.map_or(CellKind::Null, kind_of),
@@ -147,17 +175,7 @@ impl RenderedGrid {
     /// to reach for it.
     #[must_use]
     pub fn raw(&self, row: usize, col: usize) -> Option<&Value> {
-        self.result.rows.get(row).and_then(|r| r.get(col))
-    }
-
-    /// The underlying result set.
-    ///
-    /// For the application layer, which needs it to append a page. The rule
-    /// that the UI never sees a [`Value`] is about the TUI crate, not about
-    /// this one.
-    #[must_use]
-    pub fn result(&self) -> &ResultSet {
-        &self.result
+        self.row(row).and_then(|r| r.get(col))
     }
 
     /// This grid with `more` appended, keeping the original column widths.
@@ -165,28 +183,39 @@ impl RenderedGrid {
     /// Widths are sampled from the first rows, so they stay put as pages
     /// arrive — a column that resized itself on every scroll would be
     /// unusable.
+    ///
+    /// `None` when the two disagree about their columns, which means the
+    /// relation changed underneath the tab: DDL ran, or the driver altered its
+    /// projection. Concatenating them anyway would leave the rows and the
+    /// headers describing different things, and `cell` would render the
+    /// difference as nulls without anyone noticing.
     #[must_use]
-    pub fn append(&self, more: &ResultSet) -> Self {
-        let mut rows = self.result.rows.as_ref().clone();
-        rows.extend(more.rows.iter().cloned());
-        let merged = ResultSet::new(
-            self.result.columns.as_ref().clone(),
-            rows,
-            more.total_rows.or(self.result.total_rows),
-        );
-        Self {
-            result: Arc::new(merged),
-            columns: self.columns.clone(),
+    pub fn append(&self, more: &Self) -> Option<Self> {
+        if !same_columns(&self.source, &more.source) {
+            return None;
         }
+        let mut pages = self.pages.clone();
+        pages.extend(more.pages.iter().cloned());
+        Some(Self {
+            columns: self.columns.clone(),
+            source: Arc::clone(&self.source),
+            rows: self.rows + more.rows,
+            pages,
+            total_rows: more.total_rows.or(self.total_rows),
+        })
     }
+}
+
+fn same_columns(a: &[Column], b: &[Column]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
 }
 
 /// A column is right-aligned when its values are numbers. Decided from the
 /// data rather than the declared type, because a driver's type names are its
 /// own business.
-fn column_align(result: &ResultSet, col: usize) -> Align {
+fn column_align(rows: &[Row], col: usize) -> Align {
     let mut saw_value = false;
-    for row in result.rows.iter().take(WIDTH_SAMPLE_ROWS) {
+    for row in rows.iter().take(WIDTH_SAMPLE_ROWS) {
         match row.get(col) {
             None | Some(Value::Null) => {}
             Some(v) => {
@@ -536,10 +565,83 @@ mod tests {
     }
 
     #[test]
-    fn cloning_a_grid_shares_the_result_set() {
+    fn cloning_a_grid_shares_its_rows() {
         let g = one(Value::Int(1));
         let c = g.clone();
-        assert!(Arc::ptr_eq(&g.result, &c.result));
+        assert!(Arc::ptr_eq(&g.pages[0], &c.pages[0]));
+    }
+
+    #[test]
+    fn appending_a_page_does_not_copy_the_rows_already_held() {
+        let first = grid(
+            vec![Column::new("id", "int8", false)],
+            (0..100).map(|i| Row(vec![Value::Int(i)])).collect(),
+        );
+        let second = grid(
+            vec![Column::new("id", "int8", false)],
+            (100..200).map(|i| Row(vec![Value::Int(i)])).collect(),
+        );
+
+        let merged = first.append(&second).unwrap();
+        assert_eq!(merged.row_count(), 200);
+        // The point of the whole arrangement: page one is shared, not copied.
+        // Extending a single Vec would make every page cost every row fetched
+        // so far, on the store task.
+        assert!(Arc::ptr_eq(&merged.pages[0], &first.pages[0]));
+        assert!(Arc::ptr_eq(&merged.pages[1], &second.pages[0]));
+    }
+
+    #[test]
+    fn rows_read_correctly_across_a_page_boundary() {
+        let first = grid(
+            vec![Column::new("id", "int8", false)],
+            (0..3).map(|i| Row(vec![Value::Int(i)])).collect(),
+        );
+        let second = grid(
+            vec![Column::new("id", "int8", false)],
+            (3..6).map(|i| Row(vec![Value::Int(i)])).collect(),
+        );
+        let merged = first.append(&second).unwrap();
+
+        for i in 0..6 {
+            assert_eq!(merged.raw(i, 0), Some(&Value::Int(i as i64)), "row {i}");
+            assert_eq!(merged.cell(i, 0).text, i.to_string());
+        }
+        assert_eq!(merged.raw(6, 0), None);
+    }
+
+    #[test]
+    fn a_page_with_different_columns_is_refused() {
+        let first = grid(
+            vec![Column::new("id", "int8", false)],
+            vec![Row(vec![Value::Int(1)])],
+        );
+        let renamed = grid(
+            vec![Column::new("identifier", "int8", false)],
+            vec![Row(vec![Value::Int(2)])],
+        );
+        // DDL ran, or the driver changed its projection. Concatenating would
+        // leave rows and headers describing different things.
+        assert!(first.append(&renamed).is_none());
+    }
+
+    #[test]
+    fn appending_keeps_the_original_widths_and_takes_the_newer_total() {
+        let first = RenderedGrid::new(ResultSet::new(
+            vec![Column::new("v", "text", false)],
+            vec![Row(vec![Value::Text("short".into())])],
+            Some(2),
+        ));
+        let width = first.columns()[0].natural_width;
+        let second = RenderedGrid::new(ResultSet::new(
+            vec![Column::new("v", "text", false)],
+            vec![Row(vec![Value::Text("a much longer value".into())])],
+            None,
+        ));
+
+        let merged = first.append(&second).unwrap();
+        assert_eq!(merged.columns()[0].natural_width, width);
+        assert_eq!(merged.total_rows(), Some(2));
     }
 
     #[test]

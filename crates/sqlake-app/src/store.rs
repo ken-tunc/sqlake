@@ -26,8 +26,8 @@ use crate::error::{AppError, AppResult};
 use crate::grid::RenderedGrid;
 use crate::session::SessionHandle;
 use crate::snapshot::{
-    BusyItem, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot, TabContent,
-    TabView, Toast,
+    BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot,
+    TabContent, TabView, Toast,
 };
 use crate::tree::{Toggle, TreeState, TreeView};
 use crate::usecase::{
@@ -137,9 +137,6 @@ enum Event {
         /// newer page.
         page: PageRequest,
         busy: BusyId,
-        /// True when the page should be appended rather than replace what is
-        /// there.
-        append: bool,
         result: AppResult<PreviewTableOutput>,
     },
 }
@@ -157,13 +154,31 @@ struct Conn {
     view: Arc<TreeView>,
 }
 
+/// Shown on whatever was waiting for a reply that was abandoned.
+const CANCELLED: &str = "cancelled";
+
+/// A page request that has gone out and not yet come back.
+///
+/// The tab keeps this rather than optimistically advancing `page`, so that a
+/// failed or cancelled request leaves the tab describing what it actually
+/// holds. It is also the only correct guard against a second `LoadMore`: the
+/// old one tested `data`, which an append deliberately leaves `Ready`.
+#[derive(Debug)]
+struct PendingPage {
+    busy: BusyId,
+    page: PageRequest,
+    append: bool,
+}
+
 #[derive(Debug)]
 struct Tab {
     id: TabId,
     conn: ConnId,
     table: TableRef,
     sort: Option<Sort>,
+    /// The last page successfully loaded, never a page merely asked for.
     page: PageRequest,
+    pending: Option<PendingPage>,
     data: LoadState<Arc<RenderedGrid>>,
     loaded_rows: usize,
 }
@@ -193,7 +208,12 @@ impl Runtime {
     ) {
         loop {
             tokio::select! {
-                Some(action) = actions.recv() => {
+                action = actions.recv() => {
+                    // `else` never fires: this task holds an event sender of
+                    // its own, so the event channel cannot close and the
+                    // select would park here for ever, keeping every session
+                    // actor — and its database connection — alive.
+                    let Some(action) = action else { break };
                     tracing::debug!(%action, "action");
                     self.apply(action);
                 }
@@ -218,10 +238,11 @@ impl Runtime {
         id
     }
 
-    fn begin_busy(&mut self, label: impl Into<String>) -> BusyId {
+    fn begin_busy(&mut self, owner: BusyOwner, label: impl Into<String>) -> BusyId {
         let id = BusyId::new(self.alloc_id());
         self.busy.push(BusyItem {
             id,
+            owner,
             label: label.into(),
             started_at: Instant::now(),
         });
@@ -313,7 +334,7 @@ impl Runtime {
             view: Arc::new(TreeView::default()),
         });
 
-        let busy = self.begin_busy(format!("connecting to {name}"));
+        let busy = self.begin_busy(BusyOwner::Connection(id), format!("connecting to {name}"));
         let events = self.events.clone();
         self.spawn_task(busy, async move {
             let result = Connect { driver }.execute(ConnectInput { name }).await;
@@ -334,6 +355,28 @@ impl Runtime {
             conn.tree = TreeState::new();
             conn.view = Arc::new(TreeView::default());
         }
+        // Nothing still in flight for this connection can be applied now, and
+        // leaving the rows behind means "connecting to mock" stays in the
+        // status bar after the user closed it.
+        let tabs: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| t.conn == id)
+            .map(|t| t.id)
+            .collect();
+        let orphaned: Vec<BusyId> = self
+            .busy
+            .iter()
+            .filter(|b| match &b.owner {
+                BusyOwner::Connection(c) | BusyOwner::Node { conn: c, .. } => *c == id,
+                BusyOwner::Tab(t) => tabs.contains(t),
+            })
+            .map(|b| b.id)
+            .collect();
+        for busy in orphaned {
+            self.drop_task(busy);
+        }
+
         // Tabs belong to a connection; leaving them behind would show stale
         // rows with no way to refresh them.
         self.tabs.retain(|t| t.conn != id);
@@ -356,7 +399,13 @@ impl Runtime {
             return;
         }
 
-        let busy = self.begin_busy(format!("expanding {node}"));
+        let busy = self.begin_busy(
+            BusyOwner::Node {
+                conn: conn_id,
+                node: node.clone(),
+            },
+            format!("expanding {node}"),
+        );
         let events = self.events.clone();
         self.spawn_task(busy, async move {
             let result = ExpandNode { session }
@@ -395,6 +444,7 @@ impl Runtime {
             table: table.clone(),
             sort: None,
             page: PageRequest::first(),
+            pending: None,
             data: LoadState::Loading,
             loaded_rows: 0,
         });
@@ -416,7 +466,6 @@ impl Runtime {
         tab.sort = Some(sort);
         // A new ordering invalidates every page already fetched.
         let page = PageRequest::first().with_sort(Some(sort));
-        tab.page = page;
         tab.data = LoadState::Loading;
         tab.loaded_rows = 0;
         self.fetch_page(tab_id, page, false);
@@ -426,11 +475,14 @@ impl Runtime {
         let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };
-        if tab.data.is_loading() {
+        // One page request per tab at a time. The old guard tested `data`,
+        // which an append deliberately leaves `Ready` — so two quick
+        // `LoadMore`s both went out, the first reply was dropped as stale, and
+        // the rows it carried could never be asked for again.
+        if tab.pending.is_some() {
             return;
         }
         let next = tab.page.next_page();
-        tab.page = next;
         self.fetch_page(tab_id, next, true);
     }
 
@@ -443,7 +495,17 @@ impl Runtime {
             return;
         };
 
-        let busy = self.begin_busy(format!("loading {table}"));
+        // A new request supersedes whatever was in flight — re-sorting while a
+        // page is loading, for instance. Leaving the old task running would
+        // hold a busy row on screen for a reply that is now discarded as stale.
+        if let Some(previous) = self.tab_mut(tab_id).and_then(|t| t.pending.take()) {
+            self.drop_task(previous.busy);
+        }
+
+        let busy = self.begin_busy(BusyOwner::Tab(tab_id), format!("loading {table}"));
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.pending = Some(PendingPage { busy, page, append });
+        }
         let events = self.events.clone();
         self.spawn_task(busy, async move {
             let result = PreviewTable { session }
@@ -453,7 +515,6 @@ impl Runtime {
                 tab: tab_id,
                 page,
                 busy,
-                append,
                 result,
             });
         });
@@ -470,14 +531,63 @@ impl Runtime {
         }
     }
 
-    fn cancel(&mut self, id: BusyId) {
+    /// Abandon a task and stop showing it.
+    ///
+    /// This does not stop work already running inside the driver: real
+    /// cancellation is a driver capability and arrives with `CancelHandle` in
+    /// M4.
+    fn drop_task(&mut self, id: BusyId) {
         if let Some(handle) = self.tasks.remove(&id) {
-            // This abandons the result. It does not stop work already running
-            // inside the driver: real cancellation is a driver capability and
-            // arrives with CancelHandle in M4.
             handle.abort();
         }
         self.busy.retain(|b| b.id != id);
+    }
+
+    fn cancel(&mut self, id: BusyId) {
+        let owner = self
+            .busy
+            .iter()
+            .find(|b| b.id == id)
+            .map(|b| b.owner.clone());
+        self.drop_task(id);
+        // The reply is now never coming, so whatever was waiting for it has to
+        // be put back into a state the user can act on. Left alone it stays
+        // `Loading` for ever, and `TreeState::toggle` treats a loading node as
+        // already in flight — so a cancelled expansion could never be retried.
+        if let Some(owner) = owner {
+            self.abandon(&owner, CANCELLED);
+        }
+    }
+
+    /// Put `owner` back into a state that can be retried, after a reply that
+    /// will never arrive.
+    fn abandon(&mut self, owner: &BusyOwner, reason: &str) {
+        match owner {
+            BusyOwner::Connection(id) => {
+                if let Some(conn) = self
+                    .conn_mut(*id)
+                    .filter(|c| matches!(c.status, ConnStatus::Connecting))
+                {
+                    conn.status = ConnStatus::Failed(reason.to_owned());
+                }
+            }
+            BusyOwner::Node { conn, node } => {
+                if let Some(conn) = self.conn_mut(*conn) {
+                    conn.tree.finish_load(node, Err(reason.to_owned()));
+                    conn.view = Arc::new(conn.tree.flatten());
+                }
+            }
+            BusyOwner::Tab(id) => {
+                if let Some(tab) = self.tab_mut(*id) {
+                    tab.pending = None;
+                    // An append that never lands leaves the rows already on
+                    // screen perfectly usable.
+                    if tab.data.ready().is_none() {
+                        tab.data = LoadState::Failed(reason.to_owned());
+                    }
+                }
+            }
+        }
     }
 
     // ── events ─────────────────────────────────────────────────────────────
@@ -501,30 +611,31 @@ impl Runtime {
                 tab,
                 page,
                 busy,
-                append,
                 result,
             } => {
                 self.end_busy(busy);
-                self.previewed(tab, page, append, result);
+                self.previewed(tab, page, result);
             }
         }
     }
 
     fn connected(&mut self, id: ConnId, result: AppResult<ConnectOutput>) {
         match result {
-            Ok(out) => {
-                if let Some(conn) = self.conn_mut(id) {
+            // Only a connection still waiting for this reply may take it. A
+            // `Disconnect` in between leaves the entry behind as `Closed`, and
+            // writing `Ready` over it would resurrect a connection the user
+            // closed — with a live session attached to it.
+            Ok(out) => match self.conn_mut(id) {
+                Some(conn) if matches!(conn.status, ConnStatus::Connecting) => {
                     conn.name = out.name;
                     conn.status = ConnStatus::Ready;
                     conn.capabilities = Some(out.capabilities);
                     conn.session = Some(out.session);
                     conn.tree.set_roots(out.roots);
                     conn.view = Arc::new(conn.tree.flatten());
-                } else {
-                    // The connection was closed while it was opening.
-                    out.session.close();
                 }
-            }
+                _ => out.session.close(),
+            },
             Err(err) => {
                 let message = err.user_message();
                 if let Some(conn) = self.conn_mut(id) {
@@ -536,6 +647,7 @@ impl Runtime {
     }
 
     fn expanded(&mut self, id: ConnId, node: NodeRef, result: AppResult<ExpandNodeOutput>) {
+        let session_died = matches!(result, Err(AppError::SessionClosed));
         // The failure is shown on the node itself, so no toast as well: an
         // error reported twice is worse than an error reported once.
         let outcome = result
@@ -546,40 +658,93 @@ impl Runtime {
             conn.tree.finish_load(&node, outcome);
             conn.view = Arc::new(conn.tree.flatten());
         }
+        if session_died {
+            self.session_died(id);
+        }
     }
 
-    fn previewed(
-        &mut self,
-        id: TabId,
-        page: PageRequest,
-        append: bool,
-        result: AppResult<PreviewTableOutput>,
-    ) {
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
-            return;
-        };
-        // A reply for a page the user has since moved away from must not
-        // overwrite what is on screen.
-        if tab.page != page {
-            return;
+    /// Whether this reply appends or replaces comes from the tab's own record
+    /// of the request, not from the reply. The two can only disagree when
+    /// something has already gone wrong.
+    fn previewed(&mut self, id: TabId, page: PageRequest, result: AppResult<PreviewTableOutput>) {
+        let session_died = matches!(result, Err(AppError::SessionClosed));
+        let mut conn_died = None;
+        let mut toast = None;
+
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            // A reply for a page the tab is no longer waiting for must not
+            // overwrite what is on screen. The tab's own record is the
+            // authority, not the flag that travelled with the request.
+            let Some(pending) = tab.pending.take_if(|p| p.page == page) else {
+                return;
+            };
+
+            match result {
+                Ok(out) => {
+                    let grid = if pending.append {
+                        match tab.data.ready() {
+                            Some(existing) => match existing.append(&out.grid) {
+                                Some(merged) => merged,
+                                None => {
+                                    toast = Some(format!(
+                                        "{} changed shape; showing the new page only",
+                                        tab.table
+                                    ));
+                                    out.grid
+                                }
+                            },
+                            None => out.grid,
+                        }
+                    } else {
+                        out.grid
+                    };
+                    tab.page = page;
+                    let grid = Arc::new(grid);
+                    tab.loaded_rows = grid.row_count();
+                    tab.data = LoadState::Ready(grid);
+                }
+                Err(err) => {
+                    let message = err.user_message();
+                    if pending.append && tab.data.ready().is_some() {
+                        // A failed "load more" has not invalidated the rows
+                        // already fetched. Replacing them with an error panel
+                        // loses them *and* leaves the next request starting
+                        // from the wrong offset, because `page` never advanced.
+                        toast = Some(message);
+                    } else {
+                        tab.data = LoadState::Failed(message);
+                        tab.loaded_rows = 0;
+                    }
+                    if session_died {
+                        conn_died = Some(tab.conn);
+                    }
+                }
+            }
         }
 
-        match result {
-            Ok(out) => {
-                let grid = if append {
-                    match tab.data.ready() {
-                        Some(existing) => existing.append(out.grid.result()),
-                        None => out.grid,
-                    }
-                } else {
-                    out.grid
-                };
-                let grid = Arc::new(grid);
-                tab.loaded_rows = grid.row_count();
-                tab.data = LoadState::Ready(grid);
-            }
-            Err(err) => tab.data = LoadState::Failed(err.user_message()),
+        if let Some(text) = toast {
+            self.toast(Severity::Error, text);
         }
+        if let Some(conn) = conn_died {
+            self.session_died(conn);
+        }
+    }
+
+    /// The session actor is gone, so everything under this connection will
+    /// fail the same way.
+    ///
+    /// Reporting it only on the node or tab that happened to ask leaves the
+    /// connection reading `Ready` while every click on it fails, which tells
+    /// the user nothing about needing to reconnect.
+    fn session_died(&mut self, id: ConnId) {
+        let Some(conn) = self.conn_mut(id) else {
+            return;
+        };
+        if matches!(conn.status, ConnStatus::Closed) {
+            return;
+        }
+        conn.session = None;
+        conn.status = ConnStatus::Failed(AppError::SessionClosed.user_message());
     }
 
     // ── publishing ─────────────────────────────────────────────────────────
@@ -630,6 +795,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use sqlake_core::node::NodeKind;
+    use sqlake_core::value::Value;
     use sqlake_driver_mock::{Behaviour, MockDriver};
     use tokio::sync::watch::Receiver;
 
@@ -850,6 +1016,149 @@ mod tests {
         // Still one page: a re-sort invalidates everything already fetched.
         let preview = snap.tab(tab).unwrap().preview().unwrap();
         assert_eq!(preview.data.ready().unwrap().row_count(), 50);
+    }
+
+    #[tokio::test]
+    async fn two_quick_load_mores_do_not_skip_a_page() {
+        let (store, mut rx, conn) = connected_store().await;
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "big"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.loaded_rows == 200)
+        })
+        .await;
+        let tab = snap.active_tab.unwrap();
+
+        // Key repeat, or a wheel resting on the last row. The old guard tested
+        // `data`, which an append leaves `Ready`, so both went out: the first
+        // reply was dropped as stale and rows 201-400 could never be asked for
+        // again, leaving a table that silently joined 1-200 to 401-600.
+        store.dispatch(Action::LoadMore { tab });
+        store.dispatch(Action::LoadMore { tab });
+
+        let snap = until(&mut rx, |s| {
+            s.tab(tab)
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.loaded_rows >= 400)
+        })
+        .await;
+        let preview = snap.tab(tab).and_then(TabView::preview).unwrap();
+        assert_eq!(preview.loaded_rows, 400);
+
+        let grid = preview.data.ready().unwrap();
+        for row in 0..grid.row_count() {
+            assert_eq!(
+                grid.raw(row, 0),
+                Some(&Value::Int(row as i64)),
+                "row {row} is not contiguous"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_more_keeps_the_rows_already_on_screen() {
+        // Succeeds once, then fails: the second page does not come back while
+        // the first is still displayed.
+        let store = store(Behaviour {
+            failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "big"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.loaded_rows == 200)
+        })
+        .await;
+        let tab = snap.active_tab.unwrap();
+
+        store.dispatch(Action::LoadMore { tab });
+        let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
+
+        // The rows already fetched are still good. Replacing them with an
+        // error panel loses them and leaves the next request starting from the
+        // wrong offset.
+        let preview = snap.tab(tab).and_then(TabView::preview).unwrap();
+        assert_eq!(preview.loaded_rows, 200);
+        assert!(preview.data.ready().is_some(), "the table is still there");
+        assert_eq!(snap.toasts[0].severity, Severity::Error);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_expansion_leaves_the_node_retryable() {
+        let store = store(Behaviour {
+            latency: std::time::Duration::from_millis(1),
+            slow_nodes: vec![vec!["public".to_owned()]],
+            slow_latency: std::time::Duration::from_secs(30),
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+
+        let node = NodeRef::new(NodeKind::Namespace, ["public"]);
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: node.clone(),
+        });
+        let snap = until(&mut rx, Snapshot::is_busy).await;
+        let busy = snap.busy[0].id;
+
+        store.dispatch(Action::Cancel(busy));
+        // The reply is never coming. A node left in `Loading` cannot even be
+        // toggled again, so it would be permanently dead rather than merely
+        // failed.
+        let snap = until(&mut rx, |s| {
+            s.tree(conn).is_some_and(|t| {
+                t.nodes
+                    .iter()
+                    .any(|n| n.node_ref == node && matches!(n.state, NodeState::Failed(_)))
+            })
+        })
+        .await;
+        assert!(!snap.is_busy());
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_while_opening_does_not_come_back() {
+        let store = store(Behaviour {
+            latency: std::time::Duration::from_millis(50),
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
+        let conn = snap.connections[0].id;
+
+        store.dispatch(Action::Disconnect(conn));
+        let snap = until(&mut rx, |s| s.connections[0].status == ConnStatus::Closed).await;
+        assert!(!snap.is_busy(), "in-flight work is dropped with it");
+
+        // The reply lands after the disconnect. Writing Ready over a closed
+        // connection would resurrect it with a live session attached.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let snap = rx.borrow_and_update().clone();
+        assert_eq!(snap.connections[0].status, ConnStatus::Closed);
+        assert!(snap.tree(conn).is_none_or(TreeView::is_empty));
     }
 
     #[tokio::test]

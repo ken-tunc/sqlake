@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::id::{ConnId, TabId};
-use sqlake_core::node::TableRef;
+use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::result::Sort;
 
 use crate::action::{BusyId, ToastId};
@@ -121,10 +121,24 @@ pub struct Toast {
     pub created_at: Instant,
 }
 
+/// What a busy item is waiting for.
+///
+/// Cancelling abandons a reply that will now never arrive, so something has to
+/// know what that reply was going to be applied to. Without it the owner sits
+/// in `Loading` for ever — and a tree node in `Loading` refuses to toggle, so
+/// the node becomes permanently dead rather than merely stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusyOwner {
+    Connection(ConnId),
+    Node { conn: ConnId, node: NodeRef },
+    Tab(TabId),
+}
+
 /// A running operation, shown in the status bar with a way to stop it.
 #[derive(Debug, Clone)]
 pub struct BusyItem {
     pub id: BusyId,
+    pub owner: BusyOwner,
     pub label: String,
     pub started_at: Instant,
 }

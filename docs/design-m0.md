@@ -157,6 +157,7 @@ pub struct Behaviour {
     pub connect_fails: bool,                    // the most common real failure
     pub failing_nodes: Vec<Vec<String>>,        // expansion or preview always fails
     pub flaky_nodes: Vec<(Vec<String>, u32)>,   // fails n times, then succeeds
+    pub failing_after: Vec<(Vec<String>, u32)>, // succeeds n times, then fails
     pub slow_nodes: Vec<Vec<String>>,
     pub slow_latency: Duration,
 }
@@ -165,6 +166,11 @@ pub struct Behaviour {
 `flaky_nodes` exists because a permanent failure can only test a retry up to the point of
 failing again. The part a user sees — the error clearing, the children arriving, the spinner
 stopping — needs a failure that stops.
+
+`failing_after` is its mirror, and the only way to reach a failure that arrives *after*
+something is already on screen: a second page that does not come back while the first is still
+displayed. Without it, "keep what is already there when the next page fails" cannot be tested
+at all.
 
 Every path a `Behaviour` names is **checked against the catalogue** when the driver is built,
 and injecting on a node that is not there is a panic. Injection that silently matches nothing
