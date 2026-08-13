@@ -9,7 +9,7 @@
 //! becomes a way to trigger the very thing it was confirming.
 
 use ratatui::layout::{Position, Rect};
-use sqlake_app::action::BusyId;
+use sqlake_app::action::{BusyId, ToastId};
 use sqlake_core::id::TabId;
 
 /// Background of a pane, behind its content.
@@ -92,6 +92,9 @@ pub enum Target {
     TabClose(TabId),
 
     Button(ButtonId),
+
+    /// A transient message. Clicking it dismisses it.
+    Toast(ToastId),
 
     /// Everything behind a modal. Clicking it dismisses the modal instead of
     /// reaching what is underneath.
