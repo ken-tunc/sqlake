@@ -648,7 +648,7 @@ masking lives in exactly one function and never reaches the log.
 
 ## 11. Drivers
 
-### 10.1 PostgreSQL
+### 11.1 PostgreSQL
 
 - `tokio-postgres` with `tokio-postgres-rustls`; `sslmode` maps onto the rustls configuration.
 - Hold **two connections: one for queries, one for metadata**, so that expanding the tree is
@@ -666,7 +666,7 @@ masking lives in exactly one function and never reaches the log.
   be assembled through `QuotedIdent` (§4.1).
 - Show the `EXPLAIN` row estimate first; run an exact `COUNT(*)` only on explicit request.
 
-### 10.2 BigQuery
+### 11.2 BigQuery
 
 - `gcp-bigquery-client` with `yup-oauth2` (ADC, service account, or impersonation). Where the
   crate lags the API, wrap REST calls thinly inside the driver so `reqwest` can be used
