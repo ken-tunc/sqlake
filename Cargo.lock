@@ -1263,6 +1263,7 @@ dependencies = [
  "sqlake-core",
  "time",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
