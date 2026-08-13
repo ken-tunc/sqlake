@@ -154,34 +154,62 @@ built to exercise the hard cases from day one (D6).
 ```rust
 pub struct Behaviour {
     pub latency: Duration,
-    pub failing_nodes: Vec<Vec<String>>,   // expansion or preview always fails
+    pub connect_fails: bool,                    // the most common real failure
+    pub failing_nodes: Vec<Vec<String>>,        // expansion or preview always fails
+    pub flaky_nodes: Vec<(Vec<String>, u32)>,   // fails n times, then succeeds
     pub slow_nodes: Vec<Vec<String>>,
     pub slow_latency: Duration,
 }
 ```
+
+`flaky_nodes` exists because a permanent failure can only test a retry up to the point of
+failing again. The part a user sees — the error clearing, the children arriving, the spinner
+stopping — needs a failure that stops.
+
+Every path a `Behaviour` names is **checked against the catalogue** when the driver is built,
+and injecting on a node that is not there is a panic. Injection that silently matches nothing
+is worse than no injection: renaming a fixture would leave every test green while the error
+path it exercised quietly stopped being exercised.
 
 One connection, three schemas, and relations chosen to break naive rendering:
 
 | Relation | Purpose |
 | --- | --- |
 | `public.users` | The ordinary case. Whatever renders correctly here is not yet proven |
-| `public.types_showcase` | One column per `Value` variant, plus an all-null row and an extremes row |
-| `public.wide` | 60 columns — forces horizontal scrolling and width negotiation |
+| `public.types_showcase` | One column per `Value` variant, plus an all-null row, an extremes row and a NaN |
+| `public.wide` | 60 columns of unequal width — forces horizontal scrolling and width negotiation |
 | `public.big` | 200,000 rows, generated on demand — proves virtualisation |
-| `public.unicode` | CJK, ZWJ emoji, combining marks, fullwidth Latin, RTL, embedded control characters |
+| `public.unicode` | CJK, ZWJ emoji, combining marks, fullwidth Latin, RTL, and the control characters that repaint a terminal |
 | `public.empty` | Columns but no rows — the empty state has to look deliberate |
+| `public."Mixed.Case"` | Identifiers that break unquoted interpolation: upper case, an embedded dot, a space, a reserved word, a non-ASCII header |
 | `analytics.broken` | Preview always fails — the grid's error path |
 | `analytics.slow` | Preview takes two seconds — the loading path |
+| `analytics.unbounded` | Reports **no** total row count — every division by a total has to survive it |
 | schema `restricted` | Expansion always fails — the tree's error path |
 
-`public.unicode` matters more than it looks: **display width is not character count**, and
-getting column widths wrong there corrupts everything to the right of the mistake.
+Three of these are load-bearing in a way that is easy to lose by accident, so a test pins each:
+
+- `public.unicode` matters more than it looks: **display width is not character count**, and
+  getting it wrong corrupts everything to the right of the mistake. The row that is widest on
+  screen and the row that is longest in `char`s are **deliberately different rows** — if one
+  row were widest under both, a sampler counting characters would lay the table out exactly
+  like a correct one and neither would be caught.
+- `public.wide`'s columns are **unequal**. Sixty columns that all want the same width cannot
+  tell an even split apart from a negotiated layout.
+- `analytics.unbounded` exists because `ResultSet::total_rows` documents `None` as the common
+  case for real drivers. A fixture set where the total is always known lets the scrollbar,
+  the row counter and jump-to-last-page be written against a guarantee BigQuery does not give.
 
 The failing-expansion case hangs off a schema rather than a relation because relations do not
-expand — putting it on a table would not exercise the tree's error path at all.
+expand — putting it on a table would not exercise the tree's error path at all. That schema
+holds a relation anyway: failure lives in `Behaviour`, so with injection off it must expand to
+something rather than claim children and then produce none.
 
-The mock hierarchy is **two levels deep** against PostgreSQL's three. If the tree only ever
-sees one shape, its shape is not really data-driven.
+The mock hierarchy is **two levels deep** against PostgreSQL's three, and a three-level
+hierarchy is available through `MockDriver::with_capabilities`. Both halves are needed. The
+short hierarchy stops the tree assuming PostgreSQL's shape; being able to switch stops it
+assuming the mock's, which — with the mock as M0's only driver — is otherwise the one shape it
+ever sees.
 
 ---
 
