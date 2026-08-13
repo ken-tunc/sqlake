@@ -166,10 +166,14 @@ pub const KEYMAP: &[KeyBinding] = &[
         context: Context::Global,
         kind: IntentKind::Disconnect,
     },
+    // `Space` toggles; the arrows are directional, so `Right` opens and `Left`
+    // only ever closes. Leaving `Left` unbound made the tree the one place
+    // where an arrow key did nothing at all.
     KeyBinding {
         keys: &[
             KeyCombo::new(KeyCode::Char(' ')),
             KeyCombo::new(KeyCode::Right),
+            KeyCombo::new(KeyCode::Left),
         ],
         context: Context::Explorer,
         kind: IntentKind::ToggleNode,
@@ -285,7 +289,7 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
             ViewCmd::SelectTreeRow(index).into(),
         ],
         (Target::TreeRow { index }, Gesture::DoubleClick) => activate_node(index, ctx),
-        (Target::TreeToggle { index }, Gesture::Click) => toggle_node(index, ctx),
+        (Target::TreeToggle { index }, Gesture::Click) => toggle_node(index, ctx, false),
         (Target::TreeRow { .. } | Target::TreeToggle { .. }, Gesture::Scroll(delta)) => {
             vec![scroll(PaneId::Explorer, delta)]
         }
@@ -413,7 +417,10 @@ fn activate_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
     }
 }
 
-fn toggle_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
+/// `collapse_only` is set for `Left`, which must never open a subtree: a key
+/// that closes one and also opens one is not a direction, it is a toggle with
+/// a misleading name.
+fn toggle_node(index: usize, ctx: &InputContext<'_>, collapse_only: bool) -> Vec<Intent> {
     let Some(node) = ctx.node(index) else {
         return Vec::new();
     };
@@ -421,6 +428,9 @@ fn toggle_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
         return Vec::new();
     };
     if !node.state.is_toggleable() {
+        return Vec::new();
+    }
+    if collapse_only && !node.state.is_expanded() {
         return Vec::new();
     }
     vec![
@@ -547,7 +557,7 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .unwrap_or_default(),
         IntentKind::ToggleNode => ctx
             .tree_selection
-            .map(|i| toggle_node(i, ctx))
+            .map(|i| toggle_node(i, ctx, matches!(event.code, KeyCode::Left)))
             .unwrap_or_default(),
         IntentKind::PreviewTable => ctx
             .tree_selection
@@ -644,7 +654,10 @@ mod tests {
                         label: "public".into(),
                         node_ref: NodeRef::new(NodeKind::Namespace, ["public"]),
                         relation_kind: None,
-                        state: NodeState::Collapsed,
+                        // Expanded, because the row below it is its child. A
+                        // collapsed node listing a child is a state the store
+                        // cannot produce.
+                        state: NodeState::Expanded,
                     },
                     VisibleNode {
                         depth: 1,
@@ -962,6 +975,33 @@ mod tests {
             on_key(press_ctrl(KeyCode::Char('h')), &c),
             [Intent::View(ViewCmd::FocusPrevPane)]
         );
+    }
+
+    #[test]
+    fn left_closes_a_node_but_never_opens_one() {
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Explorer);
+        let conn = snap.connections[0].id;
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+
+        // Row 0 is expanded, so Left collapses it.
+        c.tree_selection = Some(0);
+        assert_eq!(
+            on_key(press(KeyCode::Left), &c),
+            [Intent::App(Action::ToggleNode {
+                conn,
+                node: public.clone()
+            })]
+        );
+        // Right and Space still toggle in both directions.
+        assert_eq!(
+            on_key(press(KeyCode::Right), &c),
+            [Intent::App(Action::ToggleNode { conn, node: public })]
+        );
+
+        // Row 1 is a leaf: nothing to close, and nothing to open either.
+        c.tree_selection = Some(1);
+        assert!(on_key(press(KeyCode::Left), &c).is_empty());
     }
 
     #[test]

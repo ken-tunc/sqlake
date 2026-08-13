@@ -456,7 +456,7 @@ The reverse direction is deliberately not required: keyboard-only capabilities a
 | Splitter | drag to resize, double-click to even out | `Ctrl-←/→`, `=` |
 | Scrolling | wheel, thumb drag, track click | `j/k`, `PgUp/PgDn`, `g/G` |
 | Grid | header click sorts, edge drag resizes, cell click selects, right-click opens menu | `J/K`, `H/L`, `s`, `<`/`>` |
-| Tree | click `▸` to expand, double-click to open | `Space`, `Enter` |
+| Tree | click `▸` to expand, double-click to open | `Space`, `←`/`→`, `Enter` |
 | Tabs | click to switch, `×` or middle-click to close | `]`/`[`, `Ctrl-w` |
 | Editor area | click to open `$EDITOR` | `e` |
 | Modal | click outside to dismiss | `Esc` |
