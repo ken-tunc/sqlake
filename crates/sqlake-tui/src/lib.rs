@@ -10,7 +10,9 @@
 //! - Terminal modes are changed in exactly one place, [`terminal`].
 
 pub mod hit;
+pub mod mouse;
 pub mod terminal;
 
 pub use hit::{HitMap, PaneId, ScrollPart, SplitId, Target};
+pub use mouse::{Gesture, MouseState};
 pub use terminal::{TerminalGuard, Tui, install_panic_hook, restore};
