@@ -1,7 +1,7 @@
 //! A result set accumulated a page at a time.
 //!
 //! Paging, not presentation. Nothing here knows how wide a terminal is or what
-//! a null looks like — that is [`sqlake_tui::grid`]'s job for the interactive
+//! a null looks like — that is `sqlake-tui`'s `grid` for the interactive
 //! client, and the agent surface's own serialisation for the API, and the two
 //! want opposite things. Collapsing a JSON document to `{2 keys}` is exactly
 //! right on screen and destroys the data an agent asked for.
@@ -78,6 +78,18 @@ impl PagedResult {
         self.row(row).and_then(|r| r.get(col))
     }
 
+    /// The first page, capped at `max` rows.
+    ///
+    /// What a front-end samples to decide anything about a column as a whole.
+    /// Sampling the accumulated result instead would let a page arriving later
+    /// change the answer, and a column that resized or re-aligned itself as
+    /// pages landed would be unusable.
+    #[must_use]
+    pub fn sample(&self, max: usize) -> &[Row] {
+        let first = self.pages.first().map_or(&[] as &[Row], |p| p.as_slice());
+        &first[..first.len().min(max)]
+    }
+
     /// This result with `more` appended.
     ///
     /// `None` when the two disagree about their columns, which means the
@@ -91,7 +103,12 @@ impl PagedResult {
             return None;
         }
         let mut pages = self.pages.clone();
-        pages.push(Arc::clone(&more.rows));
+        // An empty page carries nothing and would still be walked by every
+        // lookup: `load_more` at the end of a relation can be asked for
+        // indefinitely, and each empty reply would make `row` a step longer.
+        if !more.rows.is_empty() {
+            pages.push(Arc::clone(&more.rows));
+        }
         Some(Self {
             columns: Arc::clone(&self.columns),
             rows: self.rows + more.rows.len(),

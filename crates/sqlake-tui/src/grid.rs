@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use sqlake_app::PagedResult;
+use sqlake_core::result::Row;
 use sqlake_core::value::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -76,7 +77,6 @@ pub struct RenderedColumn {
     pub align: Align,
 }
 
-/// A result set prepared for display.
 /// Rows prepared for display.
 ///
 /// Cheap to build and cheap to hold: the rows stay behind the `Arc` they
@@ -90,13 +90,18 @@ pub struct RenderedGrid {
 impl RenderedGrid {
     #[must_use]
     pub fn new(rows: Arc<PagedResult>) -> Self {
+        // The first page only, never the accumulated result: widths and
+        // alignment are decided once, so that a page arriving later cannot
+        // re-lay out the grid under the reader.
+        let sample = rows.sample(WIDTH_SAMPLE_ROWS);
         let columns = rows
             .columns()
             .iter()
             .enumerate()
             .map(|(i, col)| {
-                let sampled = (0..rows.row_count().min(WIDTH_SAMPLE_ROWS))
-                    .map(|r| display_width(&format_value(rows.value(r, i))))
+                let sampled = sample
+                    .iter()
+                    .map(|row| display_width(&format_value(row.get(i))))
                     .max()
                     .unwrap_or(0);
                 // Headers go through the same treatment as values. A driver's
@@ -109,7 +114,7 @@ impl RenderedGrid {
                     type_name: sanitise(&col.type_name),
                     name,
                     natural_width: sampled.max(header).clamp(MIN_WIDTH, MAX_WIDTH),
-                    align: column_align(&rows, i),
+                    align: column_align(sample, i),
                 }
             })
             .collect();
@@ -171,10 +176,10 @@ impl RenderedGrid {
 /// A column is right-aligned when its values are numbers. Decided from the
 /// data rather than the declared type, because a driver's type names are its
 /// own business.
-fn column_align(rows: &PagedResult, col: usize) -> Align {
+fn column_align(rows: &[Row], col: usize) -> Align {
     let mut saw_value = false;
-    for r in 0..rows.row_count().min(WIDTH_SAMPLE_ROWS) {
-        match rows.value(r, col) {
+    for row in rows {
+        match row.get(col) {
             None | Some(Value::Null) => {}
             Some(v) => {
                 if !v.is_numeric() {
@@ -563,9 +568,35 @@ mod tests {
         );
         let grown = RenderedGrid::new(Arc::new(rows.append(&second).unwrap()));
         // A column that resized itself every time a page landed would be
-        // unusable, so the widths come from the rows sampled at build time.
+        // unusable, so the sample is the first page and nothing else — even
+        // though the second page is wider and the first is far short of
+        // `WIDTH_SAMPLE_ROWS`.
         assert_eq!(grown.row_count(), 2);
-        assert!(grown.columns()[0].natural_width >= width);
+        assert_eq!(grown.columns()[0].natural_width, width);
+    }
+
+    #[test]
+    fn alignment_survives_a_page_arriving() {
+        let numbers = ResultSet::new(
+            vec![Column::new("v", "any", true)],
+            vec![Row(vec![Value::Int(1)])],
+            None,
+        );
+        let rows = PagedResult::new(&numbers);
+        assert_eq!(
+            RenderedGrid::new(Arc::new(rows.clone())).columns()[0].align,
+            Align::Right
+        );
+
+        // A text value on page two must not flip the whole column to the left
+        // under a reader who is looking at page one.
+        let text = ResultSet::new(
+            vec![Column::new("v", "any", true)],
+            vec![Row(vec![Value::Text("x".into())])],
+            None,
+        );
+        let grown = RenderedGrid::new(Arc::new(rows.append(&text).unwrap()));
+        assert_eq!(grown.columns()[0].align, Align::Right);
     }
 
     #[test]
