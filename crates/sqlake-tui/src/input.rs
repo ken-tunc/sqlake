@@ -1,0 +1,1364 @@
+//! Turning gestures and keystrokes into intents.
+//!
+//! Both halves are pure functions of an event and a small context, which is
+//! what lets the test at the bottom of this file assert that every capability
+//! reachable with the mouse also has a key binding.
+//!
+//! The key map is data rather than code. That makes it enumerable — for the
+//! coverage test now, and for a help modal and user-defined bindings later.
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use sqlake_app::action::Action;
+use sqlake_app::snapshot::Snapshot;
+use sqlake_app::tree::VisibleNode;
+use sqlake_core::id::{ConnId, TabId};
+
+use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
+use crate::intent::{Context, Intent, IntentKind, ViewCmd};
+use crate::mouse::Gesture;
+
+/// Rows moved by one wheel notch. Three is the common terminal convention.
+const WHEEL_LINES: i32 = 3;
+
+/// Rows moved by a page key or a click on the scrollbar track.
+const PAGE_LINES: i32 = 20;
+
+// ── key map ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyCombo {
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+}
+
+impl KeyCombo {
+    #[must_use]
+    pub const fn new(code: KeyCode) -> Self {
+        Self {
+            code,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[must_use]
+    pub const fn ctrl(code: KeyCode) -> Self {
+        Self {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+        }
+    }
+
+    /// Shift is ignored on purpose: terminals report it inconsistently for
+    /// characters that are already shifted, so `G` is matched by its character
+    /// rather than by a modifier.
+    fn matches(self, event: KeyEvent) -> bool {
+        const RELEVANT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
+        self.code == event.code && (self.modifiers & RELEVANT) == (event.modifiers & RELEVANT)
+    }
+}
+
+#[derive(Debug)]
+pub struct KeyBinding {
+    pub keys: &'static [KeyCombo],
+    pub context: Context,
+    pub kind: IntentKind,
+}
+
+const fn key(c: char) -> KeyCombo {
+    KeyCombo::new(KeyCode::Char(c))
+}
+
+const fn ctrl(c: char) -> KeyCombo {
+    KeyCombo::ctrl(KeyCode::Char(c))
+}
+
+pub const KEYMAP: &[KeyBinding] = &[
+    KeyBinding {
+        keys: &[
+            KeyCombo::ctrl(KeyCode::Char('h')),
+            KeyCombo::new(KeyCode::BackTab),
+        ],
+        context: Context::Global,
+        kind: IntentKind::Focus,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Tab)],
+        context: Context::Global,
+        kind: IntentKind::Focus,
+    },
+    KeyBinding {
+        keys: &[
+            key('j'),
+            key('k'),
+            KeyCombo::new(KeyCode::Down),
+            KeyCombo::new(KeyCode::Up),
+            KeyCombo::new(KeyCode::PageDown),
+            KeyCombo::new(KeyCode::PageUp),
+        ],
+        context: Context::Global,
+        kind: IntentKind::Scroll,
+    },
+    KeyBinding {
+        keys: &[
+            key('g'),
+            key('G'),
+            KeyCombo::new(KeyCode::Home),
+            KeyCombo::new(KeyCode::End),
+        ],
+        context: Context::Global,
+        kind: IntentKind::ScrollEdge,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Left), KeyCombo::new(KeyCode::Right)],
+        context: Context::Grid,
+        kind: IntentKind::ScrollHorizontally,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Down), KeyCombo::new(KeyCode::Up)],
+        context: Context::Explorer,
+        kind: IntentKind::TreeSelection,
+    },
+    // Upper case moves the selection, lower case and the arrows move the
+    // view: `H`/`L` are to `J`/`K` what `Left`/`Right` are to `j`/`k`. Without
+    // the horizontal pair the mouse can select any cell and the keyboard
+    // cannot, which the coverage sweep does not catch because both are the
+    // same capability.
+    KeyBinding {
+        keys: &[key('J'), key('K')],
+        context: Context::Grid,
+        kind: IntentKind::GridSelection,
+    },
+    KeyBinding {
+        keys: &[key('H'), key('L')],
+        context: Context::Grid,
+        kind: IntentKind::GridSelection,
+    },
+    KeyBinding {
+        keys: &[key('<'), key('>')],
+        context: Context::Grid,
+        kind: IntentKind::ResizeColumn,
+    },
+    KeyBinding {
+        keys: &[
+            KeyCombo::ctrl(KeyCode::Left),
+            KeyCombo::ctrl(KeyCode::Right),
+        ],
+        context: Context::Global,
+        kind: IntentKind::MoveSplit,
+    },
+    KeyBinding {
+        keys: &[key('=')],
+        context: Context::Global,
+        kind: IntentKind::EvenSplit,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Esc)],
+        context: Context::Modal,
+        kind: IntentKind::DismissModal,
+    },
+    KeyBinding {
+        keys: &[key('c')],
+        context: Context::Global,
+        kind: IntentKind::Connect,
+    },
+    KeyBinding {
+        keys: &[key('D')],
+        context: Context::Global,
+        kind: IntentKind::Disconnect,
+    },
+    // `Space` toggles; the arrows are directional, so `Right` opens and `Left`
+    // only ever closes. Leaving `Left` unbound made the tree the one place
+    // where an arrow key did nothing at all.
+    KeyBinding {
+        keys: &[
+            KeyCombo::new(KeyCode::Char(' ')),
+            KeyCombo::new(KeyCode::Right),
+            KeyCombo::new(KeyCode::Left),
+        ],
+        context: Context::Explorer,
+        kind: IntentKind::ToggleNode,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Enter)],
+        context: Context::Explorer,
+        kind: IntentKind::PreviewTable,
+    },
+    KeyBinding {
+        keys: &[key('s')],
+        context: Context::Grid,
+        kind: IntentKind::SortPreview,
+    },
+    KeyBinding {
+        keys: &[key('m')],
+        context: Context::Grid,
+        kind: IntentKind::LoadMore,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::ctrl(KeyCode::Tab), key(']'), key('[')],
+        context: Context::Global,
+        kind: IntentKind::SelectTab,
+    },
+    KeyBinding {
+        keys: &[ctrl('w')],
+        context: Context::Global,
+        kind: IntentKind::CloseTab,
+    },
+    KeyBinding {
+        keys: &[ctrl('g')],
+        context: Context::Global,
+        kind: IntentKind::Cancel,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Esc)],
+        context: Context::Global,
+        kind: IntentKind::DismissToast,
+    },
+    KeyBinding {
+        keys: &[key('q'), ctrl('c')],
+        context: Context::Global,
+        kind: IntentKind::Quit,
+    },
+];
+
+// ── context ────────────────────────────────────────────────────────────────
+
+/// What the input layer needs to know to turn an event into an intent.
+///
+/// Assembled by the render loop from `UiState` and the current snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct InputContext<'a> {
+    pub snapshot: &'a Snapshot,
+    pub focus: PaneId,
+    pub modal_open: bool,
+    /// The connection the explorer is showing.
+    pub connection: Option<ConnId>,
+    pub tree_selection: Option<usize>,
+    /// The column of the selected grid cell. The keyboard equivalents of
+    /// clicking a header and dragging a column edge act on it, which is the
+    /// only thing that makes them equivalent: without it every key press would
+    /// sort and resize column zero whatever the user had selected.
+    pub grid_column: Option<usize>,
+}
+
+impl InputContext<'_> {
+    fn node(&self, index: usize) -> Option<&VisibleNode> {
+        let conn = self.connection?;
+        self.snapshot.tree(conn)?.get(index)
+    }
+
+    fn active_tab(&self) -> Option<TabId> {
+        self.snapshot.active_tab
+    }
+
+    /// The context a keystroke is read in. A modal takes the keyboard over
+    /// entirely, which is why `Esc` can mean two different things without
+    /// being ambiguous.
+    fn key_context(&self) -> Context {
+        if self.modal_open {
+            Context::Modal
+        } else {
+            match self.focus {
+                PaneId::Explorer => Context::Explorer,
+                PaneId::Grid => Context::Grid,
+                PaneId::TabBar | PaneId::StatusBar => Context::Global,
+            }
+        }
+    }
+}
+
+// ── mouse ──────────────────────────────────────────────────────────────────
+
+/// What a gesture on a target means.
+#[must_use]
+pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec<Intent> {
+    match (target, gesture) {
+        (Target::Pane(pane), Gesture::Click) => vec![ViewCmd::FocusPane(pane).into()],
+        // The wheel over the part of a pane its content does not fill. Without
+        // this, a five-row result in a forty-row grid ignores the wheel
+        // everywhere below the last row.
+        (Target::Pane(pane), Gesture::Scroll(delta)) => vec![scroll(pane, delta)],
+        (Target::Pane(PaneId::Grid), Gesture::ScrollX(delta)) => vec![
+            ViewCmd::ScrollXBy {
+                delta: i32::from(delta),
+            }
+            .into(),
+        ],
+
+        (Target::TreeRow { index }, Gesture::Click) => vec![
+            ViewCmd::FocusPane(PaneId::Explorer).into(),
+            ViewCmd::SelectTreeRow(index).into(),
+        ],
+        (Target::TreeRow { index }, Gesture::DoubleClick) => activate_node(index, ctx),
+        (Target::TreeToggle { index }, Gesture::Click) => toggle_node(index, ctx, false),
+        (Target::TreeRow { .. } | Target::TreeToggle { .. }, Gesture::Scroll(delta)) => {
+            vec![scroll(PaneId::Explorer, delta)]
+        }
+
+        (Target::GridCell { row, col }, Gesture::Click) => vec![
+            ViewCmd::FocusPane(PaneId::Grid).into(),
+            ViewCmd::SelectCell { row, col }.into(),
+        ],
+        (Target::GridHeader { col }, Gesture::Click) => ctx
+            .active_tab()
+            .map(|tab| vec![Action::SortPreview { tab, column: col }.into()])
+            .unwrap_or_default(),
+        (Target::GridColEdge { col }, Gesture::DragBy { dx, .. }) => {
+            vec![ViewCmd::ResizeColumn { col, delta: dx }.into()]
+        }
+        (
+            Target::GridCell { .. } | Target::GridHeader { .. } | Target::GridColEdge { .. },
+            Gesture::Scroll(delta),
+        ) => vec![scroll(PaneId::Grid, delta)],
+        (Target::GridCell { .. } | Target::GridHeader { .. }, Gesture::ScrollX(delta)) => vec![
+            ViewCmd::ScrollXBy {
+                delta: i32::from(delta),
+            }
+            .into(),
+        ],
+
+        // Dragging the thumb scrolls by the distance dragged; clicking the
+        // track pages towards the click.
+        (
+            Target::Scrollbar {
+                pane,
+                part: ScrollPart::Thumb,
+            },
+            Gesture::DragBy { dy, .. },
+        ) => {
+            vec![
+                ViewCmd::ScrollBy {
+                    pane,
+                    delta: i32::from(dy),
+                }
+                .into(),
+            ]
+        }
+        (
+            Target::Scrollbar {
+                pane,
+                part: ScrollPart::TrackBefore,
+            },
+            Gesture::Click,
+        ) => {
+            vec![
+                ViewCmd::ScrollBy {
+                    pane,
+                    delta: -PAGE_LINES,
+                }
+                .into(),
+            ]
+        }
+        (
+            Target::Scrollbar {
+                pane,
+                part: ScrollPart::TrackAfter,
+            },
+            Gesture::Click,
+        ) => {
+            vec![
+                ViewCmd::ScrollBy {
+                    pane,
+                    delta: PAGE_LINES,
+                }
+                .into(),
+            ]
+        }
+        (Target::Scrollbar { pane, .. }, Gesture::Scroll(delta)) => vec![scroll(pane, delta)],
+
+        (Target::Splitter(split), Gesture::DragBy { dx, .. }) => {
+            vec![ViewCmd::MoveSplit { split, delta: dx }.into()]
+        }
+        (Target::Splitter(split), Gesture::DoubleClick) => vec![ViewCmd::EvenSplit(split).into()],
+
+        (Target::Tab(id), Gesture::Click) => vec![Action::SelectTab(id).into()],
+        (Target::TabClose(id), Gesture::Click)
+        // The operation matrix in design.md §6.5 offers middle-click as the
+        // second way to close a tab, and it is the one that does not require
+        // hitting a one-cell `×`.
+        | (Target::Tab(id), Gesture::MiddleClick) => vec![Action::CloseTab(id).into()],
+
+        (Target::Button(ButtonId::Cancel(busy)), Gesture::Click) => {
+            vec![Action::Cancel(busy).into()]
+        }
+        (Target::Toast(id), Gesture::Click) => vec![Action::DismissToast(id).into()],
+        (Target::Backdrop, Gesture::Click) => vec![ViewCmd::DismissModal.into()],
+
+        // Presses, releases and hover carry no action of their own; they exist
+        // so the view can show feedback.
+        _ => Vec::new(),
+    }
+}
+
+fn scroll(pane: PaneId, delta: i8) -> Intent {
+    ViewCmd::ScrollBy {
+        pane,
+        delta: i32::from(delta) * WHEEL_LINES,
+    }
+    .into()
+}
+
+/// Opening a node: relations open a preview, branches expand.
+fn activate_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
+    let Some(node) = ctx.node(index) else {
+        return Vec::new();
+    };
+    let Some(conn) = ctx.connection else {
+        return Vec::new();
+    };
+    match node.node_ref.as_table() {
+        Some(table) => vec![Action::PreviewTable { conn, table }.into()],
+        None => vec![
+            Action::ToggleNode {
+                conn,
+                node: node.node_ref.clone(),
+            }
+            .into(),
+        ],
+    }
+}
+
+/// `collapse_only` is set for `Left`, which must never open a subtree: a key
+/// that closes one and also opens one is not a direction, it is a toggle with
+/// a misleading name.
+fn toggle_node(index: usize, ctx: &InputContext<'_>, collapse_only: bool) -> Vec<Intent> {
+    let Some(node) = ctx.node(index) else {
+        return Vec::new();
+    };
+    let Some(conn) = ctx.connection else {
+        return Vec::new();
+    };
+    if !node.state.is_toggleable() {
+        return Vec::new();
+    }
+    if collapse_only && !node.state.is_expanded() {
+        return Vec::new();
+    }
+    vec![
+        Action::ToggleNode {
+            conn,
+            node: node.node_ref.clone(),
+        }
+        .into(),
+    ]
+}
+
+// ── keyboard ───────────────────────────────────────────────────────────────
+
+/// What a keystroke means, given where focus is.
+#[must_use]
+pub fn on_key(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
+    // Windows terminals report releases as well as presses.
+    if event.kind != KeyEventKind::Press {
+        return Vec::new();
+    }
+
+    let context = ctx.key_context();
+    let matching = |wanted: Context| {
+        KEYMAP
+            .iter()
+            .find(|b| b.context == wanted && b.keys.iter().any(|k| k.matches(event)))
+    };
+
+    // A pane binding beats the global one for the same key, so `Esc` in a modal
+    // dismisses the modal rather than a toast behind it. A modal is the one
+    // context with no fallback: it has the keyboard, so `q` behind a "discard
+    // these changes?" dialog must not quit instead of answering it.
+    let bound = matching(context).or_else(|| match context {
+        Context::Modal => None,
+        _ => matching(Context::Global),
+    });
+
+    let Some(binding) = bound else {
+        return Vec::new();
+    };
+    materialise(binding.kind, event, ctx)
+}
+
+/// Build the concrete intent for a bound capability.
+///
+/// The key map says *what*; this decides the parameters from the current
+/// state, which is why the same key can scroll whichever pane has focus.
+fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
+    let pane = ctx.focus;
+    let backwards = matches!(
+        event.code,
+        KeyCode::Up | KeyCode::PageUp | KeyCode::Left | KeyCode::Home | KeyCode::BackTab
+    ) || matches!(
+        event.code,
+        KeyCode::Char('h' | 'H' | 'k' | 'K' | '<' | 'g' | '[')
+    );
+
+    match kind {
+        IntentKind::Focus => vec![if backwards {
+            ViewCmd::FocusPrevPane.into()
+        } else {
+            ViewCmd::FocusNextPane.into()
+        }],
+        IntentKind::Scroll => {
+            let magnitude = if matches!(event.code, KeyCode::PageUp | KeyCode::PageDown) {
+                PAGE_LINES
+            } else {
+                1
+            };
+            vec![
+                ViewCmd::ScrollBy {
+                    pane,
+                    delta: if backwards { -magnitude } else { magnitude },
+                }
+                .into(),
+            ]
+        }
+        IntentKind::ScrollEdge => vec![if backwards {
+            ViewCmd::ScrollToStart(pane).into()
+        } else {
+            ViewCmd::ScrollToEnd(pane).into()
+        }],
+        IntentKind::ScrollHorizontally => vec![
+            ViewCmd::ScrollXBy {
+                delta: if backwards { -1 } else { 1 },
+            }
+            .into(),
+        ],
+        IntentKind::TreeSelection => {
+            vec![ViewCmd::MoveTreeSelection(if backwards { -1 } else { 1 }).into()]
+        }
+        IntentKind::GridSelection => {
+            let step = if backwards { -1 } else { 1 };
+            let sideways = matches!(event.code, KeyCode::Char('H' | 'L'));
+            vec![
+                ViewCmd::MoveCellSelection {
+                    drow: if sideways { 0 } else { step },
+                    dcol: if sideways { step } else { 0 },
+                }
+                .into(),
+            ]
+        }
+        IntentKind::ResizeColumn => vec![
+            ViewCmd::ResizeColumn {
+                col: ctx.grid_column.unwrap_or(0),
+                delta: if backwards { -1 } else { 1 },
+            }
+            .into(),
+        ],
+        IntentKind::MoveSplit => vec![
+            ViewCmd::MoveSplit {
+                split: SplitId::Explorer,
+                delta: if backwards { -1 } else { 1 },
+            }
+            .into(),
+        ],
+        IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
+        IntentKind::DismissModal => vec![ViewCmd::DismissModal.into()],
+
+        IntentKind::Connect => vec![Action::Connect(sqlake_core::DriverKind::Mock).into()],
+        IntentKind::Disconnect => ctx
+            .connection
+            .map(|c| vec![Action::Disconnect(c).into()])
+            .unwrap_or_default(),
+        IntentKind::ToggleNode => ctx
+            .tree_selection
+            .map(|i| toggle_node(i, ctx, matches!(event.code, KeyCode::Left)))
+            .unwrap_or_default(),
+        IntentKind::PreviewTable => ctx
+            .tree_selection
+            .map(|i| activate_node(i, ctx))
+            .unwrap_or_default(),
+        IntentKind::SortPreview => ctx
+            .active_tab()
+            .map(|tab| {
+                vec![
+                    Action::SortPreview {
+                        tab,
+                        column: ctx.grid_column.unwrap_or(0),
+                    }
+                    .into(),
+                ]
+            })
+            .unwrap_or_default(),
+        IntentKind::LoadMore => ctx
+            .active_tab()
+            .map(|tab| vec![Action::LoadMore { tab }.into()])
+            .unwrap_or_default(),
+        IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
+            .map(|tab| vec![Action::SelectTab(tab).into()])
+            .unwrap_or_default(),
+        IntentKind::CloseTab => ctx
+            .active_tab()
+            .map(|tab| vec![Action::CloseTab(tab).into()])
+            .unwrap_or_default(),
+        IntentKind::Cancel => ctx
+            .snapshot
+            .busy
+            .first()
+            .map(|b| vec![Action::Cancel(b.id).into()])
+            .unwrap_or_default(),
+        IntentKind::DismissToast => ctx
+            .snapshot
+            .toasts
+            .first()
+            .map(|t| vec![Action::DismissToast(t.id).into()])
+            .unwrap_or_default(),
+        IntentKind::Quit => vec![Action::Quit.into()],
+    }
+}
+
+fn neighbouring_tab(ctx: &InputContext<'_>, backwards: bool) -> Option<TabId> {
+    let tabs = &ctx.snapshot.tabs;
+    if tabs.is_empty() {
+        return None;
+    }
+    let Some(current) = ctx
+        .active_tab()
+        .and_then(|id| tabs.iter().position(|t| t.id == id))
+    else {
+        // Nothing is active — the last tab was just closed. Stepping from an
+        // assumed index 0 would skip the first tab entirely.
+        return tabs.first().map(|t| t.id);
+    };
+    let next = if backwards {
+        (current + tabs.len() - 1) % tabs.len()
+    } else {
+        (current + 1) % tabs.len()
+    };
+    tabs.get(next).map(|t| t.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use sqlake_app::action::{BusyId, ToastId};
+    use sqlake_app::snapshot::{
+        BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity,
+        TabContent, TabView, Toast,
+    };
+    use sqlake_app::tree::{NodeState, TreeView, VisibleNode};
+    use sqlake_core::capability::DriverKind;
+    use sqlake_core::node::{NodeKind, NodeRef, RelationKind, TableRef};
+
+    use super::*;
+
+    // ── fixtures ───────────────────────────────────────────────────────────
+
+    fn snapshot() -> Snapshot {
+        let conn = ConnId::new();
+        let tab = TabId::new(1);
+        let mut trees = std::collections::HashMap::new();
+        trees.insert(
+            conn,
+            Arc::new(TreeView {
+                nodes: vec![
+                    VisibleNode {
+                        depth: 0,
+                        label: "public".into(),
+                        node_ref: NodeRef::new(NodeKind::Namespace, ["public"]),
+                        relation_kind: None,
+                        // Expanded, because the row below it is its child. A
+                        // collapsed node listing a child is a state the store
+                        // cannot produce.
+                        state: NodeState::Expanded,
+                    },
+                    VisibleNode {
+                        depth: 1,
+                        label: "users".into(),
+                        node_ref: NodeRef::new(NodeKind::Relation, ["public", "users"]),
+                        relation_kind: Some(RelationKind::Table),
+                        state: NodeState::Leaf,
+                    },
+                ],
+            }),
+        );
+
+        Snapshot {
+            rev: 1,
+            connections: vec![ConnectionView {
+                id: conn,
+                name: "mock".into(),
+                kind: DriverKind::Mock,
+                status: ConnStatus::Ready,
+                capabilities: None,
+            }],
+            trees,
+            tabs: vec![
+                TabView {
+                    id: tab,
+                    conn,
+                    title: "users".into(),
+                    content: TabContent::Preview(PreviewTab {
+                        table: TableRef::new(["public", "users"]),
+                        sort: None,
+                        loaded_rows: 0,
+                        data: LoadState::Idle,
+                    }),
+                },
+                TabView {
+                    id: TabId::new(2),
+                    conn,
+                    title: "empty".into(),
+                    content: TabContent::Preview(PreviewTab {
+                        table: TableRef::new(["public", "empty"]),
+                        sort: None,
+                        loaded_rows: 0,
+                        data: LoadState::Idle,
+                    }),
+                },
+            ],
+            active_tab: Some(tab),
+            busy: vec![BusyItem {
+                id: BusyId::new(1),
+                owner: BusyOwner::Tab(tab),
+                label: "loading".into(),
+                started_at: std::time::Instant::now(),
+            }],
+            toasts: vec![Toast {
+                id: ToastId::new(1),
+                text: "oops".into(),
+                severity: Severity::Error,
+                created_at: std::time::Instant::now(),
+            }],
+            should_quit: false,
+        }
+    }
+
+    fn ctx<'a>(snapshot: &'a Snapshot, focus: PaneId) -> InputContext<'a> {
+        InputContext {
+            snapshot,
+            focus,
+            modal_open: false,
+            connection: snapshot.connections.first().map(|c| c.id),
+            tree_selection: Some(0),
+            grid_column: Some(2),
+        }
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn press_ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    // ── mouse ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn clicking_a_tree_row_focuses_the_explorer_and_selects_it() {
+        let snap = snapshot();
+        let out = on_mouse(
+            Target::TreeRow { index: 1 },
+            Gesture::Click,
+            &ctx(&snap, PaneId::Grid),
+        );
+        assert_eq!(
+            out,
+            [
+                Intent::View(ViewCmd::FocusPane(PaneId::Explorer)),
+                Intent::View(ViewCmd::SelectTreeRow(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_relation_opens_it_and_a_branch_expands() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Explorer);
+
+        let out = on_mouse(Target::TreeRow { index: 1 }, Gesture::DoubleClick, &c);
+        assert!(matches!(out[0], Intent::App(Action::PreviewTable { .. })));
+
+        let out = on_mouse(Target::TreeRow { index: 0 }, Gesture::DoubleClick, &c);
+        assert!(matches!(out[0], Intent::App(Action::ToggleNode { .. })));
+    }
+
+    #[test]
+    fn the_toggle_glyph_never_expands_a_leaf() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Explorer);
+        assert!(on_mouse(Target::TreeToggle { index: 1 }, Gesture::Click, &c).is_empty());
+        assert!(!on_mouse(Target::TreeToggle { index: 0 }, Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn a_click_on_a_row_that_no_longer_exists_does_nothing() {
+        // The hit map is one frame old, so an index can outlive its row.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Explorer);
+        assert!(on_mouse(Target::TreeRow { index: 99 }, Gesture::DoubleClick, &c).is_empty());
+        assert!(on_mouse(Target::TreeToggle { index: 99 }, Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_it_is_over_not_the_focused_one() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_mouse(Target::TreeRow { index: 0 }, Gesture::Scroll(-1), &c),
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::Explorer,
+                delta: -WHEEL_LINES
+            })]
+        );
+    }
+
+    #[test]
+    fn dragging_a_column_edge_resizes_that_column() {
+        let snap = snapshot();
+        let out = on_mouse(
+            Target::GridColEdge { col: 4 },
+            Gesture::DragBy { dx: -3, dy: 0 },
+            &ctx(&snap, PaneId::Grid),
+        );
+        assert_eq!(
+            out,
+            [Intent::View(ViewCmd::ResizeColumn { col: 4, delta: -3 })]
+        );
+    }
+
+    #[test]
+    fn clicking_the_track_pages_towards_the_click() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        let before = on_mouse(
+            Target::Scrollbar {
+                pane: PaneId::Grid,
+                part: ScrollPart::TrackBefore,
+            },
+            Gesture::Click,
+            &c,
+        );
+        let after = on_mouse(
+            Target::Scrollbar {
+                pane: PaneId::Grid,
+                part: ScrollPart::TrackAfter,
+            },
+            Gesture::Click,
+            &c,
+        );
+        assert_eq!(
+            before,
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: -PAGE_LINES
+            })]
+        );
+        assert_eq!(
+            after,
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: PAGE_LINES
+            })]
+        );
+    }
+
+    #[test]
+    fn the_backdrop_dismisses_the_modal_rather_than_reaching_behind_it() {
+        let snap = snapshot();
+        assert_eq!(
+            on_mouse(Target::Backdrop, Gesture::Click, &ctx(&snap, PaneId::Grid)),
+            [Intent::View(ViewCmd::DismissModal)]
+        );
+    }
+
+    #[test]
+    fn presses_and_hover_carry_no_action() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Explorer);
+        for gesture in [
+            Gesture::Down,
+            Gesture::Up,
+            Gesture::HoverEnter,
+            Gesture::HoverLeave,
+        ] {
+            assert!(
+                on_mouse(Target::TreeRow { index: 0 }, gesture, &c).is_empty(),
+                "{gesture:?}"
+            );
+        }
+    }
+
+    // ── keyboard ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn scrolling_applies_to_the_focused_pane() {
+        let snap = snapshot();
+        assert_eq!(
+            on_key(press(KeyCode::Char('j')), &ctx(&snap, PaneId::Grid)),
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: 1
+            })]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('k')), &ctx(&snap, PaneId::StatusBar)),
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::StatusBar,
+                delta: -1
+            })]
+        );
+    }
+
+    #[test]
+    fn a_pane_binding_beats_the_global_one_for_the_same_key() {
+        // Down scrolls globally, but in the explorer it moves the selection.
+        let snap = snapshot();
+        assert_eq!(
+            on_key(press(KeyCode::Down), &ctx(&snap, PaneId::Explorer)),
+            [Intent::View(ViewCmd::MoveTreeSelection(1))]
+        );
+        assert!(matches!(
+            on_key(press(KeyCode::Down), &ctx(&snap, PaneId::Grid))[0],
+            Intent::View(ViewCmd::ScrollBy { .. })
+        ));
+    }
+
+    #[test]
+    fn escape_means_different_things_in_different_contexts() {
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Grid);
+        assert!(matches!(
+            on_key(press(KeyCode::Esc), &c)[0],
+            Intent::App(Action::DismissToast(_))
+        ));
+
+        c.modal_open = true;
+        assert_eq!(
+            on_key(press(KeyCode::Esc), &c),
+            [Intent::View(ViewCmd::DismissModal)]
+        );
+    }
+
+    #[test]
+    fn a_modal_takes_the_keyboard_over_entirely() {
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Grid);
+        c.modal_open = true;
+        // `s` sorts in the grid, but the grid is not what has the keyboard.
+        assert!(on_key(press(KeyCode::Char('s')), &c).is_empty());
+        // And neither is the global map, which is where the dangerous ones are.
+        assert!(on_key(press(KeyCode::Char('q')), &c).is_empty());
+        assert!(on_key(press_ctrl(KeyCode::Char('c')), &c).is_empty());
+    }
+
+    #[test]
+    fn sorting_and_resizing_act_on_the_selected_column() {
+        // The mouse can sort any header and resize any edge. Bound to column
+        // zero, the keys would only look like the same capability.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char('s')), &c),
+            [Intent::App(Action::SortPreview {
+                tab: TabId::new(1),
+                column: 2
+            })]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('>')), &c),
+            [Intent::View(ViewCmd::ResizeColumn { col: 2, delta: 1 })]
+        );
+    }
+
+    #[test]
+    fn shift_tab_moves_focus_the_other_way() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Tab), &c),
+            [Intent::View(ViewCmd::FocusNextPane)]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::BackTab), &c),
+            [Intent::View(ViewCmd::FocusPrevPane)]
+        );
+        assert_eq!(
+            on_key(press_ctrl(KeyCode::Char('h')), &c),
+            [Intent::View(ViewCmd::FocusPrevPane)]
+        );
+    }
+
+    #[test]
+    fn left_closes_a_node_but_never_opens_one() {
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Explorer);
+        let conn = snap.connections[0].id;
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+
+        // Row 0 is expanded, so Left collapses it.
+        c.tree_selection = Some(0);
+        assert_eq!(
+            on_key(press(KeyCode::Left), &c),
+            [Intent::App(Action::ToggleNode {
+                conn,
+                node: public.clone()
+            })]
+        );
+        // Right and Space still toggle in both directions.
+        assert_eq!(
+            on_key(press(KeyCode::Right), &c),
+            [Intent::App(Action::ToggleNode { conn, node: public })]
+        );
+
+        // Row 1 is a leaf: nothing to close, and nothing to open either.
+        c.tree_selection = Some(1);
+        assert!(on_key(press(KeyCode::Left), &c).is_empty());
+    }
+
+    #[test]
+    fn the_cell_cursor_moves_on_both_axes() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+
+        // A click selects any cell, so the keyboard has to reach any cell too.
+        // Both directions are `GridSelection`, so the coverage sweep cannot
+        // see the difference — it was missing until someone looked.
+        for (k, drow, dcol) in [('J', 1, 0), ('K', -1, 0), ('L', 0, 1), ('H', 0, -1)] {
+            assert_eq!(
+                on_key(press(KeyCode::Char(k)), &c),
+                [Intent::View(ViewCmd::MoveCellSelection { drow, dcol })],
+                "{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arrows_still_move_the_view_not_the_selection() {
+        // Lower case and the arrows scroll; upper case selects. Breaking that
+        // symmetry is how `Left` ends up meaning two things.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Right), &c),
+            [Intent::View(ViewCmd::ScrollXBy { delta: 1 })]
+        );
+    }
+
+    #[test]
+    fn a_middle_click_closes_the_tab_it_lands_on() {
+        // The operation matrix offers this as the second way to close a tab,
+        // and it is the one that does not require hitting a one-cell `×`.
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        let tab = TabId::new(2);
+        assert_eq!(
+            on_mouse(Target::Tab(tab), Gesture::MiddleClick, &c),
+            [Intent::App(Action::CloseTab(tab))]
+        );
+        // A left click still selects rather than closes.
+        assert_eq!(
+            on_mouse(Target::Tab(tab), Gesture::Click, &c),
+            [Intent::App(Action::SelectTab(tab))]
+        );
+    }
+
+    #[test]
+    fn switching_tabs_with_nothing_active_lands_on_the_first_one() {
+        // The active tab was just closed. Stepping from an assumed index 0
+        // would skip the tab the user is looking at.
+        let mut snap = snapshot();
+        snap.active_tab = None;
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char(']')), &c),
+            [Intent::App(Action::SelectTab(TabId::new(1)))]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('[')), &c),
+            [Intent::App(Action::SelectTab(TabId::new(1)))]
+        );
+    }
+
+    #[test]
+    fn the_wheel_works_over_the_empty_part_of_a_pane() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_mouse(Target::Pane(PaneId::Explorer), Gesture::Scroll(1), &c),
+            [Intent::View(ViewCmd::ScrollBy {
+                pane: PaneId::Explorer,
+                delta: WHEEL_LINES
+            })]
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_selected_relation() {
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Explorer);
+        c.tree_selection = Some(1);
+        assert!(matches!(
+            on_key(press(KeyCode::Enter), &c)[0],
+            Intent::App(Action::PreviewTable { .. })
+        ));
+    }
+
+    #[test]
+    fn tab_switching_wraps_in_both_directions() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char(']')), &c),
+            [Intent::App(Action::SelectTab(TabId::new(2)))]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('[')), &c),
+            [Intent::App(Action::SelectTab(TabId::new(2)))],
+            "from the first tab, backwards wraps to the last"
+        );
+    }
+
+    #[test]
+    fn cancel_targets_what_is_actually_running() {
+        let snap = snapshot();
+        assert_eq!(
+            on_key(press_ctrl(KeyCode::Char('g')), &ctx(&snap, PaneId::Grid)),
+            [Intent::App(Action::Cancel(BusyId::new(1)))]
+        );
+    }
+
+    #[test]
+    fn quit_is_bound_twice_for_the_two_habits() {
+        let snap = snapshot();
+        let c = ctx(&snap, PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char('q')), &c),
+            [Intent::App(Action::Quit)]
+        );
+        assert_eq!(
+            on_key(press_ctrl(KeyCode::Char('c')), &c),
+            [Intent::App(Action::Quit)]
+        );
+    }
+
+    #[test]
+    fn key_releases_are_ignored() {
+        // Windows terminals report them, and acting on both would double every
+        // keystroke.
+        let snap = snapshot();
+        let mut event = press(KeyCode::Char('q'));
+        event.kind = KeyEventKind::Release;
+        assert!(on_key(event, &ctx(&snap, PaneId::Grid)).is_empty());
+    }
+
+    #[test]
+    fn an_unbound_key_does_nothing() {
+        let snap = snapshot();
+        assert!(on_key(press(KeyCode::Char('~')), &ctx(&snap, PaneId::Grid)).is_empty());
+    }
+
+    #[test]
+    fn an_action_with_nothing_to_act_on_produces_nothing() {
+        let empty = Snapshot::default();
+        let c = InputContext {
+            snapshot: &empty,
+            focus: PaneId::Grid,
+            modal_open: false,
+            connection: None,
+            tree_selection: None,
+            grid_column: None,
+        };
+        for code in [
+            KeyCode::Char('s'),
+            KeyCode::Char('m'),
+            KeyCode::Char(']'),
+            KeyCode::Char('D'),
+            KeyCode::Enter,
+        ] {
+            assert!(on_key(press(code), &c).is_empty(), "{code:?}");
+        }
+    }
+
+    // ── the rule this whole module exists to keep ──────────────────────────
+
+    /// Declares the sample values for an enum next to an exhaustive match over
+    /// it, from one list.
+    ///
+    /// The samples have to be generated from the same arms that make the match
+    /// exhaustive. Counting variants against a literal instead would let a new
+    /// variant be given a match arm and no sample: the count would still equal
+    /// the literal, and the sweep below would silently stop covering it.
+    macro_rules! samples {
+        ($ty:ty, $all:ident, $exhaustive:ident, $($pattern:pat => [$($sample:expr),+ $(,)?]),+ $(,)?) => {
+            fn $all() -> Vec<$ty> {
+                vec![$($($sample),+),+]
+            }
+
+            /// Never called: it exists so that adding a variant stops this
+            /// module compiling until the arm — and therefore the sample —
+            /// is written.
+            #[allow(dead_code)]
+            const fn $exhaustive(value: &$ty) {
+                match value {
+                    $($pattern => ()),+
+                }
+            }
+        };
+    }
+
+    samples! {
+        Target, all_targets, every_target_is_sampled,
+        Target::Pane(_) => [Target::Pane(PaneId::Grid), Target::Pane(PaneId::Explorer)],
+        Target::TreeRow { .. } => [Target::TreeRow { index: 0 }],
+        Target::TreeToggle { .. } => [Target::TreeToggle { index: 0 }],
+        Target::GridCell { .. } => [Target::GridCell { row: 0, col: 0 }],
+        Target::GridHeader { .. } => [Target::GridHeader { col: 0 }],
+        Target::GridColEdge { .. } => [Target::GridColEdge { col: 0 }],
+        Target::Scrollbar { .. } => [
+            Target::Scrollbar { pane: PaneId::Grid, part: ScrollPart::Thumb },
+            Target::Scrollbar { pane: PaneId::Grid, part: ScrollPart::TrackBefore },
+            Target::Scrollbar { pane: PaneId::Grid, part: ScrollPart::TrackAfter },
+        ],
+        Target::Splitter(_) => [Target::Splitter(SplitId::Explorer)],
+        Target::Tab(_) => [Target::Tab(TabId::new(1))],
+        Target::TabClose(_) => [Target::TabClose(TabId::new(1))],
+        Target::Button(_) => [Target::Button(ButtonId::Cancel(BusyId::new(1)))],
+        Target::Toast(_) => [Target::Toast(ToastId::new(1))],
+        Target::Backdrop => [Target::Backdrop],
+    }
+
+    samples! {
+        Gesture, all_gestures, every_gesture_is_sampled,
+        Gesture::Down => [Gesture::Down],
+        Gesture::Up => [Gesture::Up],
+        Gesture::Click => [Gesture::Click],
+        Gesture::DoubleClick => [Gesture::DoubleClick],
+        Gesture::RightClick => [Gesture::RightClick],
+        Gesture::MiddleClick => [Gesture::MiddleClick],
+        Gesture::DragBy { .. } => [Gesture::DragBy { dx: 1, dy: 1 }, Gesture::DragBy { dx: -1, dy: -1 }],
+        Gesture::Scroll(_) => [Gesture::Scroll(1), Gesture::Scroll(-1)],
+        Gesture::ScrollX(_) => [Gesture::ScrollX(1), Gesture::ScrollX(-1)],
+        Gesture::HoverEnter => [Gesture::HoverEnter],
+        Gesture::HoverLeave => [Gesture::HoverLeave],
+    }
+
+    #[test]
+    fn every_capability_reachable_with_the_mouse_has_a_key_binding() {
+        // This is the mechanical form of "nothing is mouse-only". The reverse
+        // is deliberately not required: keyboard-only capabilities are fine.
+        let snap = snapshot();
+        let mut contexts = Vec::new();
+        for focus in [PaneId::Explorer, PaneId::Grid] {
+            for selection in [Some(0), Some(1)] {
+                let mut c = ctx(&snap, focus);
+                c.tree_selection = selection;
+                contexts.push(c);
+            }
+        }
+
+        let mut reachable = BTreeSet::new();
+        for target in all_targets() {
+            for gesture in all_gestures() {
+                for c in &contexts {
+                    for intent in on_mouse(target, gesture, c) {
+                        reachable.insert(IntentKind::of(&intent));
+                    }
+                }
+            }
+        }
+        assert!(!reachable.is_empty(), "the sweep found nothing at all");
+
+        let bound: BTreeSet<_> = KEYMAP.iter().map(|b| b.kind).collect();
+        let unbound: Vec<_> = reachable.difference(&bound).collect();
+        assert!(
+            unbound.is_empty(),
+            "reachable with the mouse but not with the keyboard: {unbound:?}"
+        );
+    }
+
+    #[test]
+    fn every_key_binding_is_reachable_from_some_key() {
+        for binding in KEYMAP {
+            assert!(!binding.keys.is_empty(), "{:?} has no keys", binding.kind);
+        }
+    }
+
+    /// Every focus, selection and modal state a keystroke can be read in.
+    fn every_context(snap: &Snapshot) -> Vec<InputContext<'_>> {
+        let mut out = Vec::new();
+        for focus in [
+            PaneId::TabBar,
+            PaneId::Explorer,
+            PaneId::Grid,
+            PaneId::StatusBar,
+        ] {
+            for selection in [None, Some(0), Some(1)] {
+                for modal_open in [false, true] {
+                    let mut c = ctx(snap, focus);
+                    c.tree_selection = selection;
+                    c.modal_open = modal_open;
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_binding_produces_the_capability_it_claims() {
+        // The sweep above compares the set of kinds the mouse reaches against
+        // the set of kinds the map *names*. On its own that is satisfiable by a
+        // binding that names a kind and produces nothing — a key that is listed
+        // in the help and does not work. This closes that half.
+        let snap = snapshot();
+        let contexts = every_context(&snap);
+
+        for binding in KEYMAP {
+            for combo in binding.keys {
+                let event = KeyEvent::new(combo.code, combo.modifiers);
+                let works = contexts.iter().any(|c| {
+                    let intents = on_key(event, c);
+                    !intents.is_empty() && intents.iter().all(|i| IntentKind::of(i) == binding.kind)
+                });
+                assert!(
+                    works,
+                    "{:?} in {:?} never produces {:?}",
+                    combo.code, binding.context, binding.kind
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_modal_leaves_no_key_bound_to_anything_else() {
+        // "A modal takes the keyboard over" is a claim about every key, not
+        // just the ones belonging to a pane: `q` behind a dialog must answer
+        // the dialog or do nothing, never quit.
+        let snap = snapshot();
+        let mut c = ctx(&snap, PaneId::Grid);
+        c.modal_open = true;
+
+        for binding in KEYMAP {
+            for combo in binding.keys {
+                let event = KeyEvent::new(combo.code, combo.modifiers);
+                for intent in on_key(event, &c) {
+                    assert_eq!(
+                        IntentKind::of(&intent),
+                        IntentKind::DismissModal,
+                        "{:?} still reaches {intent:?} with a modal open",
+                        combo.code
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_key_is_bound_twice_in_the_same_context() {
+        let mut seen = BTreeSet::new();
+        for binding in KEYMAP {
+            for combo in binding.keys {
+                let key = (
+                    binding.context,
+                    format!("{:?}", combo.code),
+                    combo.modifiers.bits(),
+                );
+                assert!(
+                    seen.insert(key.clone()),
+                    "{:?} is bound twice in {:?}",
+                    key.1,
+                    binding.context
+                );
+            }
+        }
+    }
+}

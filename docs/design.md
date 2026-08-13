@@ -455,12 +455,17 @@ The reverse direction is deliberately not required: keyboard-only capabilities a
 | Pane | click to focus | `Tab`, `Ctrl-h` |
 | Splitter | drag to resize, double-click to even out | `Ctrl-←/→`, `=` |
 | Scrolling | wheel, thumb drag, track click | `j/k`, `PgUp/PgDn`, `g/G` |
-| Grid | header click sorts, edge drag resizes, cell click selects, right-click opens menu | `J/K`, `s`, `<`/`>` |
-| Tree | click `▸` to expand, double-click to open | `Space`, `Enter` |
+| Grid | header click sorts, edge drag resizes, cell click selects, right-click opens menu | `J/K`, `H/L`, `s`, `<`/`>` |
+| Tree | click `▸` to expand, double-click to open | `Space`, `←`/`→`, `Enter` |
 | Tabs | click to switch, `×` or middle-click to close | `]`/`[`, `Ctrl-w` |
 | Editor area | click to open `$EDITOR` | `e` |
 | Modal | click outside to dismiss | `Esc` |
 | Command palette | — | `Ctrl-p` |
+
+Case carries the axis of control: lower case and the arrow keys move the **view**, upper case
+moves the **selection**. `H`/`L` are to `J`/`K` what `Left`/`Right` are to `j`/`k`. Dropping
+half of that pairing is easy to miss, because the coverage test works at the level of the
+capability and both directions of a cursor are one capability.
 
 ---
 

@@ -11,4 +11,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+crossterm.workspace = true
+futures.workspace = true
 ratatui.workspace = true
+sqlake-app.workspace = true
+sqlake-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
