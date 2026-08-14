@@ -30,7 +30,6 @@ pub struct ConnectInput {
 
 #[derive(Debug)]
 pub struct ConnectOutput {
-    pub profile: ProfileId,
     pub name: String,
     pub session: SessionHandle,
     pub capabilities: Capabilities,
@@ -45,12 +44,11 @@ impl UseCase for Connect {
     type Output = ConnectOutput;
 
     async fn execute(&self, input: Self::Input) -> AppResult<Self::Output> {
-        let profile = self.resolve(input.profile.clone()).await?;
+        let profile = self.resolve(input.profile).await?;
         let session = SessionHandle::spawn(self.driver.connect(&profile).await?);
         let capabilities = session.capabilities();
         let roots = session.children(NodeRef::root()).await?;
         Ok(ConnectOutput {
-            profile: input.profile,
             name: input.name,
             session,
             capabilities,
@@ -102,7 +100,12 @@ mod tests {
             .execute(input("mock"))
             .await
             .expect("should connect");
-        assert_eq!(out.profile.as_str(), "mock");
+
+        assert_eq!(out.name, "mock");
+        // The session's own answer, not the driver's: everything the UI can
+        // branch on arrives through here.
+        assert_eq!(out.capabilities.hierarchy.len(), 2);
+        // A connection that succeeds but shows an empty tree looks broken.
         assert!(!out.roots.is_empty());
     }
 

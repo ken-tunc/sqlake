@@ -97,7 +97,7 @@ impl fmt::Display for Action {
     /// Short forms for the log. Deliberately not user-facing text.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect(kind) => write!(f, "connect({})", kind.as_str()),
+            Self::Connect(profile) => write!(f, "connect({profile})"),
             Self::Disconnect(id) => write!(f, "disconnect({})", id.short()),
             Self::ToggleNode { node, .. } => write!(f, "toggle({node})"),
             Self::PreviewTable { table, .. } => write!(f, "preview({table})"),

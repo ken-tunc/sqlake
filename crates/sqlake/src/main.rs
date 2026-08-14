@@ -1,6 +1,7 @@
 //! Argument parsing, dependency wiring, startup. Nothing else lives here.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -84,6 +85,16 @@ fn main() -> Result<()> {
     );
 
     let result = runtime.block_on(sqlake_tui::run(&mut terminal, &store, !args.no_mouse));
+
+    // The user asked to quit, so the client goes.
+    //
+    // Dropping the runtime instead would wait for every blocking task, and
+    // resolving a profile is one: it can be sitting on a keyring dialog that
+    // nobody is going to answer, which would hang the exit behind a window the
+    // user may not even be able to see. Nothing at this point needs to run —
+    // when something does, it gets its own await *before* this line rather
+    // than a longer timeout here.
+    runtime.shutdown_timeout(Duration::from_millis(500));
 
     // The guard restores the screen as it drops, which happens on the way out
     // of this function whether `result` is an error or not.
