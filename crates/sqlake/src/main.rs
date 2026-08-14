@@ -26,7 +26,15 @@ struct Args {
     no_mouse: bool,
 
     /// `error`, `warn`, `info`, `debug` or `trace`. `RUST_LOG` overrides it.
-    #[arg(long, default_value = "info")]
+    ///
+    /// Checked here rather than by the filter: `EnvFilter` accepts an unknown
+    /// level, complains on stderr and falls back to errors only, so a typo
+    /// would leave the log silently almost empty.
+    #[arg(
+        long,
+        default_value = "info",
+        value_parser = ["error", "warn", "info", "debug", "trace"]
+    )]
     log_level: String,
 
     /// Panic once the terminal is taken over, to prove it is given back.
@@ -44,6 +52,11 @@ fn main() -> Result<()> {
     // Every mode change is undone by the guard's `Drop`, and the hook routes a
     // panic through the same function. Installed before the guard exists so a
     // failure inside `enter` is already covered.
+    //
+    // The hook ends the process rather than returning. tokio catches a panic in
+    // a spawned task, so without this the screen would be restored while the
+    // render loop carried on drawing frames over the user's shell, reading
+    // input that the terminal is now echoing.
     install_panic_hook(!args.no_mouse);
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
@@ -79,7 +92,14 @@ fn init_logging(level: &str) -> Result<tracing_appender::non_blocking::WorkerGua
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating the log directory {}", dir.display()))?;
 
-    let file = tracing_appender::rolling::never(&dir, "sqlake.log");
+    // `rolling::never` panics inside itself when the file cannot be opened —
+    // a read-only directory is enough — and a backtrace is a poor answer to
+    // "the log path is not writable".
+    let file = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::NEVER)
+        .filename_suffix("sqlake.log")
+        .build(&dir)
+        .with_context(|| format!("opening the log file in {}", dir.display()))?;
     let (writer, guard) = tracing_appender::non_blocking(file);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("sqlake={level},sqlake_app={level}")));

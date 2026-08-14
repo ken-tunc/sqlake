@@ -5,15 +5,21 @@
 //! keystroke. Everything expensive happened in the store task before the
 //! snapshot arrived.
 //!
-//! The [`HitMap`] is rebuilt from scratch on every frame and consulted for the
-//! events that follow it, so a click is always answered against the layout that
-//! drew the pixels it was aimed at.
+//! The [`HitMap`] is rebuilt on every frame and consulted for the events that
+//! follow it, so a click is always answered against the layout that drew the
+//! pixels it was aimed at.
+//!
+//! A frame is drawn only when something changed. Mouse capture reports every
+//! cell the pointer crosses, so redrawing per event would relayout, rebuild the
+//! hit map and reformat every visible cell a hundred times for one sweep across
+//! the screen — while [`MouseState`] is careful to report nothing for exactly
+//! that reason.
 
 use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
@@ -44,43 +50,105 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
     let mut events = EventStream::new();
     let mut snapshots = store.subscribe();
     let mut snapshot = snapshots.borrow_and_update().clone();
+    let mut hits = HitMap::new();
+    let mut dirty = true;
 
     loop {
-        ui.retain_tabs(&snapshot);
-        let mut hits = HitMap::new();
-        terminal.draw(|frame| draw(frame, &mut ui, &snapshot, &mut hits))?;
+        if dirty {
+            ui.retain_tabs(&snapshot);
+            // Cleared rather than replaced: one entry per visible cell adds up
+            // to hundreds, and growing a fresh `Vec` for them every frame is a
+            // cost with nothing to show for it.
+            hits.clear();
+            terminal.draw(|frame| draw(frame, &mut ui, &snapshot, &mut hits))?;
+            dirty = false;
+        }
 
         if snapshot.should_quit {
             return Ok(());
         }
 
-        let intents = tokio::select! {
+        let mut intents = Vec::new();
+        tokio::select! {
             event = events.next() => match event {
                 // The terminal is gone; there is nothing left to draw on.
                 None | Some(Err(_)) => return Ok(()),
                 Some(Ok(event)) => {
-                    from_event(event, &hits, &mut mouse, &ui, &snapshot, mouse_enabled)
+                    dirty |= apply_event(
+                        event, &hits, &mut mouse, &ui, &snapshot, mouse_enabled, &mut intents,
+                    );
+                    ui.hover = mouse.hovered();
                 }
             },
             changed = snapshots.changed() => {
                 if changed.is_err() {
-                    return Ok(()); // The store stopped.
+                    // The store is gone, which is a crash rather than a quit:
+                    // `should_quit` above is the way out that means "finished".
+                    return Err(io::Error::other("the store stopped unexpectedly"));
                 }
                 snapshot = snapshots.borrow_and_update().clone();
-                Vec::new()
+                dirty = true;
             }
-        };
+        }
+
+        // Whatever else has arrived while that was being decided. A key repeat
+        // or a drag delivers faster than a frame takes, and handling one event
+        // per frame turns the backlog into lag that never catches up.
+        while let Some(Ok(event)) = events.next().now_or_never().flatten() {
+            dirty |= apply_event(
+                event,
+                &hits,
+                &mut mouse,
+                &ui,
+                &snapshot,
+                mouse_enabled,
+                &mut intents,
+            );
+            ui.hover = mouse.hovered();
+        }
 
         for intent in intents {
             match intent {
                 // Applied here, on this thread, before the next frame. A wheel
                 // notch that went through the store would arrive a round trip
                 // later than the hand that turned it.
-                Intent::View(cmd) => ui.apply(cmd, &snapshot),
+                Intent::View(cmd) => {
+                    ui.apply(cmd, &snapshot);
+                    dirty = true;
+                }
                 Intent::App(action) => store.dispatch(action),
             }
         }
     }
+}
+
+/// Translate one event, collecting its intents. Returns whether the screen has
+/// to be drawn again because of it.
+fn apply_event(
+    event: Event,
+    hits: &HitMap,
+    mouse: &mut MouseState,
+    ui: &UiState,
+    snapshot: &Snapshot,
+    mouse_enabled: bool,
+    intents: &mut Vec<Intent>,
+) -> bool {
+    // A resize invalidates every rectangle the pointer was measured against,
+    // and `Target::TreeRow` is an index into a layout that no longer exists —
+    // a press held across it would be released onto a different row.
+    if matches!(event, Event::Resize(..)) {
+        mouse.reset();
+        return true;
+    }
+
+    let before = mouse.hovered();
+    let produced = from_event(event, hits, mouse, ui, snapshot, mouse_enabled);
+    let hover_moved = mouse.hovered() != before;
+    let any = !produced.is_empty();
+    intents.extend(produced);
+    // Hover is the one thing that changes the screen without producing an
+    // intent, and it is why the pointer moving *within* a target is free.
+    any || hover_moved
 }
 
 fn from_event(
@@ -222,6 +290,7 @@ pub async fn until(
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, MouseEventKind};
     use ratatui::layout::Position;
     use sqlake_app::action::Action;
     use sqlake_app::snapshot::ConnectionView;
@@ -298,18 +367,189 @@ mod tests {
         assert!(seen.contains("TreeRow"), "{seen:?}");
     }
 
+    /// Feed one event the way the loop does, and report what it produced.
+    fn step(
+        event: Event,
+        hits: &HitMap,
+        mouse: &mut MouseState,
+        ui: &UiState,
+        snapshot: &Snapshot,
+    ) -> (Vec<Intent>, bool) {
+        let mut intents = Vec::new();
+        let dirty = apply_event(event, hits, mouse, ui, snapshot, true, &mut intents);
+        (intents, dirty)
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(ratatui::crossterm::event::KeyEvent::new(
+            code,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    fn mouse_at(kind: MouseEventKind, x: u16, y: u16) -> Event {
+        Event::Mouse(ratatui::crossterm::event::MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_pointer_crossing_one_target_does_not_ask_for_a_frame() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let (_, hits) = render(&snap, &mut ui, 100, 30);
+        let mut mouse = MouseState::new();
+
+        // Settle on the explorer, then move within it. Mouse capture reports
+        // every cell, and redrawing for each is a full relayout, a rebuilt hit
+        // map and every visible cell reformatted.
+        let _ = step(
+            mouse_at(MouseEventKind::Moved, 10, 5),
+            &hits,
+            &mut mouse,
+            &ui,
+            &snap,
+        );
+        let (intents, dirty) = step(
+            mouse_at(MouseEventKind::Moved, 11, 5),
+            &hits,
+            &mut mouse,
+            &ui,
+            &snap,
+        );
+        assert!(intents.is_empty());
+        assert!(!dirty, "a move inside one target changed nothing to draw");
+    }
+
+    #[tokio::test]
+    async fn crossing_into_another_target_does_ask_for_one() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let (_, hits) = render(&snap, &mut ui, 100, 30);
+        let mut mouse = MouseState::new();
+
+        let _ = step(
+            mouse_at(MouseEventKind::Moved, 10, 5),
+            &hits,
+            &mut mouse,
+            &ui,
+            &snap,
+        );
+        // Onto the splitter, which highlights while the pointer is on it.
+        let splitter_x = chrome::layout(Rect::new(0, 0, 100, 30), &mut ui).splitter.x;
+        let (_, dirty) = step(
+            mouse_at(MouseEventKind::Moved, splitter_x, 5),
+            &hits,
+            &mut mouse,
+            &ui,
+            &snap,
+        );
+        assert!(dirty, "hover is the one change that produces no intent");
+        assert!(matches!(mouse.hovered(), Some(Target::Splitter(_))));
+    }
+
+    #[tokio::test]
+    async fn a_press_held_across_a_resize_is_not_released_onto_a_new_layout() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let (_, hits) = render(&snap, &mut ui, 100, 30);
+        let mut mouse = MouseState::new();
+
+        let down = mouse_at(
+            MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+            5,
+            5,
+        );
+        let up = mouse_at(
+            MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left),
+            5,
+            5,
+        );
+
+        // Without the resize, press and release is a click on a tree row.
+        let mut fresh = MouseState::new();
+        let _ = step(down.clone(), &hits, &mut fresh, &ui, &snap);
+        let (clicked, _) = step(up.clone(), &hits, &mut fresh, &ui, &snap);
+        assert!(!clicked.is_empty(), "the control case is not a click");
+
+        // With one in between, the release lands on nothing. `Target::TreeRow`
+        // is an index into a layout that no longer exists, so keeping the press
+        // would click whatever row 5 has become.
+        let _ = step(down, &hits, &mut mouse, &ui, &snap);
+        let (_, dirty) = step(Event::Resize(80, 24), &hits, &mut mouse, &ui, &snap);
+        assert!(dirty, "a resize redraws");
+        let (after, _) = step(up, &hits, &mut mouse, &ui, &snap);
+        assert!(after.is_empty(), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn a_view_intent_never_reaches_the_store() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let (_, hits) = render(&snap, &mut ui, 100, 30);
+        let mut mouse = MouseState::new();
+
+        // `j` scrolls, which is decision D3: a wheel notch through the store
+        // arrives a round trip after the hand that turned it.
+        let (intents, dirty) = step(key(KeyCode::Char('j')), &hits, &mut mouse, &ui, &snap);
+        assert!(dirty);
+        assert!(
+            intents.iter().all(|i| matches!(i, Intent::View(_))),
+            "{intents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_app_intent_is_the_only_kind_that_leaves() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let (_, hits) = render(&snap, &mut ui, 100, 30);
+        let mut mouse = MouseState::new();
+
+        let (intents, _) = step(key(KeyCode::Char('q')), &hits, &mut mouse, &ui, &snap);
+        assert!(
+            intents.iter().any(|i| matches!(i, Intent::App(_))),
+            "{intents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbound_key_asks_for_nothing() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let (_, hits) = render(&snap, &mut ui, 100, 30);
+        let mut mouse = MouseState::new();
+
+        let (intents, dirty) = step(key(KeyCode::Char('%')), &hits, &mut mouse, &ui, &snap);
+        assert!(intents.is_empty());
+        assert!(!dirty, "an unbound key must not cost a frame");
+    }
+
     #[tokio::test]
     async fn the_grid_viewport_excludes_the_header_and_the_scrollbar() {
         let (_store, snap) = connected().await;
         let mut ui = UiState::new();
         render(&snap, &mut ui, 100, 30);
 
-        let pane_inner = chrome::layout(Rect::new(0, 0, 100, 30), &mut ui).grid;
+        // Against the pane's *inside*, which is what the earlier version
+        // recorded. Comparing with the pane's outer rectangle passes either
+        // way, because the border alone accounts for the difference — the
+        // assertion has to be the exact rectangle, not "smaller than".
+        let outer = chrome::layout(Rect::new(0, 0, 100, 30), &mut ui).grid;
+        let inner = Rect::new(outer.x + 1, outer.y + 1, outer.width - 2, outer.height - 2);
         let viewport = ui.viewport(PaneId::Grid);
-        // Measured against the pane, `ScrollToEnd` stops a row short and the
-        // last row of a relation can never be reached.
-        assert!(viewport.height < pane_inner.height, "{viewport:?}");
-        assert!(viewport.width < pane_inner.width, "{viewport:?}");
+        assert_eq!(
+            viewport,
+            datagrid::body_area(inner),
+            "the header row and the scrollbar column are not the viewport's"
+        );
+        // And that is strictly less than the pane inside, or `ScrollToEnd`
+        // stops a row short of the last row of the relation.
+        assert!(viewport.height < inner.height, "{viewport:?} vs {inner:?}");
+        assert!(viewport.width < inner.width, "{viewport:?} vs {inner:?}");
     }
 
     #[tokio::test]

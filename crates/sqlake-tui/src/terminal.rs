@@ -86,6 +86,14 @@ pub fn install_panic_hook(mouse: bool) {
     std::panic::set_hook(Box::new(move |info| {
         let _ = restore(mouse);
         previous(info);
+        // The process ends here rather than unwinding.
+        //
+        // A panic in a spawned task is caught by tokio, so returning would
+        // leave the render loop drawing frames over the shell this hook just
+        // restored, reading input the terminal is now echoing. Anything that
+        // panicked has also left the state it was editing half-written, and
+        // there is no path back to a screen worth trusting.
+        std::process::exit(101);
     }));
 }
 
