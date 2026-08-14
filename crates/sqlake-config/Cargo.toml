@@ -11,6 +11,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+keyring.workspace = true
 serde.workspace = true
 sqlake-core.workspace = true
 thiserror.workspace = true

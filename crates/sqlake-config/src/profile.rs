@@ -15,51 +15,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use sqlake_core::capability::DriverKind;
+use sqlake_core::id::ProfileId;
+use sqlake_core::profile::SslMode;
 
 use crate::bytes::ByteSize;
 use crate::error::{ConfigError, ConfigResult};
-
-/// Names a profile in the config file, on the command line and in the keyring.
-///
-/// Restricted to characters that survive all three: an id with a space in it
-/// works in TOML and then fails as an argument, and one with a slash would
-/// build a keyring entry that is not the entry it looks like.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProfileId(String);
-
-impl ProfileId {
-    /// Letters, digits, `-`, `_` and `.`, and at least one that is not a dot.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        if text.is_empty() {
-            return Err("an id cannot be empty".into());
-        }
-        if let Some(bad) = text
-            .chars()
-            .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '.'))
-        {
-            return Err(format!(
-                "`{text}` contains `{bad}`; ids are letters, digits, `-`, `_` and `.`"
-            ));
-        }
-        // `.` and `..` pass the character test and then name a directory rather
-        // than a connection anywhere an id becomes part of a path.
-        if text.chars().all(|c| c == '.') {
-            return Err(format!("`{text}` is not an id; it is a directory"));
-        }
-        Ok(Self(text.to_owned()))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for ProfileId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// One connection, as configured. Not yet connectable: see the module note.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,16 +108,6 @@ pub enum SecretRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SslMode {
-    Disable,
-    Prefer,
-    Require,
-    VerifyCa,
-    VerifyFull,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileColor {
     Red,
@@ -197,7 +147,7 @@ pub(crate) struct RawConnection {
     port: Option<u16>,
     database: Option<String>,
     user: Option<String>,
-    sslmode: Option<SslMode>,
+    sslmode: Option<String>,
     password: Option<RawSecret>,
 
     // bigquery
@@ -284,9 +234,14 @@ impl RawConnection {
             },
             database: required(self.database.clone(), path, id, "database")?,
             user: required(self.user.clone(), path, id, "user")?,
-            // libpq's own default, so a profile that says nothing behaves the
-            // way `psql` with the same keys does.
-            sslmode: self.sslmode.unwrap_or(SslMode::Prefer),
+            sslmode: match &self.sslmode {
+                // `SslMode::DEFAULT` is libpq's own, so a profile that says
+                // nothing behaves the way `psql` with the same keys does.
+                None => SslMode::DEFAULT,
+                Some(text) => SslMode::parse(text).map_err(|why| {
+                    ConfigError::invalid(path, format!("connection `{id}`: {why}"))
+                })?,
+            },
             password: self
                 .password
                 .as_ref()
