@@ -77,6 +77,12 @@ impl GridUi {
         self.widths.get(&col).copied().unwrap_or(natural)
     }
 
+    /// Set a column's width outright, which is what a test needs and what a
+    /// future "fit to contents" would use.
+    pub fn set_width(&mut self, col: usize, width: u16) {
+        self.widths.insert(col, width.max(1));
+    }
+
     fn resize(&mut self, col: usize, delta: i16, natural: u16) {
         let current = i32::from(self.width(col, natural));
         let next = (current + i32::from(delta)).clamp(1, i32::from(u16::MAX));

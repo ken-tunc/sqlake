@@ -12,6 +12,7 @@
 //! - Terminal modes are changed in exactly one place, [`terminal`].
 
 pub mod chrome;
+pub mod datagrid;
 pub mod grid;
 pub mod hit;
 pub mod input;
