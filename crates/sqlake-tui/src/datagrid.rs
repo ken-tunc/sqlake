@@ -44,13 +44,20 @@ pub fn render(
         LoadState::Loading => message(frame, area, "loading…", Color::Yellow),
         LoadState::Failed(why) => message(frame, area, why, Color::Red),
         LoadState::Ready(rows) => {
-            let grid = ui.grid(rows).clone();
+            // Built through the `&mut`, then read through a shared reborrow.
+            // Cloning it instead would reallocate every column name on every
+            // frame, which is the cost this module exists to avoid.
+            ui.grid(rows);
+            let ui = &*ui;
+            let Some(grid) = ui.rendered() else {
+                return;
+            };
             if grid.is_empty() {
                 // The columns are still worth drawing: an empty relation with
                 // its headers reads as "nothing here", and one without reads
                 // as "nothing happened". The header goes down first so the
                 // message lands under it rather than being painted over.
-                header(frame, hits, area, &grid, ui, tab.sort);
+                header(frame, hits, area, grid, ui, tab.sort);
                 if area.height > 1 {
                     let below = Rect::new(
                         area.x,
@@ -62,7 +69,7 @@ pub fn render(
                 }
                 return;
             }
-            body(frame, hits, area, &grid, ui, tab.sort);
+            body(frame, hits, area, grid, ui, tab.sort);
         }
     }
 }
@@ -110,16 +117,18 @@ fn header(
             continue;
         };
         let sorted = sort.filter(|s| s.column == index);
-        let marker = match sorted.map(|s| s.dir) {
-            Some(sqlake_core::result::SortDir::Asc) => "▲",
-            Some(sqlake_core::result::SortDir::Desc) => "▼",
-            None => "",
-        };
+        let marker = sorted.map_or("", |s| s.dir.arrow());
 
         let rect = Rect::new(x, area.y, width, 1);
         hits.push(rect, Z_CONTENT, Target::GridHeader { col: index });
 
-        let text = chrome::fit(&column.name, width.saturating_sub(marker.len() as u16));
+        // Terminal columns, not bytes: the arrow is three bytes and one cell,
+        // and measuring it in bytes eats two cells of the name — enough to cut
+        // a five-cell header down to `a…`.
+        let text = chrome::fit(
+            &column.name,
+            width.saturating_sub(crate::grid::display_width(marker)),
+        );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(text),
@@ -201,10 +210,15 @@ fn body(
     }
 
     if bar {
+        // The full width of the pane, not the content's: the column held back
+        // above is the one at the right edge, and handing the scrollbar the
+        // narrowed rectangle draws the thumb one cell to its left — over the
+        // value the reserved column existed to keep clear, leaving a dead
+        // stripe down the edge.
         chrome::scrollbar(
             frame,
             hits,
-            rows_area,
+            Rect::new(area.x, rows_area.y, area.width, rows_area.height),
             PaneId::Grid,
             ui.row_offset,
             grid.row_count(),
@@ -225,6 +239,10 @@ fn pad(text: &str, width: u16, align: Align) -> String {
 
 fn style_for(kind: CellKind, selected: bool) -> Style {
     let base = match kind {
+        // A null is dimmed against the pane, but the selection's background is
+        // that same dark grey: left alone, moving the cursor onto a null makes
+        // the ∅ vanish and the cell reads as an empty string instead.
+        CellKind::Null if selected => Style::new().fg(Color::Gray),
         CellKind::Null => Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         CellKind::Number => Style::new().fg(Color::LightBlue),
         CellKind::Text => Style::new(),
@@ -251,6 +269,7 @@ mod tests {
     use sqlake_core::value::Value;
 
     use super::*;
+    use crate::hit::ScrollPart;
 
     fn paged(columns: Vec<Column>, rows: Vec<Row>) -> Arc<PagedResult> {
         Arc::new(PagedResult::new(&ResultSet::new(columns, rows, None)))
@@ -373,6 +392,40 @@ mod tests {
         );
         assert!(text[0].contains('▼'), "{:?}", text[0]);
         assert!(!text[0].contains('▲'), "{:?}", text[0]);
+        // The arrow takes one cell from the name, not the three its bytes
+        // would suggest — otherwise the column being sorted is the one whose
+        // name the user can no longer read.
+        assert!(text[0].contains("c1"), "{:?}", text[0]);
+    }
+
+    #[test]
+    fn the_scrollbar_sits_in_the_column_reserved_for_it() {
+        // The pane holds a column back so a wide value is cut rather than
+        // hidden behind the thumb. Drawing the bar one cell to the left of it
+        // spends that column twice: the thumb still covers a value, and the
+        // edge of the pane is a stripe nothing can ever be drawn in.
+        let mut ui = GridUi::default();
+        let (_, hits, buffer) = draw(
+            &tab(LoadState::Ready(numbers(500, 1)), None),
+            &mut ui,
+            30,
+            6,
+        );
+
+        assert_eq!(buffer[(29, 1)].symbol(), "█");
+        assert_eq!(
+            hits.at(Position::new(29, 1)),
+            Some(Target::Scrollbar {
+                pane: PaneId::Grid,
+                part: ScrollPart::Thumb,
+            })
+        );
+        // And the header row above it is not part of the track: dragging the
+        // thumb to the top must reach row zero, not one row short of it.
+        assert!(!matches!(
+            hits.at(Position::new(29, 0)),
+            Some(Target::Scrollbar { .. })
+        ));
     }
 
     #[test]
@@ -491,6 +544,46 @@ mod tests {
         // Half a column can still be scrolled to; dropping it leaves a band of
         // empty pane beside the data.
         assert_eq!(columns[0].2, 20);
+    }
+
+    #[test]
+    fn a_selected_null_is_still_legible() {
+        let rows = paged(
+            vec![Column::new("v", "text", true)],
+            vec![Row(vec![Value::Null]), Row(vec![Value::Null])],
+        );
+        let mut ui = GridUi::default();
+        ui.row = 0;
+        ui.col = 0;
+        let (_, hits, buffer) = draw(&tab(LoadState::Ready(rows), None), &mut ui, 20, 4);
+
+        let at = |want: usize| {
+            (0..20)
+                .flat_map(|x| (0..4).map(move |y| (x, y)))
+                .find(|&(x, y)| {
+                    matches!(
+                        hits.at(Position::new(x, y)),
+                        Some(Target::GridCell { row, .. }) if row == want
+                    )
+                })
+                .expect("cell not drawn")
+        };
+        let (sx, sy) = at(0);
+        let (nx, ny) = at(1);
+
+        assert_eq!(buffer[(sx, sy)].symbol(), crate::grid::NULL_GLYPH);
+        // Dimmed dark grey on the selection's dark grey background is the glyph
+        // disappearing, which is the confusion NULL_GLYPH exists to prevent.
+        assert_ne!(
+            buffer[(sx, sy)].style().fg,
+            buffer[(sx, sy)].style().bg,
+            "the selected null is invisible"
+        );
+        assert_eq!(
+            buffer[(nx, ny)].symbol(),
+            crate::grid::NULL_GLYPH,
+            "and the unselected one is unchanged"
+        );
     }
 
     #[test]

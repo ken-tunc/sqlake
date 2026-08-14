@@ -71,15 +71,31 @@ impl GridUi {
             .expect("just built when it was missing or stale")
     }
 
+    /// The grid [`GridUi::grid`] last built, if any.
+    ///
+    /// Drawing needs the grid and the widths and offsets beside it at the same
+    /// time, and the `&mut` that builds the grid cannot lend out both. Building
+    /// through `grid` and then reading through this one keeps the caller from
+    /// cloning a `RenderedGrid` — every column name reallocated — per frame.
+    #[must_use]
+    pub fn rendered(&self) -> Option<&RenderedGrid> {
+        self.grid.as_ref()
+    }
+
     /// The width to draw column `col` at.
     #[must_use]
     pub fn width(&self, col: usize, natural: u16) -> u16 {
         self.widths.get(&col).copied().unwrap_or(natural)
     }
 
-    /// Set a column's width outright, which is what a test needs and what a
-    /// future "fit to contents" would use.
-    pub fn set_width(&mut self, col: usize, width: u16) {
+    /// A column's width, set outright rather than nudged.
+    ///
+    /// Test-only, and marked so rather than shipped: nothing in the running
+    /// program sets a width except by dragging, and an API that exists for the
+    /// tests is one the tests have added to the program. The alternative was to
+    /// move a column one cell at a time through `apply` and a whole `Snapshot`.
+    #[cfg(test)]
+    pub(crate) fn set_width(&mut self, col: usize, width: u16) {
         self.widths.insert(col, width.max(1));
     }
 
