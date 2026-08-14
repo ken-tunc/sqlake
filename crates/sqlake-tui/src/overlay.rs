@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use sqlake_app::snapshot::{Severity, Snapshot};
 
 use crate::chrome;
-use crate::grid::sanitise;
+use crate::grid::{display_width, sanitise};
 use crate::hit::{ButtonId, HitMap, Target, Z_BACKDROP, Z_CHROME, Z_MODAL};
 
 /// A dialog's contents. Held by `UiState`, because whether a dialog is open is
@@ -49,7 +49,7 @@ pub fn modal(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, dialog: &Moda
     let body = sanitise(&dialog.body);
     // Two rows of border, one for the button, one to breathe.
     let text_rows = wrapped_rows(&body, width.saturating_sub(2));
-    let height = (text_rows + 5).min(area.height);
+    let height = text_rows.saturating_add(4).min(area.height);
     let rect = centre(area, width, height);
 
     hits.push(rect, Z_MODAL, Target::Modal);
@@ -78,7 +78,7 @@ pub fn modal(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, dialog: &Moda
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), text_area);
 
     // A dialog reachable only by `Esc` is one a pointer cannot leave.
-    let button_width = chrome::display_width_of(DISMISS);
+    let button_width = display_width(DISMISS);
     let button = Rect::new(
         inner.x + inner.width.saturating_sub(button_width),
         inner.bottom().saturating_sub(1),
@@ -129,7 +129,7 @@ pub fn toasts(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &S
         };
         let text = chrome::fit(
             &sanitise(&toast.text),
-            width.saturating_sub(chrome::display_width_of(badge) + 3),
+            width.saturating_sub(display_width(badge) + 3),
         );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -156,17 +156,42 @@ fn centre(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-/// Lines `text` needs once wrapped to `width`.
+/// Rows `text` needs once wrapped to `width`.
+///
+/// `Paragraph` breaks between words, so dividing the total width by `width`
+/// under-counts: a message made of long words leaves the tail of each line
+/// empty and takes more rows than its columns divided by the width. The dialog
+/// is sized from this and does not scroll, so under-counting silently cuts the
+/// end off the message. The text has already been through `sanitise`, so there
+/// are no newlines left to break on.
 fn wrapped_rows(text: &str, width: u16) -> u16 {
     if width == 0 {
         return 1;
     }
-    let mut rows: u16 = 0;
-    for line in text.split('\n') {
-        let used = chrome::display_width_of(line);
-        rows = rows.saturating_add((used / width + 1).max(1));
+    let mut rows: u16 = 1;
+    let mut used: u16 = 0;
+    for (i, word) in text.split(' ').enumerate() {
+        let word_width = display_width(word);
+        // Every word but the first carries the space before it.
+        let joined = if i == 0 {
+            word_width
+        } else {
+            used.saturating_add(1).saturating_add(word_width)
+        };
+        if joined <= width {
+            used = joined;
+            continue;
+        }
+        // It starts a line of its own, and is broken across lines of its own
+        // if it is wider than one.
+        rows = rows.saturating_add(1);
+        used = word_width;
+        while used > width {
+            rows = rows.saturating_add(1);
+            used -= width;
+        }
     }
-    rows.max(1)
+    rows
 }
 
 #[cfg(test)]
@@ -298,6 +323,25 @@ mod tests {
         );
         let lines = text.iter().filter(|l| l.contains("a a")).count();
         assert!(lines > 1, "wrapped onto one line only: {text:?}");
+    }
+
+    #[test]
+    fn a_message_of_long_words_is_not_cut_off_at_the_bottom() {
+        // Words wider than half the box take a row each, so measuring the
+        // message as if it wrapped mid-word makes the box too short and the
+        // last thing the driver said is the part that goes missing.
+        let words: Vec<String> = (0..8).map(|i| format!("{}{i}", "x".repeat(39))).collect();
+        let dialog = Modal::error("Failed", words.join(" "));
+        let (text, _) = draw(
+            |frame, hits| modal(frame, hits, Rect::new(0, 0, 80, 24), &dialog),
+            80,
+            24,
+        );
+        let last = words.last().expect("no words");
+        assert!(
+            text.iter().any(|l| l.contains(last.as_str())),
+            "the end of the message was cut: {text:?}"
+        );
     }
 
     #[test]
