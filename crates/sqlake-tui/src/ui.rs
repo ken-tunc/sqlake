@@ -111,9 +111,9 @@ pub struct UiState {
     pub focus: PaneId,
     pub tree: TreeUi,
     pub hover: Option<Target>,
-    /// A dialog is open. Its content arrives with T16; what matters here is
-    /// that the keyboard belongs to it while it is set.
-    pub modal: Option<String>,
+    /// The dialog on screen, if any. Whether one is open is a fact about this
+    /// screen rather than about the data, so it lives here.
+    pub modal: Option<crate::overlay::Modal>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.

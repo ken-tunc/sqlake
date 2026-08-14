@@ -55,6 +55,8 @@ pub enum ScrollPart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ButtonId {
     Cancel(BusyId),
+    /// The modal's own way out, for a pointer that never goes near `Esc`.
+    DismissModal,
 }
 
 /// What a rectangle on screen belongs to.
@@ -102,6 +104,13 @@ pub enum Target {
     /// Everything behind a modal. Clicking it dismisses the modal instead of
     /// reaching what is underneath.
     Backdrop,
+    /// The dialog's own body.
+    ///
+    /// It swallows the click rather than doing anything with it. Without a
+    /// target of its own the click lands on the backdrop underneath and closes
+    /// the dialog, so a confirmation would be dismissed by pressing on its own
+    /// question.
+    Modal,
 }
 
 #[derive(Debug, Clone, Copy)]

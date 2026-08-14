@@ -380,6 +380,9 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
         (Target::Button(ButtonId::Cancel(busy)), Gesture::Click) => {
             vec![Action::Cancel(busy).into()]
         }
+        (Target::Button(ButtonId::DismissModal), Gesture::Click) => {
+            vec![ViewCmd::DismissModal.into()]
+        }
         (Target::Toast(id), Gesture::Click) => vec![Action::DismissToast(id).into()],
         (Target::Backdrop, Gesture::Click) => vec![ViewCmd::DismissModal.into()],
 
@@ -1211,9 +1214,13 @@ mod tests {
         Target::Splitter(_) => [Target::Splitter(SplitId::Explorer)],
         Target::Tab(_) => [Target::Tab(TabId::new(1))],
         Target::TabClose(_) => [Target::TabClose(TabId::new(1))],
-        Target::Button(_) => [Target::Button(ButtonId::Cancel(BusyId::new(1)))],
+        Target::Button(_) => [
+            Target::Button(ButtonId::Cancel(BusyId::new(1))),
+            Target::Button(ButtonId::DismissModal),
+        ],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::Backdrop => [Target::Backdrop],
+        Target::Modal => [Target::Modal],
     }
 
     samples! {
