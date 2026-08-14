@@ -9,8 +9,9 @@ use std::path::Path;
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::paths;
-use crate::profile::{ConnectionsFile, Profile, ProfileId};
+use crate::profile::{ConnectionsFile, Profile};
 use crate::settings::{Settings, SettingsFile};
+use sqlake_core::id::ProfileId;
 
 /// Everything sqlake was configured with.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

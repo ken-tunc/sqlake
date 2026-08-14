@@ -7,6 +7,7 @@
 use std::io;
 use std::path::PathBuf;
 
+use sqlake_core::id::ProfileId;
 use thiserror::Error;
 
 pub type ConfigResult<T> = Result<T, ConfigError>;
@@ -34,6 +35,13 @@ pub enum ConfigError {
     /// The file parsed, but says something that cannot be acted on.
     #[error("{path}: {message}")]
     Invalid { path: PathBuf, message: String },
+
+    /// The secret a profile named could not be read.
+    ///
+    /// `message` says what failed, never what was read: this is the text that
+    /// reaches the log and the status bar.
+    #[error("connection `{profile}`: {message}")]
+    Secret { profile: ProfileId, message: String },
 
     #[error("no home directory: set $HOME, or $XDG_CONFIG_HOME and $XDG_STATE_HOME")]
     NoHome,
