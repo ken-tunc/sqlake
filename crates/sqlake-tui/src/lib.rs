@@ -11,6 +11,7 @@
 //!   mouse-only by accident.
 //! - Terminal modes are changed in exactly one place, [`terminal`].
 
+pub mod chrome;
 pub mod grid;
 pub mod hit;
 pub mod input;
@@ -19,6 +20,7 @@ pub mod mouse;
 pub mod terminal;
 pub mod ui;
 
+pub use chrome::{Frames, layout};
 pub use grid::{Align, Cell, CellKind, RenderedColumn, RenderedGrid};
 pub use hit::{HitMap, PaneId, ScrollPart, SplitId, Target};
 pub use input::{InputContext, KEYMAP, on_key, on_mouse};
