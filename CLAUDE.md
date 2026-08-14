@@ -3,6 +3,7 @@
 A mouse-friendly TUI database client for PostgreSQL and BigQuery, written in Rust.
 Read [docs/design.md](docs/design.md) before making architectural decisions. It holds what has
 not been built yet; for what has, the code and its doc comments are the documentation.
+[docs/design-m1.md](docs/design-m1.md) is the milestone in progress, and goes when it is done.
 
 ## Architecture rules
 
