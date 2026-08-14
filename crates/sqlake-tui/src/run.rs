@@ -23,7 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
-use sqlake_app::snapshot::{Snapshot, TabContent};
+use sqlake_app::snapshot::{ConnStatus, Snapshot, TabContent};
 use sqlake_app::store::Store;
 use tokio::sync::watch;
 
@@ -87,6 +87,7 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                     return Err(io::Error::other("the store stopped unexpectedly"));
                 }
                 snapshot = snapshots.borrow_and_update().clone();
+                raise_connection_failure(&snapshot, &mut ui);
                 dirty = true;
             }
         }
@@ -120,6 +121,33 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
             }
         }
     }
+}
+
+/// Open a dialog for a connection that failed to open.
+///
+/// A toast is right for something that went wrong beside work that is still
+/// going; a connection that never opened leaves nothing to do at all, and a
+/// message that fades on its own leaves the user with an empty explorer and no
+/// account of why. It is the same reason a failed node reports on the node.
+///
+/// Shown once per failure: the dialog is dismissed, not re-raised by the next
+/// unrelated snapshot.
+fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
+    let failure = snapshot.connections.iter().find_map(|c| match &c.status {
+        ConnStatus::Failed(why) => Some((c.id, c.name.clone(), why.clone())),
+        _ => None,
+    });
+    let Some((id, name, why)) = failure else {
+        return;
+    };
+    if ui.reported_failure == Some(id) {
+        return;
+    }
+    ui.reported_failure = Some(id);
+    ui.modal = Some(overlay::Modal::error(
+        format!("{name} could not be opened"),
+        why,
+    ));
 }
 
 /// Translate one event, collecting its intents. Returns whether the screen has
@@ -293,9 +321,10 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, MouseEventKind};
     use ratatui::layout::Position;
     use sqlake_app::action::Action;
-    use sqlake_app::snapshot::ConnectionView;
+    use sqlake_app::snapshot::{ConnectionView, TabView};
     use sqlake_app::store::Drivers;
     use sqlake_core::capability::DriverKind;
+    use sqlake_core::node::{NodeRef, TableRef};
     use sqlake_driver_mock::{Behaviour, MockDriver};
 
     use super::*;
@@ -612,5 +641,121 @@ mod tests {
         // Sorting and resizing act on the selected column, so the context has
         // to carry it or every key press means column zero.
         assert_eq!(context(&ui, &snap).grid_column, Some(3));
+    }
+
+    // ── screens ────────────────────────────────────────────────────────────
+    //
+    // The whole frame, as a string, reviewed by eye once and then held still.
+    // Unit tests say a rectangle is where it should be; only this says the
+    // screen is one a person would want to look at.
+
+    /// Draw and return the frame as text.
+    fn screen(snapshot: &Snapshot, ui: &mut UiState, w: u16, h: u16) -> String {
+        let (rows, _) = render(snapshot, ui, w, h);
+        rows.join("\n")
+    }
+
+    #[tokio::test]
+    async fn screen_before_anything_is_open() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_with_a_relation_open() {
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "users"]),
+        });
+        until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.focus = PaneId::Grid;
+        // Drawn first, the way the loop does it: an intent applied before any
+        // frame exists is measured against a viewport of zero.
+        let _ = render(&snap, &mut ui, 100, 30);
+        ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_with_the_tree_expanded() {
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: NodeRef::new(sqlake_core::node::NodeKind::Namespace, ["public"]),
+        });
+        until(&mut rx, |s| s.tree(conn).is_some_and(|t| t.len() > 3)).await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        let _ = render(&snap, &mut ui, 100, 30);
+        ui.apply(crate::intent::ViewCmd::SelectTreeRow(1), &snap);
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_reporting_a_failure() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        ui.modal = Some(overlay::Modal::error(
+            "mock could not be opened",
+            "could not connect: refused by the configured behaviour",
+        ));
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_at_the_smallest_usable_size() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        insta::assert_snapshot!(screen(&snap, &mut ui, 60, 20));
+    }
+
+    #[tokio::test]
+    async fn screen_below_the_smallest_usable_size() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        insta::assert_snapshot!(screen(&snap, &mut ui, 40, 10));
+    }
+
+    #[tokio::test]
+    async fn a_failed_connection_is_raised_as_a_dialog() {
+        let store = Store::spawn(Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
+            connect_fails: true,
+            ..Behaviour::instant()
+        }))));
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        until(&mut rx, |s| {
+            s.connections
+                .first()
+                .is_some_and(|c| matches!(c.status, ConnStatus::Failed(_)))
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        raise_connection_failure(&snap, &mut ui);
+        // A toast fades; an explorer that will never fill needs the reason to
+        // stay on screen until it is read.
+        assert!(ui.modal.is_some());
+
+        // Dismissed once, not raised again by the next unrelated snapshot.
+        ui.modal = None;
+        raise_connection_failure(&snap, &mut ui);
+        assert!(ui.modal.is_none(), "the dialog came back on its own");
     }
 }

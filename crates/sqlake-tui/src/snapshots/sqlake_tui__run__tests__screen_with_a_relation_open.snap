@@ -1,0 +1,35 @@
+---
+source: crates/sqlake-tui/src/run.rs
+assertion_line: 685
+expression: "screen(&snap, &mut ui, 100, 30)"
+---
+ users ×                                                                                            
+┌ Explorer ────────────────┐│┏ users ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+│▸ public                  ││┃id  email              display_name active score created_at          ┃
+│▸ analytics               ││┃  1 user01@example.com Grace        true    7.13 2026-01-02 10:04:0…█┃
+│▸ restricted              ││┃  2 user02@example.com Alan         true   14.26 2026-01-02 10:08:0…█┃
+│                          ││┃  3 user03@example.com Barbara      false  21.39 2026-01-02 10:12:0…█┃
+│                          ││┃  4 user04@example.com Edsger       true   28.52 2026-01-02 10:16:0…█┃
+│                          ││┃  5 user05@example.com Ada          true   35.65 2026-01-02 10:20:0…█┃
+│                          ││┃  6 user06@example.com Grace        false  42.78 2026-01-02 10:24:0…█┃
+│                          ││┃  7 user07@example.com Alan         true   49.91 2026-01-02 10:28:0…█┃
+│                          ││┃  8 user08@example.com Barbara      true   56.04 2026-01-02 10:32:0…█┃
+│                          ││┃  9 user09@example.com Edsger       false  63.17 2026-01-02 10:36:0…█┃
+│                          ││┃ 10 user10@example.com Ada          true   70.30 2026-01-02 10:40:0…█┃
+│                          ││┃ 11 user11@example.com Grace        true   77.43 2026-01-02 10:44:0…█┃
+│                          ││┃ 12 user12@example.com Alan         false  84.56 2026-01-02 10:48:0…█┃
+│                          ││┃ 13 user13@example.com Barbara      true   91.69 2026-01-02 10:52:0…│┃
+│                          ││┃ 14 user14@example.com Edsger       true   98.82 2026-01-02 10:56:0…│┃
+│                          ││┃ 15 user15@example.com Ada          false   5.95 2026-01-02 11:00:0…│┃
+│                          ││┃ 16 user16@example.com Grace        true   12.08 2026-01-02 11:04:0…│┃
+│                          ││┃ 17 user17@example.com Alan         true   19.21 2026-01-02 11:08:0…│┃
+│                          ││┃ 18 user18@example.com Barbara      false  26.34 2026-01-02 11:12:0…│┃
+│                          ││┃ 19 user19@example.com Edsger       true   33.47 2026-01-02 11:16:0…│┃
+│                          ││┃ 20 user20@example.com Ada          true   40.60 2026-01-02 11:20:0…│┃
+│                          ││┃ 21 user21@example.com Grace        false  47.73 2026-01-02 11:24:0…│┃
+│                          ││┃ 22 user22@example.com Alan         true   54.86 2026-01-02 11:28:0…│┃
+│                          ││┃ 23 user23@example.com Barbara      true   61.99 2026-01-02 11:32:0…│┃
+│                          ││┃ 24 user24@example.com Edsger       false  68.12 2026-01-02 11:36:0…│┃
+│                          ││┃ 25 user25@example.com Ada          true   75.25 2026-01-02 11:40:0…│┃
+└──────────────────────────┘│┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+ Shift (or Option) + drag to select text

@@ -18,7 +18,7 @@ use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
 use sqlake_app::snapshot::Snapshot;
 use sqlake_app::tree::TreeView;
-use sqlake_core::id::TabId;
+use sqlake_core::id::{ConnId, TabId};
 
 use crate::grid::RenderedGrid;
 use crate::hit::{PaneId, SplitId, Target};
@@ -114,6 +114,9 @@ pub struct UiState {
     /// The dialog on screen, if any. Whether one is open is a fact about this
     /// screen rather than about the data, so it lives here.
     pub modal: Option<crate::overlay::Modal>,
+    /// The connection whose failure has already been raised as a dialog, so
+    /// dismissing it is final rather than undone by the next snapshot.
+    pub reported_failure: Option<ConnId>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
@@ -349,6 +352,12 @@ impl UiState {
     /// The furthest left the grid can be scrolled while `col` is still drawn.
     fn leftmost_visible(&mut self, col: usize, snapshot: &Snapshot) -> usize {
         let available = usize::from(self.viewport(PaneId::Grid).width);
+        if available == 0 {
+            // No frame has been drawn yet, so nothing is known about what fits.
+            // Scrolling on a guess would push the first columns off the screen
+            // before the screen exists.
+            return 0;
+        }
         let mut used = 0;
         let mut first = col;
         for c in (0..=col).rev() {

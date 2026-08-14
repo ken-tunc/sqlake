@@ -10,18 +10,35 @@ M0 ships **no real database driver**. Everything is exercised against `sqlake-dr
 
 ## 1. Definition of done
 
-1. `cargo run` opens a full-screen TUI with a mock connection in the explorer.
-2. **The tree and the data grid can be driven entirely with the mouse** — expanding nodes,
-   opening a preview, scrolling, sorting, resizing columns, moving the splitter, switching and
-   closing tabs.
-3. **Every one of those operations also has a key binding**, enforced by a test rather than by
-   inspection.
-4. Loading and error states are visible: the mock injects latency and failures, and neither
-   freezes the UI.
-5. Quitting restores the terminal. Panicking restores the terminal.
-6. `cargo test` passes with no database and no network.
-7. `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` run in CI.
+All seven met, checked against the code rather than from memory:
 
+| | | |
+| --- | --- | --- |
+| 1 | `cargo run` opens a full-screen TUI with a mock connection in the explorer | ✅ |
+| 2 | The tree and the grid are driveable entirely with the mouse | ✅ |
+| 3 | Every one of those operations also has a key binding, enforced by a test | ✅ |
+| 4 | Loading and error states are visible; neither freezes the UI | ✅ |
+| 5 | Quitting restores the terminal. Panicking restores the terminal | ✅ |
+| 6 | `cargo test` passes with no database and no network | ✅ |
+| 7 | `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` run in CI | ✅ |
+
+On 3, the enforcement is `every_capability_reachable_with_the_mouse_has_a_key_binding` plus
+`every_binding_produces_the_capability_it_claims` — the first would pass on a binding that
+names a capability and does nothing, which is why there are two. Adding a `Target` or a
+`Gesture` stops the crate compiling until it has a sample.
+
+On 4, the binary runs on `Behaviour::fixture()`, so the latency, the failing schema and the
+two-second relation are on screen the moment it starts rather than only in tests.
+
+On 5, the panic hook restores through the same `restore` the guard's `Drop` uses, and then
+ends the process: tokio catches a panic in a spawned task, so returning would leave the loop
+drawing over the shell it had just handed back. `--panic-test` exists to prove the first half
+by hand. SIGTERM is still a way to leave the terminal in raw mode, and is not covered.
+
+What M0 does **not** have, so that a later milestone is not surprised: no real driver, no
+config, no history, no `$EDITOR`, no context menu, no cell-detail popover, no OSC 52 copy, and
+`Modal` is raised only by a failed connection — confirmations arrive with the operations that
+need confirming, in M4.
 ---
 
 ## 2. Scope
@@ -86,37 +103,29 @@ falls through, and a confirmation dialog becomes a way to trigger the thing it w
 
 ---
 
-## 4. Remaining tasks
+## 4. What is left
 
-T1 through T12 are merged; the code and `git log` are the record of them. What is left:
+Nothing. M0 is finished; `git log` is the record of how.
 
-| # | Task | Depends on |
-| --- | --- | --- |
-| T13 | `sqlake-tui`: `UiState`, `Pane`, `Splitter`, `Scrollbar`, `StatusBar`, `TabBar` | — |
-| T14 | `sqlake-tui`: `Tree` widget, wired to the store | T13 |
-| T15 | `sqlake-tui`: `DataGrid` — virtualisation, sorting, column resize | T13 |
-| T16 | `sqlake-tui`: `Modal`, `Toast`, error surfacing | T13 |
-| T17 | `sqlake` bin: CLI flags (`--no-mouse`, `--log-level`), logging to file, wiring | T14, T15 |
-| T18 | `insta` snapshots at 100×30 and 60×20 — empty state, loaded grid, error modal — README, review against §1 | T17 |
+## 5. Questions M0 answered
 
-`UiState` caches the `RenderedGrid` it builds from a `PagedResult` and rebuilds only when the
-rows change, which `RenderedGrid::is_for` is there to answer.
+Left open when M0 started, and settled by building it.
 
-`LoadMore` stays pressable at the end of a relation: the total row count is often unknown — a
-BigQuery preview never reports one — so the store is built to survive the press rather than
-the view to prevent it.
+1. **Horizontal scrolling is per column.** `GridUi::col_offset` is a column index. A partly
+   drawn leading column reads worse than a hard edge, and the wheel and the scrollbar both
+   move in column steps anyway. Question 3 went with it.
+2. **Selection is a single cell.** Range selection stays out until M3 decides how much of it
+   OSC 52 copy actually needs; nothing in M0 wanted it.
+3. **Six snapshots, not three.** They have not churned: a widget change moves a screen, which
+   is the point, and the two that caught something — a column scrolled off by a selection, and
+   the sizes at 60×20 — would not have been caught by a unit test, because both were about
+   what the whole frame looked like rather than about any one rectangle.
 
----
+## 6. What M0 chose to leave
 
-## 5. Open questions
-
-Resolve during implementation; none block starting.
-
-1. **Horizontal grid scrolling granularity** — per column or per cell? Per column is simpler
-   and probably better with a mouse; revisit after using it against `public.wide`.
-2. **Selection model** — a single cell in M0. Whether range selection lands in M0 or M3
-   depends on how much of it OSC 52 copy needs, which is an M3 question.
-3. **`ScrollState` shape** — whether the horizontal offset is a column index or a cell column.
-   Tied to question 1.
-4. **`insta` snapshot volume** — start with three screens. If they churn on every widget
-   change, cut back to one and rely on unit tests instead.
+- **The mock is the only driver.** Every capability the UI reads has exactly one answer in M0,
+  which `MockDriver::with_capabilities` exists to work around in tests; M2 gives it a second.
+- **A dialog is raised only by a failed connection.** `Modal` and its backdrop are built, and
+  the confirmations D5 was written for arrive with the operations that need confirming (M4).
+- **SIGTERM leaves the terminal in raw mode.** The panic path is covered, and it is the one
+  the definition of done names, but a signal does not unwind and `Drop` does not run.

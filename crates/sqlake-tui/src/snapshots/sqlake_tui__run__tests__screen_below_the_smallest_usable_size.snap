@@ -1,0 +1,6 @@
+---
+source: crates/sqlake-tui/src/run.rs
+assertion_line: 728
+expression: "screen(&snap, &mut ui, 40, 10)"
+---
+terminal is 40×10; sqlake needs 60×20

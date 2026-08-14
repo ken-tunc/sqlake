@@ -1,0 +1,35 @@
+---
+source: crates/sqlake-tui/src/run.rs
+assertion_line: 714
+expression: "screen(&snap, &mut ui, 100, 30)"
+---
+                                                                                                    
+┏ Explorer ━━━━━━━━━━━━━━━━┓│┌ Preview ────────────────────────────────────────────────────────────┐
+┃▸ public                  ┃││                                                                     │
+┃▸ analytics               ┃││                                                                     │
+┃▸ restricted              ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                   ╭ mock could not be opened ────────────────────────────────╮                   │
+┃                   │could not connect: refused by the configured behaviour    │                   │
+┃                   │                                                          │                   │
+┃                   │                                                  Dismiss │                   │
+┃                   ╰──────────────────────────────────────────────────────────╯                   │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┃                          ┃││                                                                     │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛│└─────────────────────────────────────────────────────────────────────┘
+ Shift (or Option) + drag to select text

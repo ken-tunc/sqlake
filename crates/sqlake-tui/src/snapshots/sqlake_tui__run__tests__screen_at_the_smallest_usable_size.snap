@@ -1,0 +1,25 @@
+---
+source: crates/sqlake-tui/src/run.rs
+assertion_line: 721
+expression: "screen(&snap, &mut ui, 60, 20)"
+---
+                                                            
+┏ Explorer ━━━━┓│┌ Preview ────────────────────────────────┐
+┃▸ public      ┃││                                         │
+┃▸ analytics   ┃││                                         │
+┃▸ restricted  ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┃              ┃││                                         │
+┗━━━━━━━━━━━━━━┛│└─────────────────────────────────────────┘
+ Shift (or Option) + drag to select text
