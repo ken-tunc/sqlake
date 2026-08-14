@@ -300,7 +300,7 @@ pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot
 }
 
 /// `text` cut to `max` terminal columns, with an ellipsis where it was cut.
-fn fit(text: &str, max: u16) -> String {
+pub(crate) fn fit(text: &str, max: u16) -> String {
     if display_width(text) <= max {
         return text.to_owned();
     }
