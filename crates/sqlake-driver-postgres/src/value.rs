@@ -52,10 +52,16 @@ impl RawValue {
     /// displays them correctly by accident. Everything else is shown the way
     /// `psql` shows a `bytea`, which at least says *something* true about the
     /// bytes rather than a replacement character per byte.
+    ///
+    /// Valid UTF-8 is not enough on its own to call something text: the binary
+    /// form of `interval`, `inet`, `money`, `timetz` and every array is mostly
+    /// bytes below `0x80`, so it decodes cleanly into a string of NULs and
+    /// control characters. That is not readable and it is not true — those go
+    /// to hex with the rest.
     fn opaque(&self, bytes: &[u8]) -> Value {
         let text = match std::str::from_utf8(bytes) {
-            Ok(text) => text.to_owned(),
-            Err(_) => {
+            Ok(text) if !text.chars().any(is_unprintable) => text.to_owned(),
+            _ => {
                 let mut hex = String::with_capacity(2 + bytes.len() * 2);
                 hex.push_str("\\x");
                 for byte in bytes {
@@ -70,6 +76,14 @@ impl RawValue {
             text,
         }
     }
+}
+
+/// What disqualifies a byte string from being shown as text.
+///
+/// Tabs and newlines do not: they are ordinary contents of an XML document or
+/// a domain over `text`, and the front-end already has a glyph for them.
+fn is_unprintable(ch: char) -> bool {
+    ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')
 }
 
 impl<'a> FromSql<'a> for RawValue {
@@ -100,7 +114,7 @@ fn decode(ty: &Type, bytes: &[u8]) -> Option<Value> {
         Type::INT4 => Value::Int(types::int4_from_sql(bytes).ok()?.into()),
         Type::INT8 => Value::Int(types::int8_from_sql(bytes).ok()?),
         Type::OID => Value::Int(types::oid_from_sql(bytes).ok()?.into()),
-        Type::FLOAT4 => Value::Float(types::float4_from_sql(bytes).ok()?.into()),
+        Type::FLOAT4 => Value::Float(widen(types::float4_from_sql(bytes).ok()?)),
         Type::FLOAT8 => Value::Float(types::float8_from_sql(bytes).ok()?),
         Type::NUMERIC => Value::Decimal(numeric(bytes)?),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
@@ -118,6 +132,17 @@ fn decode(ty: &Type, bytes: &[u8]) -> Option<Value> {
         _ => return None,
     };
     Some(value)
+}
+
+/// A `real` as the `double precision` that means the same thing *to a reader*.
+///
+/// `f64::from(1.1f32)` is 1.100000023841858, and the front-end formats an
+/// `f64` with the shortest text that round-trips as an `f64` — so widening
+/// directly turns every `real` column into a wall of noise digits that were
+/// never in the value. Going via the `f32`'s own shortest form keeps the
+/// number `psql` prints.
+fn widen(value: f32) -> f64 {
+    value.to_string().parse().unwrap_or_else(|_| value.into())
 }
 
 /// PostgreSQL counts from 2000-01-01, not from the Unix epoch.
@@ -184,6 +209,8 @@ fn json(ty: &Type, bytes: &[u8]) -> Option<serde_json::Value> {
 /// one can exceed. The wire format is a sign, a base-10000 digit array, the
 /// position of the decimal point, and how many fractional digits to display.
 fn numeric(mut bytes: &[u8]) -> Option<String> {
+    use std::fmt::Write as _;
+
     fn i16_at(bytes: &mut &[u8]) -> Option<i16> {
         let (head, rest) = bytes.split_at_checked(2)?;
         *bytes = rest;
@@ -213,32 +240,29 @@ fn numeric(mut bytes: &[u8]) -> Option<String> {
     // left of the decimal point. A negative weight means the number is
     // smaller than one and has no whole part at all — which is where the
     // first version of this went wrong, reading 0.01 as 100.01.
-    let mut whole = String::new();
-    if weight < 0 {
-        whole.push('0');
-    } else {
-        for group in 0..=weight {
-            let digit = digits.get(group as usize).copied().unwrap_or(0);
-            if group == 0 {
-                whole.push_str(&digit.to_string());
-            } else {
-                // Only the first group is written as-is; the rest are padded,
-                // because 1_0001 is two groups and 10001, not 11.
-                whole.push_str(&format!("{digit:04}"));
-            }
-        }
-    }
-
     let mut text = String::new();
     if sign == 0x4000 {
         text.push('-');
     }
-    text.push_str(&whole);
+    if weight < 0 {
+        text.push('0');
+    } else {
+        for group in 0..=weight {
+            let digit = digits.get(group as usize).copied().unwrap_or(0);
+            if group == 0 {
+                let _ = write!(text, "{digit}");
+            } else {
+                // Only the first group is written as-is; the rest are padded,
+                // because 1_0001 is two groups and 10001, not 11.
+                let _ = write!(text, "{digit:04}");
+            }
+        }
+    }
 
     if dscale > 0 {
         // Groups continue from just right of the point. A group index below
-        // zero is a gap the sender did not transmit — 0.0001 arrives as one
-        // group with weight -2 — and reads as four zeros.
+        // zero is a gap the sender did not transmit — 0.00000001 arrives as
+        // one group with weight -2 — and reads as four zeros.
         let mut fraction = String::new();
         let mut group = i32::from(weight) + 1;
         while fraction.len() < dscale as usize {
@@ -246,7 +270,7 @@ fn numeric(mut bytes: &[u8]) -> Option<String> {
                 .ok()
                 .and_then(|g| digits.get(g).copied())
                 .unwrap_or(0);
-            fraction.push_str(&format!("{digit:04}"));
+            let _ = write!(fraction, "{digit:04}");
             group += 1;
         }
         fraction.truncate(dscale as usize);
@@ -406,6 +430,41 @@ mod tests {
             panic!("expected opaque");
         };
         assert_eq!(text, "\\x00ff");
+    }
+
+    #[test]
+    fn a_binary_builtin_goes_to_hex_rather_than_to_control_characters() {
+        // `interval`, `inet`, `money`, `timetz` and every array are binary and
+        // almost entirely below 0x80, so they are *valid UTF-8* — believing
+        // that would show a cell of NULs where the hex at least describes what
+        // arrived.
+        let Value::Opaque { text, .. } = raw(Type::INTERVAL, &[0, 0, 0, 1, 0, 0, 0, 0]).decode()
+        else {
+            panic!("expected opaque");
+        };
+        assert_eq!(text, "\\x0000000100000000");
+
+        // A newline is not that: it belongs to plenty of real text values.
+        let Value::Opaque { text, .. } = raw(Type::XML, b"<a>\n</a>").decode() else {
+            panic!("expected opaque");
+        };
+        assert_eq!(text, "<a>\n</a>");
+    }
+
+    #[test]
+    fn a_real_keeps_the_digits_it_was_written_with() {
+        // Widening straight to f64 makes 1.1 into 1.100000023841858, and the
+        // front-end prints an f64 with every digit it needs to round-trip.
+        assert_eq!(wire(&Type::FLOAT4, 1.1f32).decode(), Value::Float(1.1));
+        assert_eq!(wire(&Type::FLOAT4, 0.1f32).decode(), Value::Float(0.1));
+        assert_eq!(
+            wire(&Type::FLOAT4, f32::INFINITY).decode(),
+            Value::Float(f64::INFINITY)
+        );
+        let Value::Float(nan) = wire(&Type::FLOAT4, f32::NAN).decode() else {
+            panic!("expected a float");
+        };
+        assert!(nan.is_nan());
     }
 
     #[test]

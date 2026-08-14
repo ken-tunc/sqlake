@@ -14,7 +14,21 @@ use tokio_postgres::config::SslMode as PgSslMode;
 
 /// Long enough for a bastion or a VPN to answer, short enough that a wrong
 /// host is a message rather than a hang.
+///
+/// This one is per *socket*: a host that resolves to several addresses is
+/// tried at each in turn, and each attempt gets it. [`DEADLINE`] is what
+/// bounds the whole thing.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest `connect` may take before it gives up, over everything.
+///
+/// [`CONNECT_TIMEOUT`] reaches the socket and nothing else — name resolution,
+/// the TLS handshake and authentication all wait for ever — so a host that
+/// accepts the connection and then says nothing would hang a session actor
+/// with no way for the UI to get out of it. Generous next to the per-socket
+/// timeout, because a host with several addresses is meant to get through more
+/// than one of them.
+pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// Shows up in `pg_stat_activity`, so a DBA can see which connections are this
 /// client's before asking.
@@ -42,8 +56,12 @@ pub fn build(profile: &ResolvedProfile, params: &PostgresParams) -> Config {
 
     if profile.readonly {
         // The server refuses the write, not us. A client-side check protects
-        // nothing that a client-side bug cannot undo, and this one survives
-        // every path into the connection — including the SQL tab in M4.
+        // nothing that a client-side bug cannot undo, and this one applies to
+        // every path into the connection — including the SQL tab in M4 —
+        // without any of them having to remember it. It is a *default*, so a
+        // deliberate `SET default_transaction_read_only = off` or `BEGIN READ
+        // WRITE` still gets through; guarding against a user who types that is
+        // a job for the role's own privileges.
         config.options("-c default_transaction_read_only=on");
     }
 

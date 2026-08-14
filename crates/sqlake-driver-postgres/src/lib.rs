@@ -18,7 +18,7 @@ use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet};
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Config};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub use value::RawValue;
@@ -50,13 +50,35 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     quote_style: QuoteStyle::DoubleQuote,
 };
 
-#[derive(Debug, Default)]
-pub struct PgDriver;
+#[derive(Debug)]
+pub struct PgDriver {
+    /// The longest a connection attempt may take, over everything.
+    deadline: std::time::Duration,
+}
+
+impl Default for PgDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PgDriver {
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub const fn new() -> Self {
+        Self {
+            deadline: config::DEADLINE,
+        }
+    }
+
+    /// A driver that gives up sooner.
+    ///
+    /// Exists because the interesting case — a host that accepts the
+    /// connection and then says nothing — is only observable by waiting, and
+    /// waiting [`config::DEADLINE`] to find that out is not a test anyone runs
+    /// twice.
+    #[must_use]
+    pub const fn with_deadline(deadline: std::time::Duration) -> Self {
+        Self { deadline }
     }
 }
 
@@ -79,28 +101,46 @@ impl Driver for PgDriver {
         };
 
         let config = config::build(profile, params);
-        let client = match tls::Verification::of(params.sslmode) {
-            // `disable` is the one mode with no TLS stack to configure, and
-            // asking rustls for a connector that will never be used would fail
-            // on a machine with no trust store for no reason.
-            None => {
-                let (client, connection) = config
-                    .connect(tokio_postgres::NoTls)
-                    .await
-                    .map_err(connect_failed)?;
-                spawn(connection);
-                client
-            }
-            Some(verification) => {
-                let connector = MakeRustlsConnect::new(tls::client_config(verification)?);
-                let (client, connection) =
-                    config.connect(connector).await.map_err(connect_failed)?;
-                spawn(connection);
-                client
-            }
-        };
+        let opened = open(&config, tls::Verification::of(params.sslmode));
+
+        // `Config::connect_timeout` reaches the socket and nothing else — see
+        // `config::DEADLINE`. A stale tunnel or a load balancer with no backend
+        // accepts the connection and then says nothing, and without this the
+        // future stays pending for ever.
+        let client = tokio::time::timeout(self.deadline, opened)
+            .await
+            .map_err(|_| {
+                DriverError::Connect(format!(
+                    "no answer from {}:{} within {:?}",
+                    params.host, params.port, self.deadline
+                ))
+            })??;
 
         Ok(Box::new(PgSession { client }))
+    }
+}
+
+/// The handshake, with no deadline of its own — [`PgDriver::connect`] puts one
+/// around the whole of it.
+async fn open(config: &Config, verification: Option<tls::Verification>) -> DriverResult<Client> {
+    match verification {
+        // `disable` is the one mode with no TLS stack to configure, and asking
+        // rustls for a connector that will never be used would fail on a
+        // machine with no trust store for no reason.
+        None => {
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(connect_failed)?;
+            spawn(connection);
+            Ok(client)
+        }
+        Some(verification) => {
+            let connector = MakeRustlsConnect::new(tls::client_config(verification)?);
+            let (client, connection) = config.connect(connector).await.map_err(connect_failed)?;
+            spawn(connection);
+            Ok(client)
+        }
     }
 }
 
@@ -124,8 +164,22 @@ where
 /// Connection failures are the ones a user reads most often, so they keep the
 /// server's own words — "password authentication failed", "no pg_hba.conf
 /// entry" — rather than being summarised.
+///
+/// Which means walking the cause chain: `tokio_postgres::Error` displays only
+/// its category ("db error", "error connecting to server") and hangs the
+/// reason off [`Error::source`](std::error::Error::source), so `to_string`
+/// alone throws away every word worth reading.
 fn connect_failed(err: tokio_postgres::Error) -> DriverError {
-    DriverError::Connect(err.to_string())
+    use std::error::Error as _;
+    use std::fmt::Write as _;
+
+    let mut message = err.to_string();
+    let mut cause = err.source();
+    while let Some(next) = cause {
+        let _ = write!(message, ": {next}");
+        cause = next.source();
+    }
+    DriverError::Connect(message)
 }
 
 #[derive(Debug)]
@@ -152,10 +206,10 @@ impl Session for PgSession {
     }
 
     async fn close(self: Box<Self>) {
-        // Dropping the client closes the socket and ends the connection task.
-        // There is no goodbye to send: PostgreSQL treats a closed socket as a
-        // disconnect, and a `Terminate` message would only be politer to a
-        // server that is not waiting for one.
+        // Dropping the client is the whole goodbye. `tokio-postgres` sends the
+        // `Terminate` itself when the request channel closes, and the spawned
+        // connection task then ends on its own; there is nothing left here to
+        // await that would not simply be waiting for a drop.
     }
 }
 
@@ -212,6 +266,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_host_that_accepts_and_then_says_nothing_gives_up() {
+        // The failure the socket timeout does not cover: the connection is
+        // made, and the handshake never finishes. A stale tunnel or a load
+        // balancer with no backend behaves exactly like this listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let _accepting = tokio::spawn(async move {
+            let held = listener.accept().await;
+            // Hold the connection open and answer nothing at all.
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let params = PostgresParams {
+            host: "127.0.0.1".to_owned(),
+            port,
+            database: "app".to_owned(),
+            user: "readonly".to_owned(),
+            sslmode: sqlake_core::profile::SslMode::Disable,
+            password: None,
+        };
+        let err = PgDriver::with_deadline(std::time::Duration::from_millis(150))
+            .connect(&profile(Params::Postgres(params)))
+            .await
+            .expect_err("should give up");
+        assert!(err.to_string().contains("no answer from"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_host_that_is_not_there_says_so_rather_than_hanging() {
         // Port 1 on the loopback: nothing listens, and the refusal is
         // immediate, so this exercises the error path without a server.
@@ -229,5 +314,13 @@ mod tests {
             .expect_err("should not connect");
         assert!(matches!(err, DriverError::Connect(_)), "{err:?}");
         assert!(err.is_retryable(), "a refused connection is worth retrying");
+        // And it says *why*. `tokio_postgres::Error` displays its category
+        // only — "error connecting to server" with the refusal hidden in its
+        // source — which is a message nobody can act on.
+        let message = err.to_string();
+        assert!(message.contains("error connecting to server:"), "{message}");
+        // The reason itself, not just the fact that a cause was appended: on
+        // both platforms this project runs on, a closed port refuses.
+        assert!(message.to_lowercase().contains("refused"), "{message}");
     }
 }

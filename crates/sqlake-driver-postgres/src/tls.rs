@@ -16,13 +16,15 @@
 //! `require` verifying nothing surprises people who read it as the strong
 //! setting: it stops someone listening and not someone answering.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
+};
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::profile::SslMode;
 
@@ -64,18 +66,36 @@ pub fn client_config(verification: Verification) -> DriverResult<ClientConfig> {
         Verification::Full => web_pki(&provider)?,
     };
 
-    ClientConfig::builder_with_provider(provider)
+    Ok(ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|err| DriverError::Connect(format!("setting up TLS: {err}")))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth()
-        .pipe_ok()
+        .with_no_client_auth())
 }
 
 /// The ordinary verifier, over the platform's trust store.
 fn web_pki(provider: &Arc<CryptoProvider>) -> DriverResult<Arc<WebPkiServerVerifier>> {
-    let mut roots = rustls::RootCertStore::empty();
+    WebPkiServerVerifier::builder_with_provider(native_roots()?, provider.clone())
+        .build()
+        .map_err(|err| DriverError::Connect(format!("setting up certificate checks: {err}")))
+}
+
+/// The platform's trust store, read once.
+///
+/// Reading it is blocking file or keychain I/O — on macOS a Security framework
+/// query — and this runs inside `connect`, on a runtime worker. Once per
+/// process is a pause nobody notices; once per connection would be a pause on
+/// every one. A failure is not cached, so a machine that grows a trust store
+/// later still gets one.
+fn native_roots() -> DriverResult<Arc<RootCertStore>> {
+    static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
+
+    if let Some(roots) = ROOTS.get() {
+        return Ok(roots.clone());
+    }
+
+    let mut roots = RootCertStore::empty();
     let loaded = rustls_native_certs::load_native_certs();
     let (added, _) = roots.add_parsable_certificates(loaded.certs);
     if added == 0 {
@@ -88,9 +108,7 @@ fn web_pki(provider: &Arc<CryptoProvider>) -> DriverResult<Arc<WebPkiServerVerif
         )));
     }
 
-    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-        .build()
-        .map_err(|err| DriverError::Connect(format!("setting up certificate checks: {err}")))
+    Ok(ROOTS.get_or_init(|| Arc::new(roots)).clone())
 }
 
 /// `verify-ca`: check the chain, ignore who the certificate says it is.
@@ -193,15 +211,6 @@ impl ServerCertVerifier for AcceptAnything {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
-
-/// Small helper so the builder chain above ends in a `Result`.
-trait PipeOk: Sized {
-    fn pipe_ok<E>(self) -> Result<Self, E> {
-        Ok(self)
-    }
-}
-
-impl PipeOk for ClientConfig {}
 
 #[cfg(test)]
 mod tests {

@@ -27,4 +27,4 @@ tracing.workspace = true
 bytes.workspace = true
 sqlake-driver-mock.workspace = true
 rust_decimal.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "net", "rt"] }
