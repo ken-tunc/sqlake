@@ -11,7 +11,7 @@
 //! the same as [`crate::hit::HitMap`] — an event is always answered against the
 //! layout that produced the pixels it was aimed at.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
@@ -114,9 +114,11 @@ pub struct UiState {
     /// The dialog on screen, if any. Whether one is open is a fact about this
     /// screen rather than about the data, so it lives here.
     pub modal: Option<crate::overlay::Modal>,
-    /// The connection whose failure has already been raised as a dialog, so
-    /// dismissing it is final rather than undone by the next snapshot.
-    pub reported_failure: Option<ConnId>,
+    /// The connections whose failure has already been raised as a dialog, so
+    /// dismissing one is final rather than undone by the next snapshot. A set
+    /// rather than one id: remembering only the last leaves a second connection
+    /// failing in silence behind the first.
+    pub reported_failures: HashSet<ConnId>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.

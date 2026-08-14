@@ -45,11 +45,16 @@ use crate::ui::UiState;
 /// Propagates terminal write failures. The caller still holds the
 /// `TerminalGuard`, so the screen is restored either way.
 pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::Result<()> {
-    let mut ui = UiState::new();
     let mut mouse = MouseState::new();
     let mut events = EventStream::new();
     let mut snapshots = store.subscribe();
+    let mut ui = initial_ui(&snapshots.borrow_and_update().clone());
     let mut snapshot = snapshots.borrow_and_update().clone();
+    // The first snapshot as well as every later one: connecting is dispatched
+    // before the loop starts, so a connection that failed while the terminal
+    // was being taken over is already in this one — and a failure produces no
+    // further snapshot to be caught by the arm below.
+    raise_connection_failure(&snapshot, &mut ui);
     let mut hits = HitMap::new();
     let mut dirty = true;
 
@@ -123,6 +128,18 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
     }
 }
 
+/// The state the first frame is drawn from.
+///
+/// A connection dispatched before the terminal was taken over can already have
+/// failed by the time the loop starts, and a failed connect publishes nothing
+/// afterwards — so waiting for the next snapshot would mean waiting for one
+/// that never comes.
+fn initial_ui(snapshot: &Snapshot) -> UiState {
+    let mut ui = UiState::new();
+    raise_connection_failure(snapshot, &mut ui);
+    ui
+}
+
 /// Open a dialog for a connection that failed to open.
 ///
 /// A toast is right for something that went wrong beside work that is still
@@ -133,17 +150,21 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
 /// Shown once per failure: the dialog is dismissed, not re-raised by the next
 /// unrelated snapshot.
 fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
-    let failure = snapshot.connections.iter().find_map(|c| match &c.status {
-        ConnStatus::Failed(why) => Some((c.id, c.name.clone(), why.clone())),
-        _ => None,
-    });
+    // Skipping the ones already reported before looking at the status: a single
+    // remembered id would let the first failure hide every later one, because
+    // it stays in the list and is what a plain search keeps finding.
+    let failure = snapshot
+        .connections
+        .iter()
+        .filter(|c| !ui.reported_failures.contains(&c.id))
+        .find_map(|c| match &c.status {
+            ConnStatus::Failed(why) => Some((c.id, c.name.clone(), why.clone())),
+            _ => None,
+        });
     let Some((id, name, why)) = failure else {
         return;
     };
-    if ui.reported_failure == Some(id) {
-        return;
-    }
-    ui.reported_failure = Some(id);
+    ui.reported_failures.insert(id);
     ui.modal = Some(overlay::Modal::error(
         format!("{name} could not be opened"),
         why,
@@ -649,10 +670,69 @@ mod tests {
     // Unit tests say a rectangle is where it should be; only this says the
     // screen is one a person would want to look at.
 
-    /// Draw and return the frame as text.
+    /// Draw, and return the frame as its characters *and* its styling.
+    ///
+    /// Text alone would leave all six of these unchanged if every highlight in
+    /// the client broke at once: focus, the selected row, the cell cursor and
+    /// the severity of a message are all colour and nothing else. The mask
+    /// gives each distinct style a character and lists what they were, so a
+    /// change to any of them shows up as a diff a person can read.
     fn screen(snapshot: &Snapshot, ui: &mut UiState, w: u16, h: u16) -> String {
-        let (rows, _) = render(snapshot, ui, w, h);
-        rows.join("\n")
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = HitMap::new();
+        terminal
+            .draw(|frame| draw(frame, ui, snapshot, &mut hits))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut legend: Vec<ratatui::style::Style> = Vec::new();
+        let mut text = String::new();
+        let mut mask = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let cell = &buffer[(x, y)];
+                text.push_str(cell.symbol());
+                let style = cell.style();
+                let index = legend.iter().position(|s| *s == style).unwrap_or_else(|| {
+                    legend.push(style);
+                    legend.len() - 1
+                });
+                // Beyond the thirty-sixth distinct style the mask stops being
+                // readable, and a screen with that many is worth noticing.
+                mask.push(char::from_digit(u32::try_from(index).unwrap_or(35), 36).unwrap_or('?'));
+            }
+            text.push('\n');
+            mask.push('\n');
+        }
+
+        let mut out = text;
+        out.push_str("\n── styles ──\n");
+        out.push_str(&mask);
+        for (i, style) in legend.iter().enumerate() {
+            let key = char::from_digit(u32::try_from(i).unwrap_or(35), 36).unwrap_or('?');
+            out.push_str(&format!("{key} = {}\n", describe(*style)));
+        }
+        out
+    }
+
+    /// Only the parts of a `Style` this client sets, so the snapshot does not
+    /// churn on a field nothing touches.
+    fn describe(style: ratatui::style::Style) -> String {
+        let mut parts = Vec::new();
+        if let Some(fg) = style.fg {
+            parts.push(format!("fg={fg:?}"));
+        }
+        if let Some(bg) = style.bg {
+            parts.push(format!("bg={bg:?}"));
+        }
+        if !style.add_modifier.is_empty() {
+            parts.push(format!("{:?}", style.add_modifier));
+        }
+        if parts.is_empty() {
+            "default".to_owned()
+        } else {
+            parts.join(" ")
+        }
     }
 
     #[tokio::test]
@@ -747,8 +827,11 @@ mod tests {
         .await;
         let snap = rx.borrow_and_update().clone();
 
-        let mut ui = UiState::new();
-        raise_connection_failure(&snap, &mut ui);
+        // Through `initial_ui`, which is the path the first frame takes. A
+        // connect dispatched before the terminal was taken over can already
+        // have failed, and a failed connect publishes nothing afterwards — so
+        // raising it only on the next snapshot means never.
+        let mut ui = initial_ui(&snap);
         // A toast fades; an explorer that will never fill needs the reason to
         // stay on screen until it is read.
         assert!(ui.modal.is_some());
@@ -757,5 +840,20 @@ mod tests {
         ui.modal = None;
         raise_connection_failure(&snap, &mut ui);
         assert!(ui.modal.is_none(), "the dialog came back on its own");
+
+        // A second connection failing is a second thing to report. Remembering
+        // only one id leaves it silent, because the first failure stays in the
+        // list and is what the search keeps finding.
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        until(&mut rx, |s| {
+            s.connections.len() == 2
+                && s.connections
+                    .iter()
+                    .all(|c| matches!(c.status, ConnStatus::Failed(_)))
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+        raise_connection_failure(&snap, &mut ui);
+        assert!(ui.modal.is_some(), "the second failure went unreported");
     }
 }

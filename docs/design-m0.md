@@ -39,15 +39,16 @@ What M0 does **not** have, so that a later milestone is not surprised: no real d
 config, no history, no `$EDITOR`, no context menu, no cell-detail popover, no OSC 52 copy, and
 `Modal` is raised only by a failed connection — confirmations arrive with the operations that
 need confirming, in M4.
+
 ---
 
 ## 2. Scope
 
 ### In scope
 
-`crates/` is the list of what exists. What is still to come inside M0: `UiState`, the nine
-widgets — `Pane`, `Splitter`, `Scrollbar`, `Tree`, `DataGrid`, `TabBar`, `StatusBar`, `Modal`,
-`Toast` — the binary that wires them together, and screen snapshots.
+`crates/` is the list of what exists. All of M0 is in it: `UiState`, the nine widgets —
+`Pane`, `Splitter`, `Scrollbar`, `Tree`, `DataGrid`, `TabBar`, `StatusBar`, `Modal`, `Toast` —
+the binary that wires them together, and the screen snapshots.
 
 Deferred past M0: context menu, buttons beyond the status bar, command palette, help modal.
 
