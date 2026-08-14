@@ -23,7 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
-use sqlake_app::snapshot::{Snapshot, TabContent};
+use sqlake_app::snapshot::{ConnStatus, Snapshot, TabContent};
 use sqlake_app::store::Store;
 use tokio::sync::watch;
 
@@ -45,11 +45,16 @@ use crate::ui::UiState;
 /// Propagates terminal write failures. The caller still holds the
 /// `TerminalGuard`, so the screen is restored either way.
 pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::Result<()> {
-    let mut ui = UiState::new();
     let mut mouse = MouseState::new();
     let mut events = EventStream::new();
     let mut snapshots = store.subscribe();
+    let mut ui = initial_ui(&snapshots.borrow_and_update().clone());
     let mut snapshot = snapshots.borrow_and_update().clone();
+    // The first snapshot as well as every later one: connecting is dispatched
+    // before the loop starts, so a connection that failed while the terminal
+    // was being taken over is already in this one — and a failure produces no
+    // further snapshot to be caught by the arm below.
+    raise_connection_failure(&snapshot, &mut ui);
     let mut hits = HitMap::new();
     let mut dirty = true;
 
@@ -87,6 +92,7 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                     return Err(io::Error::other("the store stopped unexpectedly"));
                 }
                 snapshot = snapshots.borrow_and_update().clone();
+                raise_connection_failure(&snapshot, &mut ui);
                 dirty = true;
             }
         }
@@ -120,6 +126,49 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
             }
         }
     }
+}
+
+/// The state the first frame is drawn from.
+///
+/// A connection dispatched before the terminal was taken over can already have
+/// failed by the time the loop starts, and a failed connect publishes nothing
+/// afterwards — so waiting for the next snapshot would mean waiting for one
+/// that never comes.
+fn initial_ui(snapshot: &Snapshot) -> UiState {
+    let mut ui = UiState::new();
+    raise_connection_failure(snapshot, &mut ui);
+    ui
+}
+
+/// Open a dialog for a connection that failed to open.
+///
+/// A toast is right for something that went wrong beside work that is still
+/// going; a connection that never opened leaves nothing to do at all, and a
+/// message that fades on its own leaves the user with an empty explorer and no
+/// account of why. It is the same reason a failed node reports on the node.
+///
+/// Shown once per failure: the dialog is dismissed, not re-raised by the next
+/// unrelated snapshot.
+fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
+    // Skipping the ones already reported before looking at the status: a single
+    // remembered id would let the first failure hide every later one, because
+    // it stays in the list and is what a plain search keeps finding.
+    let failure = snapshot
+        .connections
+        .iter()
+        .filter(|c| !ui.reported_failures.contains(&c.id))
+        .find_map(|c| match &c.status {
+            ConnStatus::Failed(why) => Some((c.id, c.name.clone(), why.clone())),
+            _ => None,
+        });
+    let Some((id, name, why)) = failure else {
+        return;
+    };
+    ui.reported_failures.insert(id);
+    ui.modal = Some(overlay::Modal::error(
+        format!("{name} could not be opened"),
+        why,
+    ));
 }
 
 /// Translate one event, collecting its intents. Returns whether the screen has
@@ -293,9 +342,10 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, MouseEventKind};
     use ratatui::layout::Position;
     use sqlake_app::action::Action;
-    use sqlake_app::snapshot::ConnectionView;
+    use sqlake_app::snapshot::{ConnectionView, TabView};
     use sqlake_app::store::Drivers;
     use sqlake_core::capability::DriverKind;
+    use sqlake_core::node::{NodeRef, TableRef};
     use sqlake_driver_mock::{Behaviour, MockDriver};
 
     use super::*;
@@ -612,5 +662,198 @@ mod tests {
         // Sorting and resizing act on the selected column, so the context has
         // to carry it or every key press means column zero.
         assert_eq!(context(&ui, &snap).grid_column, Some(3));
+    }
+
+    // ── screens ────────────────────────────────────────────────────────────
+    //
+    // The whole frame, as a string, reviewed by eye once and then held still.
+    // Unit tests say a rectangle is where it should be; only this says the
+    // screen is one a person would want to look at.
+
+    /// Draw, and return the frame as its characters *and* its styling.
+    ///
+    /// Text alone would leave all six of these unchanged if every highlight in
+    /// the client broke at once: focus, the selected row, the cell cursor and
+    /// the severity of a message are all colour and nothing else. The mask
+    /// gives each distinct style a character and lists what they were, so a
+    /// change to any of them shows up as a diff a person can read.
+    fn screen(snapshot: &Snapshot, ui: &mut UiState, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = HitMap::new();
+        terminal
+            .draw(|frame| draw(frame, ui, snapshot, &mut hits))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut legend: Vec<ratatui::style::Style> = Vec::new();
+        let mut text = String::new();
+        let mut mask = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let cell = &buffer[(x, y)];
+                text.push_str(cell.symbol());
+                let style = cell.style();
+                let index = legend.iter().position(|s| *s == style).unwrap_or_else(|| {
+                    legend.push(style);
+                    legend.len() - 1
+                });
+                // Beyond the thirty-sixth distinct style the mask stops being
+                // readable, and a screen with that many is worth noticing.
+                mask.push(char::from_digit(u32::try_from(index).unwrap_or(35), 36).unwrap_or('?'));
+            }
+            text.push('\n');
+            mask.push('\n');
+        }
+
+        let mut out = text;
+        out.push_str("\n── styles ──\n");
+        out.push_str(&mask);
+        for (i, style) in legend.iter().enumerate() {
+            let key = char::from_digit(u32::try_from(i).unwrap_or(35), 36).unwrap_or('?');
+            out.push_str(&format!("{key} = {}\n", describe(*style)));
+        }
+        out
+    }
+
+    /// Only the parts of a `Style` this client sets, so the snapshot does not
+    /// churn on a field nothing touches.
+    fn describe(style: ratatui::style::Style) -> String {
+        let mut parts = Vec::new();
+        if let Some(fg) = style.fg {
+            parts.push(format!("fg={fg:?}"));
+        }
+        if let Some(bg) = style.bg {
+            parts.push(format!("bg={bg:?}"));
+        }
+        if !style.add_modifier.is_empty() {
+            parts.push(format!("{:?}", style.add_modifier));
+        }
+        if parts.is_empty() {
+            "default".to_owned()
+        } else {
+            parts.join(" ")
+        }
+    }
+
+    #[tokio::test]
+    async fn screen_before_anything_is_open() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_with_a_relation_open() {
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "users"]),
+        });
+        until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.focus = PaneId::Grid;
+        // Drawn first, the way the loop does it: an intent applied before any
+        // frame exists is measured against a viewport of zero.
+        let _ = render(&snap, &mut ui, 100, 30);
+        ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_with_the_tree_expanded() {
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: NodeRef::new(sqlake_core::node::NodeKind::Namespace, ["public"]),
+        });
+        until(&mut rx, |s| s.tree(conn).is_some_and(|t| t.len() > 3)).await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        let _ = render(&snap, &mut ui, 100, 30);
+        ui.apply(crate::intent::ViewCmd::SelectTreeRow(1), &snap);
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_reporting_a_failure() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        ui.modal = Some(overlay::Modal::error(
+            "mock could not be opened",
+            "could not connect: refused by the configured behaviour",
+        ));
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_at_the_smallest_usable_size() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        insta::assert_snapshot!(screen(&snap, &mut ui, 60, 20));
+    }
+
+    #[tokio::test]
+    async fn screen_below_the_smallest_usable_size() {
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        insta::assert_snapshot!(screen(&snap, &mut ui, 40, 10));
+    }
+
+    #[tokio::test]
+    async fn a_failed_connection_is_raised_as_a_dialog() {
+        let store = Store::spawn(Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
+            connect_fails: true,
+            ..Behaviour::instant()
+        }))));
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        until(&mut rx, |s| {
+            s.connections
+                .first()
+                .is_some_and(|c| matches!(c.status, ConnStatus::Failed(_)))
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        // Through `initial_ui`, which is the path the first frame takes. A
+        // connect dispatched before the terminal was taken over can already
+        // have failed, and a failed connect publishes nothing afterwards — so
+        // raising it only on the next snapshot means never.
+        let mut ui = initial_ui(&snap);
+        // A toast fades; an explorer that will never fill needs the reason to
+        // stay on screen until it is read.
+        assert!(ui.modal.is_some());
+
+        // Dismissed once, not raised again by the next unrelated snapshot.
+        ui.modal = None;
+        raise_connection_failure(&snap, &mut ui);
+        assert!(ui.modal.is_none(), "the dialog came back on its own");
+
+        // A second connection failing is a second thing to report. Remembering
+        // only one id leaves it silent, because the first failure stays in the
+        // list and is what the search keeps finding.
+        store.dispatch(Action::Connect(DriverKind::Mock));
+        until(&mut rx, |s| {
+            s.connections.len() == 2
+                && s.connections
+                    .iter()
+                    .all(|c| matches!(c.status, ConnStatus::Failed(_)))
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+        raise_connection_failure(&snap, &mut ui);
+        assert!(ui.modal.is_some(), "the second failure went unreported");
     }
 }

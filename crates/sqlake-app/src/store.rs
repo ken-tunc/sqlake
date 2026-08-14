@@ -637,11 +637,14 @@ impl Runtime {
                 _ => out.session.close(),
             },
             Err(err) => {
-                let message = err.user_message();
+                // Recorded on the connection and nowhere else. How a failure is
+                // surfaced is the front-end's decision — the interactive client
+                // raises a dialog for this one, and a toast beside it would be
+                // the same error reported twice, which is worse than reporting
+                // it once. The same rule as `expanded` below.
                 if let Some(conn) = self.conn_mut(id) {
-                    conn.status = ConnStatus::Failed(message.clone());
+                    conn.status = ConnStatus::Failed(err.user_message());
                 }
-                self.toast(Severity::Error, message);
             }
         }
     }

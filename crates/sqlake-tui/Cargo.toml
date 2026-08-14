@@ -24,5 +24,6 @@ unicode-width.workspace = true
 [dev-dependencies]
 # Test-only. The fixtures exist to break naive formatting, so the formatter is
 # run against them here rather than against values written to suit it.
+insta.workspace = true
 sqlake-driver-mock.workspace = true
 time = { workspace = true, features = ["macros"] }

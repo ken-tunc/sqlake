@@ -11,14 +11,14 @@
 //! the same as [`crate::hit::HitMap`] — an event is always answered against the
 //! layout that produced the pixels it was aimed at.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
 use sqlake_app::snapshot::Snapshot;
 use sqlake_app::tree::TreeView;
-use sqlake_core::id::TabId;
+use sqlake_core::id::{ConnId, TabId};
 
 use crate::grid::RenderedGrid;
 use crate::hit::{PaneId, SplitId, Target};
@@ -114,6 +114,11 @@ pub struct UiState {
     /// The dialog on screen, if any. Whether one is open is a fact about this
     /// screen rather than about the data, so it lives here.
     pub modal: Option<crate::overlay::Modal>,
+    /// The connections whose failure has already been raised as a dialog, so
+    /// dismissing one is final rather than undone by the next snapshot. A set
+    /// rather than one id: remembering only the last leaves a second connection
+    /// failing in silence behind the first.
+    pub reported_failures: HashSet<ConnId>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
@@ -349,6 +354,12 @@ impl UiState {
     /// The furthest left the grid can be scrolled while `col` is still drawn.
     fn leftmost_visible(&mut self, col: usize, snapshot: &Snapshot) -> usize {
         let available = usize::from(self.viewport(PaneId::Grid).width);
+        if available == 0 {
+            // No frame has been drawn yet, so nothing is known about what fits.
+            // Scrolling on a guess would push the first columns off the screen
+            // before the screen exists.
+            return 0;
+        }
         let mut used = 0;
         let mut first = col;
         for c in (0..=col).rev() {
