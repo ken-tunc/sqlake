@@ -7,7 +7,7 @@
 //! Everything here either touches data or performs I/O. Scrolling, selection,
 //! column widths and split positions are *not* actions: they are handled inside
 //! the render loop, because routing them through an async task adds a round
-//! trip to every wheel tick (decision D3).
+//! trip to every wheel tick.
 
 use std::fmt;
 

@@ -5,7 +5,7 @@
 //! behind it, and the dialog itself covers its own area at [`Z_MODAL`] so a
 //! click inside it does not reach the backdrop. Miss either and a confirmation
 //! dialog becomes a way to trigger the thing it was confirming, or a way to
-//! dismiss itself by pressing on its own question (decision D5).
+//! dismiss itself by pressing on its own question.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

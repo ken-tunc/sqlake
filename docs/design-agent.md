@@ -27,7 +27,7 @@ and **each front-end renders it for itself**. The TUI's rules are actively wrong
 not parse as null, a JSON document collapsed to `{2 keys}` destroys exactly what was asked
 for, and a newline replaced by `␊` corrupts the text. So `sqlake-api` owns its own
 `Value` → JSON serialisation, and reaching for `sqlake-tui`'s formatter would be a bug rather
-than reuse (architecture §4.2).
+than reuse — which is what the peer relationship in architecture §2 is protecting.
 
 ---
 
@@ -107,7 +107,7 @@ query that was never estimated. What differs for an agent is how approval is gra
   turn that into an approval itself; it has to surface the number to a human, who approves it
   through the TUI or by re-issuing with `--approve-up-to`.
 
-`NeedsApproval` being a normal output rather than an error (architecture §4.3) is what makes
+`NeedsApproval` being a normal output rather than an error (architecture §4.2) is what makes
 this a clean protocol response instead of an error path with special handling.
 
 ### 3.2 Write access is opt-in

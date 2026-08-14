@@ -26,11 +26,11 @@ Logs go to `$XDG_STATE_HOME/sqlake/sqlake.log` and never to the screen.
 ## Design
 
 - [Design](docs/design.md) — architecture, driver model, type design, milestones
-- [M0 — Foundation](docs/design-m0.md) — the milestone just finished
 - [Agent surface](docs/design-agent.md) — driving sqlake from an AI agent
 
 The code is the primary documentation: the design documents hold what has not been built and
-the reasons behind decisions that a type cannot state for itself.
+the reasons behind decisions that a type cannot state for itself. What M0 built is described
+by the crates it produced, not by a document beside them.
 
 ## Features
 

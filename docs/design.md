@@ -5,8 +5,10 @@ A mouse-friendly database client that runs in the terminal.
 Scope is deliberately narrow: PostgreSQL and BigQuery, built as a personal tool. Where a
 trade-off exists, prefer "hard to break" and "possible to finish" over "extensible".
 
-This document holds the architecture. Companion documents hold only what is specific to their
-subject: [M0 — Foundation](design-m0.md), [Agent surface](design-agent.md).
+**The code is the primary documentation.** What has been built states its own reasoning in doc
+comments, and is deliberately not repeated here — a summary of working code is a copy that
+drifts. What is left in this document is the part nothing has built yet, plus the decisions a
+type cannot make on its own. [Agent surface](design-agent.md) does the same for its subject.
 
 ---
 
@@ -45,6 +47,9 @@ sqlake/
     └── sqlake-driver-mock/       # for UI development and tests. Every screen works with no DB
 ```
 
+`crates/` is the list of what exists; the rest are created by the milestone that first needs
+one. An empty placeholder crate is dead weight and hides which parts are real.
+
 Dependencies flow one way:
 
 ```
@@ -56,23 +61,16 @@ sqlake(bin) ──┤            ├──→ sqlake-app ──→ sqlake-core �
 ```
 
 `sqlake-tui` and `sqlake-api` are **peers**: two front-ends over the same application layer,
-neither depending on the other (§9). The TUI only needs to know how to start a listener, which
+neither depending on the other (§8). The TUI only needs to know how to start a listener, which
 is `sqlake-api`'s job.
-
-`sqlake-core` depends on little more than `serde`, `tokio` (sync only) and `async-trait`.
-`sqlake-driver-mock` is what lets both front-ends and the use cases be developed and tested
-without standing up a database.
 
 ---
 
 ## 3. Domain model (`sqlake-core`)
 
-The types are the documentation: `Driver`/`Session`, `Capabilities`, `Value`, `Ident` and the
-tree types live in `crates/sqlake-core/` and carry their reasoning as doc comments. A summary
-here would only drift, and had already: it showed a `Session` without `capabilities`, a
-`connect` taking a profile it does not take, and three methods that do not exist yet.
-
-What follows is the part of the model nothing has built.
+`Driver`/`Session`, `Capabilities`, `Value`, `Ident` and the tree types live in
+`crates/sqlake-core/` and carry their reasoning as doc comments. What follows is the part of
+the model nothing has built.
 
 ### 3.1 Table definition (feature 5)
 
@@ -96,26 +94,17 @@ partitioning and clustering and leaves the rest empty.
 
 ---
 
-## 4. Use cases and types (`sqlake-app`)
+## 4. Types still to be built (`sqlake-app`)
 
 Every operation in the app layer is a `UseCase` (`crates/sqlake-app/src/usecase/`) whose input
-and output are expressed as types. Making "before" and "after" distinct types turns a skipped
-step into a compile error.
-
-- Dependencies (`Session` handles, `Store`, `HistoryRepo`) are injected as struct fields.
-- `Input` and `Output` are types specific to the use case. No tuples like
-  `(String, u32, bool)`, and no generic `serde_json::Value`.
-- Inject the mock driver and a use case can be verified in isolation, input to output.
-- Outputs echo the request back with the result. Without that, a late reply is applied to
-  whatever is selected now, and a stale page overwrites a newer one.
+and output are expressed as types, so a skipped step is a compile error rather than a runtime
+surprise.
 
 ### 4.1 Stages as types
 
 | Pipeline | Stages |
 | --- | --- |
 | SQL | `RawSql` → `ValidatedSql` → `PreparedSql` → **`ApprovedQuery`** |
-| Identifiers | `Ident` → **`QuotedIdent`** |
-| Results | `RowBatch` → `ResultSet` → `PagedResult` → **`RenderedGrid`** |
 | Connection info | `Profile` → **`ResolvedProfile`** |
 | Templates | `Template` → `BoundTemplate` → **`RawSql`** |
 
@@ -126,21 +115,16 @@ The guarantees each stage carries:
 | `ValidatedSql` | Parsed; single vs. multiple statements determined |
 | `PreparedSql` | Parameters bound; implicit `LIMIT` applied |
 | `ApprovedQuery` | Estimated cost within threshold, or explicitly approved by the user |
-| `QuotedIdent` | Quoted and escaped |
-| `ResultSet` | Column definitions and row count fixed |
-| `PagedResult` | Pages accumulated; still driver data, no display decisions |
-| `RenderedGrid` | Column widths, alignment and truncation settled |
 | `ResolvedProfile` | Secrets resolved from keyring or command; subject to `zeroize` |
 
-Three things become **impossible to write**:
-
-- `Session::execute` accepts only `ApprovedQuery`
-  → **there is no code path that executes without estimating.** The BigQuery billing accident
-  is prevented structurally.
+`Session::execute` accepts only an `ApprovedQuery`, so **there is no code path that executes
+without estimating.** The BigQuery billing accident is prevented structurally.
 
 Conversions go through `TryFrom` or a dedicated function carrying a failure reason, and
 **constructors are not `pub`**: `ApprovedQuery::new` is callable only from the approval logic
-in the same module.
+in the same module. The stages already built — `Ident → QuotedIdent` and
+`RowBatch → ResultSet → PagedResult → RenderedGrid` — follow the same pattern and state their
+own invariants.
 
 ### 4.2 "Needs approval" is an output, not an error
 
@@ -155,107 +139,12 @@ pub enum RunQueryOutput {
 The UI shows a confirmation dialog on `NeedsApproval` and calls the same use case again with
 `Approval::Approved`.
 
-### 4.3 The relationship to `Action`
-
-`Action` is a raw intent from the UI ("this button was pressed"); a use case `Input` is
-validated. **The UI never calls a use case directly.** The store builds an `Input` from an
-`Action`, invokes the use case, and folds the `Output` into the `Snapshot`.
-
-`Action` carries only what touches data or performs I/O. An action carries no parameter the
-store already owns: sorting names a column but not a direction, so two fast header clicks
-cannot race with a sort already in flight.
-
 ---
 
-## 5. Concurrency and state
+## 5. Screen layout
 
-The store task, the per-connection session actor and the event loop between them are in
-`crates/sqlake-app/src/{store,session}.rs`.
-
-### 5.1 Render loop
-
-```rust
-let mut term_events = crossterm::event::EventStream::new();   // feature = "event-stream"
-let mut snapshot    = store.subscribe();
-let mut ui          = UiState::default();
-let mut dirty       = true;
-
-loop {
-    if dirty {
-        hits.clear();
-        terminal.draw(|f| views::shell::render(f, &snapshot.borrow(), &mut ui, &mut hits))?;
-        dirty = false;
-    }
-
-    tokio::select! {
-        Some(Ok(ev)) = term_events.next() => {
-            for intent in input::translate(ev, &ui) { apply(intent); }
-            dirty = true;
-        }
-        Ok(()) = snapshot.changed() => dirty = true,
-        Some(()) = ui.animation_tick() => dirty = true,   // only while a spinner is running
-    }
-}
-```
-
-**Do not run at a fixed frame rate.** Redraw only when an event arrives or state changes.
-Mouse-move events fire for every cell, so `dirty` is set only when the hovered target
-actually changes.
-
-### 5.2 Two kinds of state
-
-| Kind | Owner | Examples |
-| --- | --- | --- |
-| `Snapshot` (data) | store task | connection status, tree, result sets, running queries |
-| `UiState` (appearance) | TUI loop | scroll offset, selected cell, column widths, split position, hover, focus |
-
-Transient UI state does not go into the store. Mixing the two makes the scroll position jump
-on every asynchronous update.
-
-### 5.3 Logging
-
-Writing to stdout while the TUI is up corrupts the screen, so `tracing` plus
-`tracing-appender` write to `~/.local/state/sqlake/sqlake.log` and nowhere else.
-
----
-
-## 6. Mouse foundation
-
-ratatui has no hit testing, but it hands every rectangle to the code that draws it. So each
-widget records "this rectangle is this thing" while drawing, and a click is resolved against
-that record.
-
-### 6.1 Terminal caveats
-
-- Mouse capture takes native text selection away from the terminal. The status bar
-  permanently shows "Shift (or Option) + drag to select", **clipboard copy is implemented via
-  OSC 52** (cell, row, or whole result — works over SSH), and `--no-mouse` disables capture
-  entirely.
-- Some terminals and tmux configurations cannot deliver right-click, so every context menu
-  entry also has a key binding.
-
-### 6.2 Operation matrix
-
-| Part | Mouse | Keyboard |
-| --- | --- | --- |
-| Pane | click to focus | `Tab`, `Ctrl-h` |
-| Splitter | drag to resize, double-click to even out | `Ctrl-←/→`, `=` |
-| Scrolling | wheel, thumb drag, track click | `j/k`, `PgUp/PgDn`, `g/G` |
-| Grid | header click sorts, edge drag resizes, cell click selects, right-click opens menu | `J/K`, `H/L`, `s`, `<`/`>` |
-| Tree | click `▸` to expand, double-click to open | `Space`, `←`/`→`, `Enter` |
-| Tabs | click to switch, `×` or middle-click to close | `]`/`[`, `Ctrl-w` |
-| Editor area | click to open `$EDITOR` | `e` |
-| Modal | click outside to dismiss | `Esc` |
-| Command palette | — | `Ctrl-p` |
-
-Case carries the axis of control: lower case and the arrow keys move the **view**, upper case
-moves the **selection**. `H`/`L` are to `J`/`K` what `Left`/`Right` are to `j`/`k`. Dropping
-half of that pairing is easy to miss, because the coverage test works at the level of the
-capability and both directions of a cursor are one capability.
-
----
-
-## 7. Screen layout
+Where the layout is heading. Today's is the left half of it: one tree pane and one grid pane,
+with the cell-detail pane arriving in M3 and the SQL and definition tabs in M4 and M5.
 
 ```
 ┌ sqlake ── [● prod-pg] [○ bq-analytics] [+] ─────────────────────── ⚙ ─┐
@@ -271,44 +160,41 @@ capability and both directions of a cursor are one capability.
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-```
-crates/sqlake-tui/src/
-├── app.rs           # event loop, terminal setup, TerminalGuard
-├── hit.rs           # HitMap, Target, z levels
-├── mouse.rs         # MouseState, gesture synthesis
-├── intent.rs        # Intent, ViewCmd, IntentKind
-├── input.rs         # KEYMAP, on_key, on_mouse
-├── editor.rs        # launching and returning from $EDITOR
-├── ui_state.rs      # scroll, selection, column widths, splits, focus
-├── theme.rs
-├── widgets/         # pane, grid, tree, scrollbar, modal, menu, button, splitter, toast
-└── views/
-    ├── shell.rs     # overall layout, tab bar, status bar
-    ├── explorer.rs  # features 1 and 2
-    ├── grid.rs      # feature 3
-    ├── sql.rs       # feature 4 (buffer display, execution, results)
-    ├── detail.rs    # feature 5
-    └── history.rs   # features 7 and 8
-```
+---
 
-The data grid **must be virtualised** — only visible rows are drawn — so that 100k rows cost
-the same as 100.
+## 6. Mouse and keyboard
+
+`KEYMAP` in `crates/sqlake-tui/src/input.rs` is the list of bindings, and the two coverage
+tests beside it are what keep it complete: one asserts that every capability reachable with
+the mouse has a key, the other that the key produces the capability it names. Adding a target
+or a gesture stops the crate compiling until it has a sample.
+
+What that mechanism does not cover, because it has not been built:
+
+- Mouse capture takes native text selection away from the terminal. The plan is a permanent
+  hint in the status bar ("Shift — or Option — + drag to select") plus **OSC 52 copy** of a
+  cell, a row or a whole result, which works over SSH (M3). `--no-mouse` disables capture
+  entirely and exists today.
+- Some terminals and tmux configurations cannot deliver right-click, so every context menu
+  entry (M3) also needs a key binding. The coverage test enforces that only once the menu is a
+  hit target.
+- Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M4).
 
 ---
 
-## 8. No SQL editor: delegate to `$EDITOR` (feature 4)
+## 7. No SQL editor: delegate to `$EDITOR` (feature 4)
 
 Write the buffer to a temporary file, launch `$EDITOR`, and read it back when the editor
 exits. The same mechanism as `git commit`.
 
-### 8.1 What this buys
+### 7.1 What this buys
 
 - Syntax highlighting, completion, snippets, LSP (`sqls`, `sqlfluff`), key bindings, macros —
   **the user's existing neovim configuration applies unchanged.**
 - No dependency on any editor crate, and no multi-line editing, undo/redo or search to write.
 - The temporary file carries a `.sql` extension, so filetype detection works automatically.
 
-### 8.2 Flow
+### 7.2 Flow
 
 1. `e`, or a click on the editor area → `Action::EditExternally { tab }`.
 2. **The main loop handles this synchronously** — it hands the terminal over, so ordering
@@ -320,7 +206,7 @@ exits. The same mechanism as `git commit`.
 3. Read the file back into a `RawSql`. If it changed, record it as a draft in history.
 4. `Ctrl-Enter` or the run button hands off to the `RunQuery` use case: estimate, approve, run.
 
-### 8.3 Caveats
+### 7.3 Caveats
 
 - Restore runs through the same path as the panic hook, so an editor that dies
   abnormally still leaves a usable screen.
@@ -330,12 +216,12 @@ exits. The same mechanism as `git commit`.
   still consumed. The display catches up on return.
 - Scratch files are persisted per tab and reloaded on session restore.
 
-### 8.4 What the SQL tab does own
+### 7.4 What the SQL tab does own
 
 Everything except editing: a read-only preview of the buffer, run and cancel, the estimated
 byte count, error line highlighting, the result grid, and tab management.
 
-### 8.5 Possible later (out of scope for v1)
+### 7.5 Possible later (out of scope for v1)
 
 A watch mode: use `notify` to watch the scratch file and re-run automatically on every save,
 so neovim can stay open in another tmux pane. Genuinely useful for a personal tool, but it
@@ -343,7 +229,7 @@ adds a dependency.
 
 ---
 
-## 9. A second front-end: the agent surface
+## 8. A second front-end: the agent surface
 
 The application layer has no idea a terminal exists, so the TUI is one front-end over it
 rather than the only possible one. An AI agent driving sqlake — listing tables, previewing
@@ -356,7 +242,7 @@ Two things follow, and both are load-bearing:
 - The guards already in the type system apply unchanged. `Session::execute` accepts only an
   `ApprovedQuery`, so an agent cannot run an unestimated BigQuery scan any more than a human
   can; what differs is that approval is granted by a byte budget rather than by a dialog, and
-  that going over it returns `NeedsApproval` (§4.3) for a human to answer.
+  that going over it returns `NeedsApproval` (§4.2) for a human to answer.
 
 The surface is a socket API against a running session, thin noun-verb subcommands over it, and
 an MCP server wrapping the same client — modelled on herdr. Attaching to a running session is
@@ -367,7 +253,7 @@ Detail, including the safety policy for agents, is in [design-agent.md](design-a
 
 ---
 
-## 10. Configuration and secrets (`sqlake-config`)
+## 9. Configuration and secrets (`sqlake-config`)
 
 ```
 ~/.config/sqlake/
@@ -412,9 +298,9 @@ masking lives in exactly one function and never reaches the log.
 
 ---
 
-## 11. Drivers
+## 10. Drivers
 
-### 11.1 PostgreSQL
+### 10.1 PostgreSQL
 
 - `tokio-postgres` with `tokio-postgres-rustls`; `sslmode` maps onto the rustls configuration.
 - Hold **two connections: one for queries, one for metadata**, so that expanding the tree is
@@ -429,10 +315,10 @@ masking lives in exactly one function and never reaches the log.
   true, holding `(Type, Vec<u8>)`. Decode the ~40 known OIDs strictly and route everything
   else to `Value::Opaque`. Extension and user-defined types then cannot crash the client.
 - Preview issues `SELECT * FROM "sch"."tbl" ORDER BY … LIMIT n OFFSET m`. Identifiers can only
-  be assembled through `QuotedIdent` (§4.1).
+  be assembled through `QuotedIdent`.
 - Show the `EXPLAIN` row estimate first; run an exact `COUNT(*)` only on explicit request.
 
-### 11.2 BigQuery
+### 10.2 BigQuery
 
 - `gcp-bigquery-client` with `yup-oauth2` (ADC, service account, or impersonation). Where the
   crate lags the API, wrap REST calls thinly inside the driver so `reqwest` can be used
@@ -451,7 +337,7 @@ masking lives in exactly one function and never reaches the log.
 
 ---
 
-## 12. Proxies and tunnels (feature 6)
+## 11. Proxies and tunnels (feature 6)
 
 ```rust
 #[async_trait]
@@ -480,7 +366,7 @@ timeout = "20s"
 
 ---
 
-## 13. History and templates (features 7 and 8)
+## 12. History and templates (features 7 and 8)
 
 One SQLite file (`rusqlite`, bundled).
 
@@ -509,39 +395,30 @@ CREATE TABLE templates (
 
 ---
 
-## 14. Testing
+## 13. Testing
 
-**In-source tests by default**, in a `#[cfg(test)] mod tests` at the bottom of each file.
-Private pure functions can then be tested directly, with no need to widen visibility for the
-sake of a test. This design is heavy on pure functions and type conversions, so the two fit
-well.
-
-`tests/` is reserved for behaviour observable from outside the crate — chiefly the shared
-driver conformance suite, run against PostgreSQL via `testcontainers`, against BigQuery via an
-emulator, and against the mock.
-
-Screen snapshots use `insta` with ratatui's `TestBackend`. They are brittle by nature, so they
-cover a small number of representative screens rather than every state.
-
-Because `sqlake-driver-mock` exists, every other test runs with no database and no network.
+The testing rules that apply to every commit are in [CLAUDE.md](../CLAUDE.md). The part still
+to build is the shared **driver conformance suite** in `tests/`: one set of cases run against
+PostgreSQL via `testcontainers`, against BigQuery via an emulator, and against the mock, so
+that "the driver behaves" means the same thing for all three.
 
 ---
 
-## 15. Milestones
+## 14. Milestones
 
 | # | Content | Done when |
 | --- | --- | --- |
-| **M0 — Foundation** | workspace, domain types, staged types, `UseCase` trait, store, render loop, `TerminalGuard`, `HitMap` and one input pipeline, base widgets, mock driver | The tree and the grid can be driven entirely by mouse against the mock connection, and every one of those operations also works from the keyboard. See [design-m0.md](design-m0.md) |
+| **M0 — Foundation** ✅ | workspace, domain types, staged types, `UseCase` trait, store, render loop, `TerminalGuard`, `HitMap` and one input pipeline, base widgets, mock driver | Done. `crates/` and `git log` are the record |
 | **M1** | Connection management (feature 1) | `Profile → ResolvedProfile`, keyring, connection test, connection tabs |
-| **M2** | Table list (feature 2) | Lazy tree expansion for pg and bq, filter search |
-| **M3** | Table preview (feature 3) | Paging, sorting, cell detail, CSV/JSON copy via OSC 52 |
-| **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display |
+| **M2** | Table list (feature 2) | Lazy tree expansion for pg and bq, filter search. A second driver also gives `Capabilities` a second answer, which the mock alone cannot |
+| **M3** | Table preview (feature 3) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
+| **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
 | **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
 | **M7** | SQL templates (feature 7) | Save, parameter entry, insert from the palette |
 | **M8** | Query history (feature 8) | FTS search, re-run, promote to template |
 
-The agent surface (§9) runs as a track alongside these rather than after them, because each
+The agent surface (§8) runs as a track alongside these rather than after them, because each
 of its parts becomes possible at a different point:
 
 | # | Lands after | Content |
@@ -552,21 +429,16 @@ of its parts becomes possible at a different point:
 
 Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
 
-**M0 determines the feel of everything else.** `HitMap`, the data grid and the staged types in
-§4 are all expensive to replace later, so they are the parts worth finishing properly first.
-
 ---
 
-## 16. Risks
+## 15. Risks
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Terminal state corrupted after returning from the external editor | unusable | One restore path, shared with the panic hook (`TerminalGuard`) |
 | `$EDITOR` is a GUI editor and returns immediately | annoyance | `editor_args` can supply a `--wait` equivalent; warn when the editor exits instantly |
 | Mouse capture steals native text selection | annoyance | OSC 52 copy as standard, a permanent hint about shift-drag, and `--no-mouse` |
-| Terminals and tmux configurations without right-click or hover | missing features | Every feature has a key binding, enforced by the coverage test (§6) |
-| Event-driven rendering misses an update | looks frozen | `dirty` is only set in the three `select!` arms; nothing else draws |
-| Data grid performance (100k rows × 100 columns) | usability | Draw only visible rows; sample column widths; swap in `rat-ftable` if that is not enough |
+| Terminals and tmux configurations without right-click or hover | missing features | Every feature has a key binding, enforced by the coverage tests (§6) |
 | Too many staged types make the code verbose | velocity | Keep to the pipelines listed in §4.1; add a stage only when skipping it would cause a real accident |
 | BigQuery billing accident | real cost | `tabledata.list` for preview; `ApprovedQuery` enforced by the type system; `maximumBytesBilled` |
 | Unknown PostgreSQL type crashes the client | unusable | `Value::Opaque` fallback enforced by the type system |
@@ -574,64 +446,46 @@ Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 �
 
 ---
 
-## 17. Dependencies
+## 16. Dependencies
 
 The UI layer depends on **`ratatui` and `crossterm`, and nothing else**. The data grid, tree,
 modals, scrollbar handling and focus are written here, because each has requirements specific
 to this project and each is a few hundred lines at most. `rat-ftable` is the fallback if the
 grid cannot be made fast enough.
 
+The workspace `Cargo.toml` is the record of what is in use. What is not there yet, with the
+choice already made:
+
 ```toml
-# shared
-tokio = { version = "1", features = ["full"] }
-async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
+# configuration and secrets (M1)
 toml = "0.9"
-thiserror = "2"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-tracing-appender = "0.2"
 directories = "6"
-time = "0.3"
-uuid = { version = "1", features = ["v4", "serde"] }
-
-# UI
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
-unicode-width = "0.2"
-
-# configuration and secrets
 keyring = "3"
 zeroize = "1"
 
-# persistence
+# persistence (M7, M8)
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# PostgreSQL
+# PostgreSQL (M1)
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-time-0_3"] }
 tokio-postgres-rustls = "0.13"
 rustls = "0.23"
 
-# BigQuery
+# BigQuery (M2)
 gcp-bigquery-client = "0.28"
 yup-oauth2 = "12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "socks"] }
 
-# development
+# driver conformance (M1)
 testcontainers = "0.25"
-insta = "1"
 ```
 
-`crossterm` is declared directly, pinned to the version ratatui re-exports, only to turn on
-the `event-stream` feature.
-
-For `ValidatedSql`, start by checking whether splitting on semicolons and classifying the
+For `ValidatedSql` (M4), start by checking whether splitting on semicolons and classifying the
 statement is enough; reach for `sqlparser` only if it is not.
 
 ---
 
-## 18. References
+## 17. References
 
 - [ratatui](https://ratatui.rs/) and [awesome-ratatui](https://github.com/ratatui/awesome-ratatui)
 - [rainfrog](https://github.com/achristmascarl/rainfrog) — a PostgreSQL TUI in Rust and

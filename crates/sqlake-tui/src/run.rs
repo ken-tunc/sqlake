@@ -542,8 +542,9 @@ mod tests {
         let (_, hits) = render(&snap, &mut ui, 100, 30);
         let mut mouse = MouseState::new();
 
-        // `j` scrolls, which is decision D3: a wheel notch through the store
-        // arrives a round trip after the hand that turned it.
+        // `j` scrolls, and scrolling stays out of the store: a wheel notch
+        // through an async task arrives a round trip after the hand that
+        // turned it.
         let (intents, dirty) = step(key(KeyCode::Char('j')), &hits, &mut mouse, &ui, &snap);
         assert!(dirty);
         assert!(
