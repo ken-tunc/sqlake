@@ -3,7 +3,7 @@
 //!
 //! Expansion drives loading, so it is data and lives here rather than in the
 //! view. What the UI receives is already flat: drawing the tree is a slice and
-//! an index, never a recursive walk (decision D7).
+//! an index, never a recursive walk.
 //!
 //! Scroll position and selection are deliberately *not* here. They belong to
 //! `UiState`; mixing them in makes the tree jump on every asynchronous update.

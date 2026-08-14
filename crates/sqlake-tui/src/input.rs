@@ -372,9 +372,8 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
 
         (Target::Tab(id), Gesture::Click) => vec![Action::SelectTab(id).into()],
         (Target::TabClose(id), Gesture::Click)
-        // The operation matrix in design.md §6.5 offers middle-click as the
-        // second way to close a tab, and it is the one that does not require
-        // hitting a one-cell `×`.
+        // Middle-click is the second way to close a tab, and the one that does
+        // not require hitting a one-cell `×`.
         | (Target::Tab(id), Gesture::MiddleClick) => vec![Action::CloseTab(id).into()],
 
         (Target::Button(ButtonId::Cancel(busy)), Gesture::Click) => {
@@ -1038,8 +1037,8 @@ mod tests {
 
     #[test]
     fn a_middle_click_closes_the_tab_it_lands_on() {
-        // The operation matrix offers this as the second way to close a tab,
-        // and it is the one that does not require hitting a one-cell `×`.
+        // The second way to close a tab, and the one that does not require
+        // hitting a one-cell `×`.
         let snap = snapshot();
         let c = ctx(&snap, PaneId::Grid);
         let tab = TabId::new(2);

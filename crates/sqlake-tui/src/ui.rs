@@ -196,7 +196,7 @@ impl UiState {
         wanted.clamp(MIN_PANE_WIDTH.min(ceiling), ceiling)
     }
 
-    /// Apply a view command. Synchronous by design (§5.2 of the architecture).
+    /// Apply a view command, synchronously and without touching the store.
     pub fn apply(&mut self, cmd: ViewCmd, snapshot: &Snapshot) {
         match cmd {
             ViewCmd::FocusPane(pane) => self.focus = pane,

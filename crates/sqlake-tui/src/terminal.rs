@@ -4,6 +4,10 @@
 //! undone, and they have to be undone on every exit path — a clean quit, a
 //! panic, and (from M4) handing the terminal to `$EDITOR`. Every one of those
 //! goes through [`restore`], so there is exactly one thing to get right.
+//!
+//! SIGTERM is the gap: a signal does not unwind, so `Drop` never runs and the
+//! terminal is left in raw mode on the alternate screen. Closing it means a
+//! signal handler that calls [`restore`], which nothing needs yet.
 
 use std::io::{self, Stdout};
 

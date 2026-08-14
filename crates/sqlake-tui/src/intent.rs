@@ -3,7 +3,7 @@
 //! Mouse and keyboard both produce [`Intent`]s, which is the mechanism behind
 //! "nothing is mouse-only". An intent is either handled inside the render loop
 //! or dispatched to the store — the split matters because scrolling must not
-//! round-trip through an async task (decision D3).
+//! round-trip through an async task.
 //!
 //! [`IntentKind`] names the *capability* rather than the exact variant, so
 //! clicking a specific tree row and moving the selection with the arrow keys
