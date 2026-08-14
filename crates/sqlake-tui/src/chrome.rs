@@ -300,6 +300,12 @@ pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot
 }
 
 /// `text` cut to `max` terminal columns, with an ellipsis where it was cut.
+/// Display columns `text` occupies, re-exported so the overlays measure the
+/// same way everything else does.
+pub(crate) fn display_width_of(text: &str) -> u16 {
+    crate::grid::display_width(text)
+}
+
 pub(crate) fn fit(text: &str, max: u16) -> String {
     if display_width(text) <= max {
         return text.to_owned();
