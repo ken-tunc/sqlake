@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::capability::{Capabilities, DriverKind};
 use crate::node::{NodeRef, TableRef, TreeNode};
+use crate::profile::ResolvedProfile;
 use crate::result::{PageRequest, ResultSet};
 
 pub type DriverResult<T> = Result<T, DriverError>;
@@ -45,16 +46,20 @@ impl DriverError {
     }
 }
 
-/// Creates sessions. One instance per configured connection profile.
+/// Creates sessions. One instance per driver kind, shared by every profile of
+/// that kind.
 #[async_trait]
 pub trait Driver: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> DriverKind;
 
     fn capabilities(&self) -> Capabilities;
 
-    /// In M0 a driver carries its own configuration. `ResolvedProfile` arrives
-    /// with `sqlake-config` in M1.
-    async fn connect(&self) -> DriverResult<Box<dyn Session>>;
+    /// Open a connection with the parameters of one profile.
+    ///
+    /// A driver is per *kind*, not per connection: one `Arc<dyn Driver>`
+    /// serves every PostgreSQL profile there is, and what distinguishes two
+    /// live connections is the [`ResolvedProfile`] each was opened with.
+    async fn connect(&self, profile: &ResolvedProfile) -> DriverResult<Box<dyn Session>>;
 }
 
 /// A live connection. Owned by exactly one session actor, which serialises

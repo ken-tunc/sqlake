@@ -242,7 +242,9 @@ mod tests {
     }
 
     fn password_of(resolved: &ResolvedProfile) -> Option<&str> {
-        let Params::Postgres(pg) = &resolved.params;
+        let Params::Postgres(pg) = &resolved.params else {
+            panic!("a postgres profile resolves to postgres params");
+        };
         pg.password.as_ref().map(Secret::expose)
     }
 
@@ -252,7 +254,9 @@ mod tests {
         let resolved = resolved(&profile).expect("should resolve");
         assert_eq!(resolved.id, profile.id);
         assert!(resolved.readonly);
-        let Params::Postgres(pg) = &resolved.params;
+        let Params::Postgres(pg) = &resolved.params else {
+            panic!("a postgres profile resolves to postgres params");
+        };
         assert_eq!(pg.host, "db.internal");
         assert_eq!(pg.sslmode, SslMode::VerifyFull);
         // No password key means no password, not an empty one.

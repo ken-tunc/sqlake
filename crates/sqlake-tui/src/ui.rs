@@ -446,7 +446,9 @@ fn scroll_into_view(offset: usize, index: usize, page: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use sqlake_driver_mock::mock_summary;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use sqlake_app::snapshot::{LoadState, PreviewTab, TabContent, TabView};
     use sqlake_app::tree::{NodeState, VisibleNode};
@@ -488,8 +490,10 @@ mod tests {
 
         Snapshot {
             rev: 1,
+            profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![sqlake_app::snapshot::ConnectionView {
                 id: conn,
+                profile: mock_summary("mock").id,
                 name: "mock".into(),
                 kind: sqlake_core::capability::DriverKind::Mock,
                 status: sqlake_app::snapshot::ConnStatus::Ready,

@@ -344,20 +344,22 @@ mod tests {
     use sqlake_app::action::Action;
     use sqlake_app::snapshot::{ConnectionView, TabView};
     use sqlake_app::store::Drivers;
-    use sqlake_core::capability::DriverKind;
     use sqlake_core::node::{NodeRef, TableRef};
-    use sqlake_driver_mock::{Behaviour, MockDriver};
+    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, mock_summary};
 
     use super::*;
 
     fn store() -> Store {
-        Store::spawn(Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))))
+        Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::default()),
+        )
     }
 
     async fn connected() -> (Store, Arc<Snapshot>) {
         let store = store();
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(mock_summary("mock").id));
         until(&mut rx, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
@@ -814,12 +816,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_connection_is_raised_as_a_dialog() {
-        let store = Store::spawn(Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
-            connect_fails: true,
-            ..Behaviour::instant()
-        }))));
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
+                connect_fails: true,
+                ..Behaviour::instant()
+            }))),
+            Arc::new(MockProfiles::default()),
+        );
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(mock_summary("mock").id));
         until(&mut rx, |s| {
             s.connections
                 .first()
@@ -845,7 +850,7 @@ mod tests {
         // A second connection failing is a second thing to report. Remembering
         // only one id leaves it silent, because the first failure stays in the
         // list and is what the search keeps finding.
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(mock_summary("mock").id));
         until(&mut rx, |s| {
             s.connections.len() == 2
                 && s.connections

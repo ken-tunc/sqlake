@@ -9,9 +9,9 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::Snapshot;
+use sqlake_app::snapshot::{ConnStatus, Snapshot};
 use sqlake_app::tree::VisibleNode;
-use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::id::{ConnId, ProfileId, TabId};
 
 use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
 use crate::intent::{Context, Intent, IntentKind, ViewCmd};
@@ -241,6 +241,31 @@ pub struct InputContext<'a> {
 }
 
 impl InputContext<'_> {
+    /// Which profile `c` connects to, until T7 puts a picker in front of it.
+    ///
+    /// The first one nothing is connected to, so that with several profiles it
+    /// works through them rather than reopening the first — and the first
+    /// profile again once they all have a connection, because a second window
+    /// onto the same database is a real thing to want, and a key that goes
+    /// dead once is worse than one that repeats itself.
+    ///
+    /// A connection the user closed, or one that failed, is not a connection:
+    /// counting its row would make `c` skip past the profile the user is
+    /// trying to reopen and connect to something else instead.
+    fn connectable_profile(&self) -> Option<ProfileId> {
+        let profiles = &self.snapshot.profiles;
+        let live = |id: &ProfileId| {
+            self.snapshot.connections.iter().any(|c| {
+                &c.profile == id && matches!(c.status, ConnStatus::Connecting | ConnStatus::Ready)
+            })
+        };
+        profiles
+            .iter()
+            .find(|p| !live(&p.id))
+            .or_else(|| profiles.first())
+            .map(|p| p.id.clone())
+    }
+
     fn node(&self, index: usize) -> Option<&VisibleNode> {
         let conn = self.connection?;
         self.snapshot.tree(conn)?.get(index)
@@ -552,7 +577,10 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
         IntentKind::DismissModal => vec![ViewCmd::DismissModal.into()],
 
-        IntentKind::Connect => vec![Action::Connect(sqlake_core::DriverKind::Mock).into()],
+        IntentKind::Connect => ctx
+            .connectable_profile()
+            .map(|id| vec![Action::Connect(id).into()])
+            .unwrap_or_default(),
         IntentKind::Disconnect => ctx
             .connection
             .map(|c| vec![Action::Disconnect(c).into()])
@@ -627,6 +655,7 @@ fn neighbouring_tab(ctx: &InputContext<'_>, backwards: bool) -> Option<TabId> {
 
 #[cfg(test)]
 mod tests {
+    use sqlake_driver_mock::mock_summary;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -674,8 +703,10 @@ mod tests {
 
         Snapshot {
             rev: 1,
+            profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![ConnectionView {
                 id: conn,
+                profile: mock_summary("mock").id,
                 name: "mock".into(),
                 kind: DriverKind::Mock,
                 status: ConnStatus::Ready,
@@ -1168,6 +1199,50 @@ mod tests {
         ] {
             assert!(on_key(press(code), &c).is_empty(), "{code:?}");
         }
+    }
+
+    #[test]
+    fn connecting_walks_the_profiles_and_can_reopen_a_closed_one() {
+        let mut snap = snapshot();
+        snap.profiles = Arc::new(vec![mock_summary("replica"), mock_summary("staging")]);
+        snap.connections[0].profile = mock_summary("replica").id;
+
+        // `replica` is open, so `c` reaches for the one that is not.
+        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        assert_eq!(
+            out,
+            [Intent::App(Action::Connect(mock_summary("staging").id))]
+        );
+
+        // Still opening counts as open. Otherwise a second press while the
+        // first connection is still on its way opens a duplicate of it rather
+        // than moving on to the profile that has nothing.
+        snap.connections[0].status = ConnStatus::Connecting;
+        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        assert_eq!(
+            out,
+            [Intent::App(Action::Connect(mock_summary("staging").id))]
+        );
+
+        // Closing a connection leaves its row behind, and a row is not a
+        // connection: `c` has to be able to open `replica` again rather than
+        // skipping past it for ever.
+        snap.connections[0].status = ConnStatus::Closed;
+        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        assert_eq!(
+            out,
+            [Intent::App(Action::Connect(mock_summary("replica").id))]
+        );
+
+        // The same profile twice is a second window onto one database, so the
+        // key never goes dead once everything is open.
+        snap.connections[0].status = ConnStatus::Ready;
+        snap.profiles = Arc::new(vec![mock_summary("replica")]);
+        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        assert_eq!(
+            out,
+            [Intent::App(Action::Connect(mock_summary("replica").id))]
+        );
     }
 
     // ── the rule this whole module exists to keep ──────────────────────────

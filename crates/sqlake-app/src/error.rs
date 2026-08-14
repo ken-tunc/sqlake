@@ -17,6 +17,12 @@ pub enum AppError {
     #[error("no driver registered for {0}")]
     UnknownDriver(&'static str),
 
+    /// The profile could not be turned into something connectable: it does not
+    /// exist, or its secret could not be read. The message comes from whatever
+    /// implements `Profiles` and is already written for the person reading it.
+    #[error("{0}")]
+    Profile(String),
+
     #[error("no such connection")]
     UnknownConnection,
 

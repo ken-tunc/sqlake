@@ -110,13 +110,13 @@ async fn run(session: Box<dyn Session>, mut rx: mpsc::Receiver<SessionCmd>) {
 mod tests {
     use sqlake_core::driver::Driver;
     use sqlake_core::node::NodeKind;
-    use sqlake_driver_mock::{Behaviour, MockDriver};
+    use sqlake_driver_mock::{Behaviour, MockDriver, mock_profile};
 
     use super::*;
 
     async fn handle() -> SessionHandle {
         let driver = MockDriver::new(Behaviour::instant());
-        SessionHandle::spawn(driver.connect().await.unwrap())
+        SessionHandle::spawn(driver.connect(&mock_profile("mock")).await.unwrap())
     }
 
     #[tokio::test]
@@ -139,7 +139,7 @@ mod tests {
             failing_nodes: vec![vec!["restricted".to_owned()]],
             ..Behaviour::instant()
         });
-        let h = SessionHandle::spawn(driver.connect().await.unwrap());
+        let h = SessionHandle::spawn(driver.connect(&mock_profile("mock")).await.unwrap());
         let node = NodeRef::new(NodeKind::Namespace, ["restricted"]);
         let err = h.children(node).await.unwrap_err();
         assert!(matches!(err, AppError::Driver(_)), "{err:?}");

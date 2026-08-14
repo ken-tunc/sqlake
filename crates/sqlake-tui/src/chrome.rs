@@ -324,7 +324,9 @@ pub(crate) fn fit(text: &str, max: u16) -> String {
 
 #[cfg(test)]
 mod tests {
+    use sqlake_driver_mock::mock_summary;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Instant;
 
     use ratatui::Terminal;
@@ -344,8 +346,10 @@ mod tests {
         let conn = ConnId::new();
         Snapshot {
             rev: 1,
+            profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![ConnectionView {
                 id: conn,
+                profile: mock_summary("mock").id,
                 name: "mock".into(),
                 kind: DriverKind::Mock,
                 status: ConnStatus::Ready,

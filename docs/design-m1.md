@@ -41,10 +41,13 @@ to connect, and a driver depends only on `sqlake-core`. Putting it in `sqlake-co
 make every driver depend on the *file format*, which is a decision about TOML, not about
 databases. `sqlake-config` owns `Profile` — the shape on disk — and owns the conversion.
 
-**D2 — the driver registry is keyed by profile, not by driver kind.** `Drivers` maps
-`DriverKind → Arc<dyn Driver>` today, which cannot express two PostgreSQL connections at once,
-and two is the normal case (a replica and a staging box). `Action::Connect` carries a
-`ProfileId` from M1 on, as `action.rs` already says it will.
+**D2 — a driver is per kind; a connection is per profile.** The registry stays
+`DriverKind → Arc<dyn Driver>`, because that is what a driver is: one PostgreSQL driver serves
+every PostgreSQL profile there is. What could not express two connections was
+`Driver::connect()` taking no parameters and `Action::Connect` naming a *kind* — so the
+parameters move into `connect(&ResolvedProfile)` and the action carries a `ProfileId`, as
+`action.rs` always said it would. Two connections may even name the same profile: that is a
+second window onto one database, not a collision.
 
 **D3 — the PostgreSQL driver implements `children` and `preview` in M1, not M2.** They are the
 only way to know a connection actually works: the store calls `children` during `Connect`, so
