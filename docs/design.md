@@ -287,7 +287,7 @@ id = "bq-analytics"
 driver = "bigquery"
 project = "my-project"
 location = "asia-northeast1"
-auth = { adc = true }           # or { service_account = "~/.config/.../sa.json" }
+auth = { adc = true }           # or { service_account = "/home/me/.config/.../sa.json" }
 max_bytes_billed = "20GB"       # queries above this are refused
 ```
 

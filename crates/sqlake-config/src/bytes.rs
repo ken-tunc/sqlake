@@ -5,11 +5,10 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 
 /// A size in bytes, parsed from a string like `20GB` or `1.5TiB`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ByteSize(u64);
 
 impl ByteSize {
@@ -76,6 +75,43 @@ impl TryFrom<String> for ByteSize {
     }
 }
 
+/// Written by hand rather than derived, so that both forms a person might
+/// write are accepted.
+///
+/// `"20GB"` is the form worth encouraging and the one the module argues for,
+/// but `max_bytes_billed = 20000000000` is a reasonable thing to type — and
+/// `invalid type: integer, expected a string` is not a reasonable thing to say
+/// back about it.
+impl<'de> serde::Deserialize<'de> for ByteSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AnySize;
+
+        impl Visitor<'_> for AnySize {
+            type Value = ByteSize;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a size like \"20GB\", or a number of bytes")
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                ByteSize::parse(text).map_err(E::custom)
+            }
+
+            /// TOML has one integer type and it is signed, so this is the only
+            /// arm a number ever arrives through. There is no `visit_u64`
+            /// beside it: it would never be called, and an arm no test can
+            /// reach is an arm nobody is checking.
+            fn visit_i64<E: de::Error>(self, bytes: i64) -> Result<Self::Value, E> {
+                u64::try_from(bytes)
+                    .map(ByteSize)
+                    .map_err(|_| E::custom(format!("`{bytes}` is not a size")))
+            }
+        }
+
+        deserializer.deserialize_any(AnySize)
+    }
+}
+
 impl fmt::Display for ByteSize {
     /// The largest unit that leaves a whole number, so a round-trip through the
     /// config file reads the way it was written.
@@ -137,6 +173,24 @@ mod tests {
         assert!(err.contains('G'), "{err}");
         assert!(ByteSize::parse("twenty").is_err());
         assert!(ByteSize::parse("-1GB").is_err());
+    }
+
+    #[test]
+    fn both_forms_a_person_might_write_are_read() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Budget {
+            max: ByteSize,
+        }
+
+        let quoted: Budget = toml::from_str(r#"max = "20GB""#).expect("a string size");
+        let bare: Budget = toml::from_str("max = 20000000000").expect("a number of bytes");
+        assert_eq!(quoted.max, bare.max);
+
+        // A negative budget is a number, and still not a size.
+        let err = toml::from_str::<Budget>("max = -1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a size"), "{err}");
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::error::{ConfigError, ConfigResult};
 pub struct ProfileId(String);
 
 impl ProfileId {
-    /// Letters, digits, `-`, `_` and `.`, and at least one of them.
+    /// Letters, digits, `-`, `_` and `.`, and at least one that is not a dot.
     pub fn parse(text: &str) -> Result<Self, String> {
         if text.is_empty() {
             return Err("an id cannot be empty".into());
@@ -40,6 +40,11 @@ impl ProfileId {
             return Err(format!(
                 "`{text}` contains `{bad}`; ids are letters, digits, `-`, `_` and `.`"
             ));
+        }
+        // `.` and `..` pass the character test and then name a directory rather
+        // than a connection anywhere an id becomes part of a path.
+        if text.chars().all(|c| c == '.') {
+            return Err(format!("`{text}` is not an id; it is a directory"));
         }
         Ok(Self(text.to_owned()))
     }
@@ -236,7 +241,11 @@ impl RawConnection {
         };
 
         Ok(Profile {
-            name: self.name.unwrap_or_else(|| id.as_str().to_owned()),
+            // `name = ""` is the blank tab the id fallback exists to prevent.
+            name: self
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| id.as_str().to_owned()),
             id,
             driver,
             readonly: self.readonly.unwrap_or(false),
@@ -261,7 +270,18 @@ impl RawConnection {
 
         Ok(DriverConfig::Postgres(PostgresConfig {
             host: required(self.host.clone(), path, id, "host")?,
-            port: self.port.unwrap_or(PostgresConfig::DEFAULT_PORT),
+            port: match self.port {
+                // Port 0 means "any free port" to a listener and nothing at all
+                // to a client, so it is a typo every time it appears here.
+                Some(0) => {
+                    return Err(ConfigError::invalid(
+                        path,
+                        format!("connection `{id}`: `port = 0` is not a port"),
+                    ));
+                }
+                Some(port) => port,
+                None => PostgresConfig::DEFAULT_PORT,
+            },
             database: required(self.database.clone(), path, id, "database")?,
             user: required(self.user.clone(), path, id, "user")?,
             // libpq's own default, so a profile that says nothing behaves the
@@ -304,18 +324,35 @@ impl RawConnection {
                 ));
             }
             Some(RawAuth::ServiceAccount(file)) => {
-                if file.starts_with("~") {
+                // Covers `~/keys/sa.json` and `keys/sa.json` alike: the first is
+                // a shell expansion sqlake does not perform, the second resolves
+                // against whichever directory sqlake happened to be started in.
+                if !file.is_absolute() {
                     return Err(ConfigError::invalid(
                         path,
                         format!(
                             "connection `{id}`: write `service_account` as a full path — \
-                             `~` is expanded by a shell, and sqlake is not one"
+                             `~` is expanded by a shell and sqlake is not one, and a \
+                             relative path depends on where sqlake was started"
                         ),
                     ));
                 }
                 BigQueryAuth::ServiceAccount(file.clone())
             }
         };
+
+        if self
+            .max_bytes_billed
+            .is_some_and(|budget| budget.get() == 0)
+        {
+            return Err(ConfigError::invalid(
+                path,
+                format!(
+                    "connection `{id}`: `max_bytes_billed = \"0\"` refuses every query; \
+                     remove the key to leave the budget to the project"
+                ),
+            ));
+        }
 
         Ok(DriverConfig::BigQuery(BigQueryConfig {
             project: required(self.project.clone(), path, id, "project")?,
@@ -387,8 +424,23 @@ impl RawSecret {
     }
 }
 
-fn required<T>(value: Option<T>, path: &Path, id: &ProfileId, key: &str) -> ConfigResult<T> {
-    value.ok_or_else(|| ConfigError::invalid(path, format!("connection `{id}` needs `{key}`")))
+/// A key that has to be there, and has to say something.
+///
+/// `host = ""` is a half-filled template, not a host called nothing: accepting
+/// it trades this message for whatever the driver says when it fails to connect
+/// to the empty string, which is a worse message about a worse problem.
+fn required(value: Option<String>, path: &Path, id: &ProfileId, key: &str) -> ConfigResult<String> {
+    match value {
+        Some(text) if !text.trim().is_empty() => Ok(text),
+        Some(_) => Err(ConfigError::invalid(
+            path,
+            format!("connection `{id}`: `{key}` is empty"),
+        )),
+        None => Err(ConfigError::invalid(
+            path,
+            format!("connection `{id}` needs `{key}`"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -538,6 +590,65 @@ mod tests {
         assert!(ProfileId::parse("").is_err());
         assert!(ProfileId::parse("prod pg").is_err());
         assert!(ProfileId::parse("prod/pg").is_err());
+        // Dots are allowed, but an id of nothing else names a directory.
+        assert!(ProfileId::parse("db.prod").is_ok());
+        assert!(ProfileId::parse(".").is_err());
+        assert!(ProfileId::parse("..").is_err());
+    }
+
+    #[test]
+    fn a_key_that_is_present_but_empty_is_not_an_answer() {
+        // `host = ""` otherwise reaches the driver, which reports a failure to
+        // connect to nowhere instead of a config file that is half filled in.
+        let err = why(r#"
+            [[connection]]
+            id = "prod-pg"
+            driver = "postgres"
+            host = ""
+            database = "app"
+            user = "readonly"
+        "#);
+        assert!(err.contains("host"), "{err}");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_name_falls_back_to_the_id() {
+        // The same blank tab the id fallback exists to prevent.
+        assert_eq!(one(&format!("{PG}\nname = \"\"")).name, "prod-pg");
+    }
+
+    #[test]
+    fn port_zero_is_a_typo_not_a_port() {
+        let err = why(&format!("{PG}\nport = 0"));
+        assert!(err.contains("port"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_service_account_path_is_refused_too() {
+        // It would resolve against whatever directory sqlake was started in.
+        let err = why(r#"
+            [[connection]]
+            id = "bq"
+            driver = "bigquery"
+            project = "p"
+            auth = { service_account = "keys/sa.json" }
+        "#);
+        assert!(err.contains("full path"), "{err}");
+    }
+
+    #[test]
+    fn a_budget_of_zero_is_refused() {
+        // It would refuse every query, which reads as sqlake being broken
+        // rather than as the budget being the thing that is wrong.
+        let err = why(r#"
+            [[connection]]
+            id = "bq"
+            driver = "bigquery"
+            project = "p"
+            max_bytes_billed = "0"
+        "#);
+        assert!(err.contains("max_bytes_billed"), "{err}");
     }
 
     #[test]
