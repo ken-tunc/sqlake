@@ -24,6 +24,22 @@ use crate::ui::GridUi;
 /// One blank column between neighbours, so values do not touch.
 const GAP: u16 = 1;
 
+/// The rows of the grid: the pane's inside without the header row or the
+/// column the scrollbar keeps.
+///
+/// The caller records *this* as the pane's viewport. Measured against the pane
+/// instead, a page is one row too tall and `ScrollToEnd` stops a row short of
+/// the end, so the last row of a relation can never be reached.
+#[must_use]
+pub fn body_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1),
+    )
+}
+
 /// Draw the preview into `area`, the inside of the grid pane.
 ///
 /// `ui` is taken mutably because the rendered grid is built here, from the rows
