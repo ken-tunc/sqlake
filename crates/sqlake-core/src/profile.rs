@@ -97,10 +97,13 @@ impl SslMode {
         }
     }
 
-    /// The five libpq spellings, and nothing else.
+    /// The libpq spellings sqlake implements, and nothing else.
     ///
     /// The error lists them all, because the mode someone meant is always one
-    /// of five and never worth guessing.
+    /// of them and never worth guessing. libpq has a sixth — `allow`, which
+    /// tries plaintext first — and it gets its own message: someone who copied
+    /// it out of a working connection string must not be told it is not an
+    /// sslmode, because it is.
     pub fn parse(text: &str) -> Result<Self, String> {
         Ok(match text {
             "disable" => Self::Disable,
@@ -108,6 +111,11 @@ impl SslMode {
             "require" => Self::Require,
             "verify-ca" => Self::VerifyCa,
             "verify-full" => Self::VerifyFull,
+            "allow" => {
+                return Err("`allow` is a libpq sslmode sqlake does not implement; \
+                            `prefer` negotiates the same two outcomes, TLS first"
+                    .to_owned());
+            }
             other => {
                 return Err(format!(
                     "`{other}` is not an sslmode; \
@@ -173,6 +181,15 @@ mod tests {
         ] {
             assert_eq!(SslMode::parse(mode.as_str()), Ok(mode));
         }
+    }
+
+    #[test]
+    fn libpqs_sixth_mode_is_refused_as_itself() {
+        // `allow` is a real sslmode, so telling someone who copied it out of a
+        // working connection string that it is not one would be a lie.
+        let err = SslMode::parse("allow").unwrap_err();
+        assert!(err.contains("does not implement"), "{err}");
+        assert!(!err.contains("is not an sslmode"), "{err}");
     }
 
     #[test]

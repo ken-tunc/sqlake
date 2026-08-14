@@ -540,15 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn an_id_has_to_survive_a_command_line_and_a_keyring_entry() {
-        assert!(ProfileId::parse("prod-pg").is_ok());
-        assert!(ProfileId::parse("").is_err());
-        assert!(ProfileId::parse("prod pg").is_err());
-        assert!(ProfileId::parse("prod/pg").is_err());
-        // Dots are allowed, but an id of nothing else names a directory.
-        assert!(ProfileId::parse("db.prod").is_ok());
-        assert!(ProfileId::parse(".").is_err());
-        assert!(ProfileId::parse("..").is_err());
+    fn an_unusable_id_names_the_file_it_came_from() {
+        // What makes an id valid is `ProfileId`'s own test; what this one
+        // covers is that a bad one is reported as a config error rather than
+        // panicking somewhere below.
+        let err = why(&PG.replace("prod-pg", "prod pg"));
+        assert!(err.contains("connections.toml"), "{err}");
+        assert!(err.contains("prod pg"), "{err}");
     }
 
     #[test]

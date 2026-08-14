@@ -16,6 +16,7 @@ serde.workspace = true
 sqlake-core.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

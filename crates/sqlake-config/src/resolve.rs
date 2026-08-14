@@ -16,6 +16,7 @@ use std::process::Command;
 use sqlake_core::id::ProfileId;
 use sqlake_core::profile::{Params, PostgresParams, ResolvedProfile};
 use sqlake_core::secret::Secret;
+use zeroize::Zeroize as _;
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::profile::{DriverConfig, Profile, SecretRef};
@@ -47,15 +48,29 @@ impl Keyring for OsKeyring {
             .get_password()
             .map(Secret::new)
             .map_err(|err| match err {
-                keyring::Error::NoEntry => secret_error(
-                    profile,
-                    format!(
-                        "no keyring entry. Store one with: \
-                         security add-generic-password -s {KEYRING_SERVICE} -a {profile} -w"
-                    ),
-                ),
+                keyring::Error::NoEntry => secret_error(profile, no_keyring_entry(profile)),
                 other => secret_error(profile, format!("reading the keyring: {other}")),
             })
+    }
+}
+
+/// Why there was nothing to read, and how to put an entry where
+/// [`OsKeyring`] will look for it.
+///
+/// `security` is macOS' own tool and exists nowhere else, so every other
+/// platform is told what to store rather than which command to type — a
+/// command that does not exist is a worse answer than no command.
+fn no_keyring_entry(profile: &ProfileId) -> String {
+    if cfg!(target_os = "macos") {
+        format!(
+            "no keyring entry. Store one with: \
+             security add-generic-password -s {KEYRING_SERVICE} -a {profile} -w"
+        )
+    } else {
+        format!(
+            "no keyring entry. Store one in the platform credential store \
+             under service `{KEYRING_SERVICE}`, account `{profile}`"
+        )
     }
 }
 
@@ -127,6 +142,12 @@ fn from_command(command: &str, profile: &ProfileId) -> ConfigResult<Secret> {
         .output()
         .map_err(|err| secret_error(profile, format!("running the password command: {err}")))?;
 
+    // Whatever it printed is the password until proven otherwise, so every
+    // path out of here wipes the buffer rather than dropping it: a helper that
+    // prints the secret and *then* fails is the ordinary case, not an exotic
+    // one, and `Secret` cannot protect bytes it never held.
+    let mut stdout = output.stdout;
+
     if !output.status.success() {
         // Deliberately without the command's stderr. It is the obvious thing
         // to include and it is a hole in the one guarantee this module makes:
@@ -134,6 +155,7 @@ fn from_command(command: &str, profile: &ProfileId) -> ConfigResult<Secret> {
         // its input on the way out — would put the password in the log, and no
         // type can stop it once the bytes are in a message. The user owns the
         // command line, so they can run it and read the message themselves.
+        stdout.zeroize();
         let status = output
             .status
             .code()
@@ -144,13 +166,25 @@ fn from_command(command: &str, profile: &ProfileId) -> ConfigResult<Secret> {
         ));
     }
 
-    let mut text = String::from_utf8(output.stdout)
-        .map_err(|_| secret_error(profile, "the password command produced no text".to_owned()))?;
-    // Only the trailing newline the command's own `println` added — a password
-    // is allowed to begin or end with a space, and trimming both ends would
-    // silently produce a different password than the one that is stored.
-    while text.ends_with('\n') || text.ends_with('\r') {
+    let mut text = match String::from_utf8(stdout) {
+        Ok(text) => text,
+        Err(err) => {
+            err.into_bytes().zeroize();
+            return Err(secret_error(
+                profile,
+                "the password command printed bytes that are not text".to_owned(),
+            ));
+        }
+    };
+    // Only the line ending the command's own `println` added, and only one of
+    // them — a password is allowed to begin or end with a space, and trimming
+    // any further would silently produce a different password than the one
+    // that is stored.
+    if text.ends_with('\n') {
         text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
     }
     Ok(Secret::new(text))
 }
@@ -244,8 +278,23 @@ mod tests {
         // and trimming both ends would quietly use a different password than
         // the one that is stored.
         let profile = profile_with(Some(SecretRef::Command("printf ' hunter2 \\n'".to_owned())));
-        let resolved = resolved(&profile).expect("should resolve");
-        assert_eq!(password_of(&resolved), Some(" hunter2 "));
+        let spaces = resolved(&profile).expect("should resolve");
+        assert_eq!(password_of(&spaces), Some(" hunter2 "));
+
+        // One line ending, not every one: a second newline is part of the
+        // password, and eating it is the same silent substitution.
+        let profile = profile_with(Some(SecretRef::Command(
+            "printf 'hunter2\\n\\n'".to_owned(),
+        )));
+        let two = resolved(&profile).expect("should resolve");
+        assert_eq!(password_of(&two), Some("hunter2\n"));
+
+        // A CRLF is one line ending too.
+        let profile = profile_with(Some(SecretRef::Command(
+            "printf 'hunter2\\r\\n'".to_owned(),
+        )));
+        let crlf = resolved(&profile).expect("should resolve");
+        assert_eq!(password_of(&crlf), Some("hunter2"));
     }
 
     #[test]
