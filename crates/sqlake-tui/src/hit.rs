@@ -25,9 +25,12 @@ pub const Z_MENU: u8 = 110;
 
 /// The panes M0 has. A fixed set, not a generated id: there are four of them
 /// and they never change at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PaneId {
     TabBar,
+    /// Where focus starts: it is the only pane with anything in it before a
+    /// table is opened.
+    #[default]
     Explorer,
     Grid,
     StatusBar,
