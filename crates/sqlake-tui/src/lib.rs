@@ -18,6 +18,7 @@ pub mod input;
 pub mod intent;
 pub mod mouse;
 pub mod terminal;
+pub mod tree;
 pub mod ui;
 
 pub use chrome::{Frames, layout};
