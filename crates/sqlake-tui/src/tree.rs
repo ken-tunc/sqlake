@@ -50,7 +50,7 @@ pub fn render(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, view: &TreeV
     };
 
     let height = rows_area.height as usize;
-    for (line, index) in (ui.offset..view.len().min(ui.offset + height)).enumerate() {
+    for (line, index) in (ui.offset..view.len().min(ui.offset.saturating_add(height))).enumerate() {
         let Some(node) = view.get(index) else {
             break;
         };
@@ -98,23 +98,34 @@ fn render_row(
         Style::new()
     };
 
+    // The icon is dimmer than the label, but dark grey on the selection's dark
+    // grey background is the same colour: the kind of a row would disappear the
+    // moment it was picked.
+    let dim = if selected {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    };
+    let icon = icon(node.relation_kind);
+    let label = sanitise(&node.label);
+
     let mut spans = vec![
         Span::styled(" ".repeat(indent as usize), base),
         Span::styled(glyph, glyph_style.patch(base)),
-        Span::styled(icon(node.relation_kind), base.fg(Color::DarkGray)),
+        Span::styled(icon, base.fg(dim)),
     ];
 
-    let used = indent + TOGGLE_WIDTH + display_width(icon(node.relation_kind));
+    let used = indent + TOGGLE_WIDTH + display_width(icon);
     let room = row.width.saturating_sub(used);
     spans.push(Span::styled(
-        chrome::fit(&sanitise(&node.label), room),
+        chrome::fit(&label, room),
         base.fg(label_colour(&node.state)),
     ));
 
     if let NodeState::Failed(message) = &node.state {
         // The reason belongs on the row that failed. A toast would be gone by
         // the time the user looks, and the node would just sit there.
-        let so_far = used + display_width(&sanitise(&node.label));
+        let so_far = used + display_width(&label);
         let left = row.width.saturating_sub(so_far);
         if left > 3 {
             spans.push(Span::styled(
@@ -162,6 +173,7 @@ const fn label_colour(state: &NodeState) -> Color {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::layout::Position;
     use sqlake_core::node::{NodeKind, NodeRef};
 
@@ -184,20 +196,32 @@ mod tests {
         }
     }
 
-    fn draw(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (String, HitMap) {
+    /// The screen as one string per row. Whether a row was cut to the pane is
+    /// only answerable per row: run together, an overflowing row is
+    /// indistinguishable from the one below it.
+    ///
+    /// One char per cell, so a char index is a column: the trailing cell of a
+    /// double-width glyph holds a space of its own.
+    fn draw_rows(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (Vec<String>, HitMap) {
+        let (buffer, hits) = draw_buffer(view, ui, w, h);
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (rows, hits)
+    }
+
+    fn draw_buffer(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (Buffer, HitMap) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitMap::new();
         terminal
             .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), view, ui))
             .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect();
-        (text, hits)
+        (terminal.backend().buffer().clone(), hits)
+    }
+
+    fn draw(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (String, HitMap) {
+        let (rows, hits) = draw_rows(view, ui, w, h);
+        (rows.concat(), hits)
     }
 
     fn tree(nodes: Vec<VisibleNode>) -> TreeView {
@@ -328,21 +352,32 @@ mod tests {
             "a_very_long_relation_name_indeed",
             NodeState::Collapsed,
         )]);
-        let (text, _) = draw(&view, &TreeUi::default(), 16, 3);
-        let first: String = text.chars().take(16).collect();
+        let (rows, _) = draw_rows(&view, &TreeUi::default(), 16, 3);
+        let first: Vec<char> = rows[0].chars().collect();
+        // Cut with an ellipsis rather than run off the edge and clipped: the
+        // ellipsis is what says the name goes on.
+        assert_eq!(first[14], '…', "{:?}", rows[0]);
         assert_eq!(
-            first.chars().count(),
-            16,
-            "no row may be wider than the pane"
+            first[15], ' ',
+            "the scrollbar's column is not the label's to use: {:?}",
+            rows[0]
         );
     }
 
     #[test]
     fn a_double_width_label_still_fits_the_pane() {
         let view = tree(vec![node(0, "ユーザー情報テーブル", NodeState::Collapsed)]);
-        let (_, hits) = draw(&view, &TreeUi::default(), 20, 3);
-        // Measuring in characters would run the label two cells past the edge
-        // and push the scrollbar off the pane.
+        let (rows, hits) = draw_rows(&view, &TreeUi::default(), 20, 3);
+        // Ten characters, twenty columns. Measuring the label in characters
+        // would keep four more of them than fit and run it past the edge, so
+        // the ellipsis has to land in the last column the rows own.
+        let first: Vec<char> = rows[0].chars().collect();
+        assert_eq!(first[18], '…', "{:?}", rows[0]);
+        assert_eq!(
+            first[19], ' ',
+            "the scrollbar's column is not the label's to use: {:?}",
+            rows[0]
+        );
         assert_eq!(
             hits.at(Position::new(19, 0)),
             None,
@@ -368,17 +403,27 @@ mod tests {
             offset: 0,
             selected: Some(1),
         };
-        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
-        let mut hits = HitMap::new();
-        terminal
-            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, 20, 3), &view, &ui))
-            .unwrap();
-
-        let buffer = terminal.backend().buffer();
+        let (buffer, _) = draw_buffer(&view, &ui, 20, 3);
         assert_ne!(
             buffer[(0, 0)].style().bg,
             buffer[(0, 1)].style().bg,
             "the selection has to be visible, not just recorded"
+        );
+    }
+
+    #[test]
+    fn a_selected_row_does_not_paint_over_its_own_icon() {
+        let view = tree(vec![relation(0, "users")]);
+        let ui = TreeUi {
+            offset: 0,
+            selected: Some(0),
+        };
+        let (buffer, _) = draw_buffer(&view, &ui, 20, 3);
+        // The icon follows the two-cell toggle, so it starts at column two.
+        let icon = buffer[(2, 0)].style();
+        assert_ne!(
+            icon.fg, icon.bg,
+            "an icon the colour of the row it sits on is not drawn at all"
         );
     }
 
