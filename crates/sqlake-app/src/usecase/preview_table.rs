@@ -50,14 +50,14 @@ impl UseCase for PreviewTable {
 mod tests {
     use sqlake_core::driver::Driver;
     use sqlake_core::result::{Sort, SortDir};
-    use sqlake_driver_mock::{Behaviour, MockDriver};
+    use sqlake_driver_mock::{Behaviour, MockDriver, mock_profile};
 
     use super::*;
 
     async fn use_case(behaviour: Behaviour) -> PreviewTable {
         let driver = MockDriver::new(behaviour);
         PreviewTable {
-            session: SessionHandle::spawn(driver.connect().await.unwrap()),
+            session: SessionHandle::spawn(driver.connect(&mock_profile("mock")).await.unwrap()),
         }
     }
 

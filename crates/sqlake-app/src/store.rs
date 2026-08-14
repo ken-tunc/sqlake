@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
-use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::{NodeRef, TableRef};
+use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
@@ -70,13 +71,18 @@ pub struct Store {
 
 impl Store {
     #[must_use]
-    pub fn spawn(drivers: Drivers) -> Self {
+    pub fn spawn(drivers: Drivers, profiles: Arc<dyn Profiles>) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(Snapshot::default()));
 
         let runtime = Runtime {
             drivers,
+            // Read once, at startup. Editing `connections.toml` while the
+            // client is running is a reload, and a reload is a feature with
+            // its own questions — not a thing to do silently on every frame.
+            profile_list: Arc::new(profiles.list()),
+            profiles,
             events: event_tx,
             conns: Vec::new(),
             tabs: Vec::new(),
@@ -144,6 +150,10 @@ enum Event {
 #[derive(Debug)]
 struct Conn {
     id: ConnId,
+    /// Which profile this connection was opened from. Two connections can
+    /// share one, which is what makes a second window onto the same database
+    /// possible rather than a name collision.
+    profile: ProfileId,
     name: String,
     kind: DriverKind,
     status: ConnStatus,
@@ -185,6 +195,8 @@ struct Tab {
 
 struct Runtime {
     drivers: Drivers,
+    profiles: Arc<dyn Profiles>,
+    profile_list: Arc<Vec<ProfileSummary>>,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     tabs: Vec<Tab>,
@@ -294,7 +306,7 @@ impl Runtime {
 
     fn apply(&mut self, action: Action) {
         match action {
-            Action::Connect(kind) => self.connect(kind),
+            Action::Connect(profile) => self.connect(&profile),
             Action::Disconnect(id) => self.disconnect(id),
             Action::ToggleNode { conn, node } => self.toggle_node(conn, node),
             Action::PreviewTable { conn, table } => self.preview_table(conn, table),
@@ -312,8 +324,15 @@ impl Runtime {
         }
     }
 
-    fn connect(&mut self, kind: DriverKind) {
-        let driver = match self.drivers.get(kind) {
+    fn connect(&mut self, profile: &ProfileId) {
+        // The summary answers both questions a connection needs before its
+        // secret has been read: what to call it, and which driver it wants.
+        let Some(summary) = self.profile_list.iter().find(|p| &p.id == profile).cloned() else {
+            self.toast(Severity::Error, format!("no profile called `{profile}`"));
+            return;
+        };
+
+        let driver = match self.drivers.get(summary.kind) {
             Ok(d) => d,
             Err(err) => {
                 self.toast(Severity::Error, err.user_message());
@@ -322,11 +341,12 @@ impl Runtime {
         };
 
         let id = ConnId::new();
-        let name = kind.as_str().to_owned();
+        let name = summary.name.clone();
         self.conns.push(Conn {
             id,
+            profile: summary.id.clone(),
             name: name.clone(),
-            kind,
+            kind: summary.kind,
             status: ConnStatus::Connecting,
             capabilities: None,
             session: None,
@@ -336,8 +356,12 @@ impl Runtime {
 
         let busy = self.begin_busy(BusyOwner::Connection(id), format!("connecting to {name}"));
         let events = self.events.clone();
+        let profiles = Arc::clone(&self.profiles);
+        let profile = summary.id;
         self.spawn_task(busy, async move {
-            let result = Connect { driver }.execute(ConnectInput { name }).await;
+            let result = Connect { driver, profiles }
+                .execute(ConnectInput { profile, name })
+                .await;
             let _ = events.send(Event::Connected {
                 conn: id,
                 busy,
@@ -756,11 +780,13 @@ impl Runtime {
         self.rev += 1;
         Snapshot {
             rev: self.rev,
+            profiles: Arc::clone(&self.profile_list),
             connections: self
                 .conns
                 .iter()
                 .map(|c| ConnectionView {
                     id: c.id,
+                    profile: c.profile.clone(),
                     name: c.name.clone(),
                     kind: c.kind,
                     status: c.status.clone(),
@@ -799,14 +825,43 @@ impl Runtime {
 mod tests {
     use sqlake_core::node::NodeKind;
     use sqlake_core::value::Value;
-    use sqlake_driver_mock::{Behaviour, MockDriver};
+    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
     use tokio::sync::watch::Receiver;
 
     use super::*;
     use crate::tree::NodeState;
 
     fn store(behaviour: Behaviour) -> Store {
-        Store::spawn(Drivers::new().with(Arc::new(MockDriver::new(behaviour))))
+        Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
+            Arc::new(MockProfiles::default()),
+        )
+    }
+
+    fn pid(id: &str) -> ProfileId {
+        ProfileId::parse(id).expect("a usable id")
+    }
+
+    /// A profile whose driver is deliberately not registered.
+    #[derive(Debug)]
+    struct UnservedProfile(DriverKind);
+
+    impl Profiles for UnservedProfile {
+        fn list(&self) -> Vec<ProfileSummary> {
+            vec![ProfileSummary {
+                id: pid("unserved"),
+                name: "unserved".to_owned(),
+                kind: self.0,
+            }]
+        }
+
+        fn resolve(
+            &self,
+            id: &ProfileId,
+        ) -> Result<sqlake_core::profile::ResolvedProfile, sqlake_core::profile::ProfileError>
+        {
+            Ok(sqlake_driver_mock::mock_profile(id.as_str()))
+        }
     }
 
     /// Wait until `predicate` holds, or fail. Snapshots arrive asynchronously,
@@ -833,7 +888,7 @@ mod tests {
     async fn connected_store() -> (Store, Receiver<Arc<Snapshot>>, ConnId) {
         let store = store(Behaviour::instant());
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
@@ -849,13 +904,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_profiles_of_one_kind_are_open_at_the_same_time() {
+        // The thing M0 could not express: `Drivers` was keyed by kind, so a
+        // replica and a staging box could not both be open. One driver serves
+        // both now, and what tells the connections apart is the profile each
+        // was opened from — including their trees, which are per connection
+        // and not per driver.
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::new(["replica", "staging"])),
+        );
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("replica")));
+        store.dispatch(Action::Connect(pid("staging")));
+
+        let snap = until(&mut rx, |s| {
+            s.connections.len() == 2 && s.connections.iter().all(ConnectionView::is_ready)
+        })
+        .await;
+
+        let profiles: Vec<&str> = snap
+            .connections
+            .iter()
+            .map(|c| c.profile.as_str())
+            .collect();
+        assert_eq!(profiles, ["replica", "staging"]);
+        assert_eq!(snap.connections[0].name, "replica");
+
+        // Two trees, not one shared by both — which only expanding a node can
+        // show. Asserting that both trees have rows passes just as happily
+        // when the second connection is handed the first one's tree.
+        let ids: Vec<ConnId> = snap.connections.iter().map(|c| c.id).collect();
+        assert_ne!(ids[0], ids[1]);
+        let before = snap.tree(ids[1]).expect("a tree").len();
+
+        store.dispatch(Action::ToggleNode {
+            conn: ids[0],
+            node: NodeRef::new(NodeKind::Namespace, ["public"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.tree(ids[0]).is_some_and(|t| t.len() > before)
+        })
+        .await;
+        assert_eq!(snap.tree(ids[1]).expect("a tree").len(), before);
+    }
+
+    #[tokio::test]
+    async fn one_profile_can_be_opened_twice() {
+        // A second window onto the same database is a real thing to want, so
+        // the profile is not an identity the store deduplicates on.
+        let store = store(Behaviour::instant());
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        store.dispatch(Action::Connect(pid("mock")));
+
+        let snap = until(&mut rx, |s| s.connections.len() == 2).await;
+        assert_ne!(snap.connections[0].id, snap.connections[1].id);
+        assert_eq!(snap.connections[0].profile, snap.connections[1].profile);
+    }
+
+    #[tokio::test]
+    async fn connecting_to_a_profile_nobody_configured_says_so() {
+        let store = store(Behaviour::instant());
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("typo")));
+
+        let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
+        assert!(snap.toasts[0].text.contains("typo"), "{:?}", snap.toasts[0]);
+        // No half-made connection row for something that cannot be opened.
+        assert!(snap.connections.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_connection_is_visible_while_it_is_still_opening() {
         let store = store(Behaviour {
             latency: std::time::Duration::from_millis(50),
             ..Behaviour::instant()
         });
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
 
         // The user must see that something is happening, with a way to stop it.
         let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
@@ -865,9 +992,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_connection_is_reported_on_the_connection_and_in_a_toast() {
-        let store = Store::spawn(Drivers::new());
+        let store = Store::spawn(
+            Drivers::new(),
+            Arc::new(UnservedProfile(DriverKind::Postgres)),
+        );
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Postgres));
+        store.dispatch(Action::Connect(pid("unserved")));
 
         let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
         assert_eq!(snap.toasts[0].severity, Severity::Error);
@@ -952,7 +1082,7 @@ mod tests {
             ..Behaviour::instant()
         });
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
@@ -1071,7 +1201,7 @@ mod tests {
             ..Behaviour::instant()
         });
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
@@ -1111,7 +1241,7 @@ mod tests {
             ..Behaviour::instant()
         });
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
@@ -1148,7 +1278,7 @@ mod tests {
             ..Behaviour::instant()
         });
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
         let conn = snap.connections[0].id;
 
@@ -1246,9 +1376,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_toast_can_be_dismissed() {
-        let store = Store::spawn(Drivers::new());
+        let store = Store::spawn(
+            Drivers::new(),
+            Arc::new(UnservedProfile(DriverKind::BigQuery)),
+        );
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::BigQuery));
+        store.dispatch(Action::Connect(pid("unserved")));
         let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
 
         store.dispatch(Action::DismissToast(snap.toasts[0].id));
@@ -1262,7 +1395,7 @@ mod tests {
             ..Behaviour::instant()
         });
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, Snapshot::is_busy).await;
 
         store.dispatch(Action::Cancel(snap.busy[0].id));

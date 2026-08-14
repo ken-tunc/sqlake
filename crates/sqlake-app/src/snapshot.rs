@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
-use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::{NodeRef, TableRef};
+use sqlake_core::profile::ProfileSummary;
 use sqlake_core::result::Sort;
 
 use crate::action::{BusyId, ToastId};
@@ -61,6 +62,8 @@ pub enum ConnStatus {
 #[derive(Debug, Clone)]
 pub struct ConnectionView {
     pub id: ConnId,
+    /// The profile this connection came from.
+    pub profile: ProfileId,
     pub name: String,
     pub kind: DriverKind,
     pub status: ConnStatus,
@@ -155,6 +158,9 @@ pub struct Snapshot {
     /// Increments on every publication. Useful in logs and tests; the UI
     /// redraws on channel notification, not on this.
     pub rev: u64,
+    /// Every configured profile, connected or not. Read once at startup, so
+    /// this is the same `Arc` in every snapshot until a reload exists.
+    pub profiles: Arc<Vec<ProfileSummary>>,
     pub connections: Vec<ConnectionView>,
     pub trees: HashMap<ConnId, Arc<TreeView>>,
     pub tabs: Vec<TabView>,
@@ -198,6 +204,7 @@ mod tests {
     fn conn(status: ConnStatus) -> ConnectionView {
         ConnectionView {
             id: ConnId::new(),
+            profile: ProfileId::parse("mock").expect("a usable id"),
             name: "mock".into(),
             kind: DriverKind::Mock,
             status,

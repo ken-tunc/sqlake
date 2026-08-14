@@ -6,8 +6,8 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
-use sqlake_core::capability::DriverKind;
-use sqlake_driver_mock::MockDriver;
+use sqlake_core::profile::Profiles as _;
+use sqlake_driver_mock::{MockDriver, MockProfiles};
 use sqlake_tui::terminal::{TerminalGuard, install_panic_hook};
 use tracing_subscriber::EnvFilter;
 
@@ -61,11 +61,19 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let store = runtime.block_on(async {
-        let store = Store::spawn(Drivers::new().with(std::sync::Arc::new(MockDriver::default())));
-        // M0 has one driver and no profiles, so the connection the user would
-        // have chosen is the only one there is. `sqlake-config` replaces this
-        // in M1.
-        store.dispatch(Action::Connect(DriverKind::Mock));
+        // Still the mock, and still the only profile there is. What changed is
+        // that it arrives as a profile rather than as a driver kind, so the
+        // path it takes is the path a real connection will take; T7 swaps this
+        // for the profiles in `connections.toml`.
+        let profiles = MockProfiles::default();
+        let first = profiles.list().first().map(|p| p.id.clone());
+        let store = Store::spawn(
+            Drivers::new().with(std::sync::Arc::new(MockDriver::default())),
+            std::sync::Arc::new(profiles),
+        );
+        if let Some(id) = first {
+            store.dispatch(Action::Connect(id));
+        }
         store
     });
 

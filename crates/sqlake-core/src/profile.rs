@@ -11,9 +11,59 @@
 //! arrives in M2; declaring it now would be a shape guessed months before
 //! anything constructs one.
 
+use std::fmt;
+
+use thiserror::Error;
+
 use crate::capability::DriverKind;
 use crate::id::ProfileId;
 use crate::secret::Secret;
+
+/// Where connection profiles come from.
+///
+/// The application layer holds one of these rather than reading files itself:
+/// a profile can come from `sqlake-config`, from a test, or from a `--mock`
+/// flag, and none of those belong in the store.
+///
+/// [`resolve`](Profiles::resolve) **blocks**. Reading a secret can talk to the
+/// OS keyring, which can put a dialog on the user's screen and wait for a
+/// fingerprint, so the caller runs it on a blocking task rather than this
+/// trait pretending the wait does not exist.
+pub trait Profiles: Send + Sync + fmt::Debug {
+    /// Every configured profile, in the order the user wrote them.
+    fn list(&self) -> Vec<ProfileSummary>;
+
+    /// Read the secret this profile names and hand back something connectable.
+    fn resolve(&self, id: &ProfileId) -> Result<ResolvedProfile, ProfileError>;
+}
+
+/// What is known about a profile without reading its secret.
+///
+/// Enough to show it, name it, and pick the driver it needs — all of which the
+/// UI wants before a keyring dialog has been answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub id: ProfileId,
+    /// What the UI calls it.
+    pub name: String,
+    pub kind: DriverKind,
+}
+
+/// Why a profile could not be turned into something connectable.
+///
+/// A string rather than a structured error: the causes live in
+/// `sqlake-config`, which this crate must not know about, and the message is
+/// already written for the person reading it.
+#[derive(Debug, Clone, Error)]
+#[error("{0}")]
+pub struct ProfileError(String);
+
+impl ProfileError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
 
 /// A profile with its secret resolved, ready to connect with.
 ///
@@ -34,6 +84,7 @@ impl ResolvedProfile {
     pub const fn kind(&self) -> DriverKind {
         match self.params {
             Params::Postgres(_) => DriverKind::Postgres,
+            Params::Mock => DriverKind::Mock,
         }
     }
 }
@@ -42,6 +93,10 @@ impl ResolvedProfile {
 #[derive(Debug, Clone)]
 pub enum Params {
     Postgres(PostgresParams),
+    /// The in-memory driver, which has nothing to connect to. It still arrives
+    /// as a profile, because the path a mock connection takes has to be the
+    /// path a real one takes or it is not testing it.
+    Mock,
 }
 
 #[derive(Debug, Clone)]

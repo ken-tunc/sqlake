@@ -11,8 +11,7 @@
 
 use std::fmt;
 
-use sqlake_core::capability::DriverKind;
-use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::{NodeRef, TableRef};
 
 /// Identifies one long-running operation, so it can be shown and cancelled.
@@ -48,9 +47,11 @@ impl ToastId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Open a connection. In M0 the driver is chosen directly; from M1 this
-    /// carries a profile id instead.
-    Connect(DriverKind),
+    /// Open a connection to a configured profile.
+    ///
+    /// Two connections may name the same profile: that is a second window onto
+    /// the same database, not a mistake to deduplicate.
+    Connect(ProfileId),
     Disconnect(ConnId),
 
     /// Expand or collapse a tree node, fetching its children if needed.

@@ -43,7 +43,7 @@ impl UseCase for ExpandNode {
 mod tests {
     use sqlake_core::driver::Driver;
     use sqlake_core::node::NodeKind;
-    use sqlake_driver_mock::{Behaviour, MockDriver};
+    use sqlake_driver_mock::{Behaviour, MockDriver, mock_profile};
 
     use super::*;
     use crate::error::AppError;
@@ -51,7 +51,7 @@ mod tests {
     async fn use_case(behaviour: Behaviour) -> ExpandNode {
         let driver = MockDriver::new(behaviour);
         ExpandNode {
-            session: SessionHandle::spawn(driver.connect().await.unwrap()),
+            session: SessionHandle::spawn(driver.connect(&mock_profile("mock")).await.unwrap()),
         }
     }
 

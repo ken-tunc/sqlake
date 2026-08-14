@@ -13,13 +13,93 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqlake_core::capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
+use sqlake_core::id::ProfileId;
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
+use sqlake_core::profile::{Params, ProfileError, ProfileSummary, Profiles, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet, Row, Sort, SortDir};
 use sqlake_core::value::Value;
 
 pub mod fixtures;
 
 use fixtures::Catalog;
+
+/// A profile the mock driver will accept.
+///
+/// Lives here rather than in each crate's tests because everything above this
+/// one needs a connectable profile to test with, and a second hand-rolled copy
+/// of it would drift from what [`MockDriver::connect`] actually checks.
+///
+/// # Panics
+///
+/// If `id` is not a usable [`ProfileId`]. Callers are tests and wiring code
+/// with literal ids.
+#[must_use]
+pub fn mock_profile(id: &str) -> ResolvedProfile {
+    ResolvedProfile {
+        id: ProfileId::parse(id).expect("a usable profile id"),
+        readonly: false,
+        params: Params::Mock,
+    }
+}
+
+/// What the UI knows about a mock profile before it resolves.
+///
+/// # Panics
+///
+/// If `id` is not a usable [`ProfileId`].
+#[must_use]
+pub fn mock_summary(id: &str) -> ProfileSummary {
+    ProfileSummary {
+        id: ProfileId::parse(id).expect("a usable profile id"),
+        name: id.to_owned(),
+        kind: DriverKind::Mock,
+    }
+}
+
+/// A set of mock profiles, in place of a config file.
+///
+/// The store takes `Arc<dyn Profiles>`, so this is what stands in for
+/// `sqlake-config` in a test — and, until M1 finishes wiring the real thing,
+/// what `--mock` gives the binary.
+#[derive(Debug, Clone)]
+pub struct MockProfiles {
+    profiles: Vec<ProfileSummary>,
+}
+
+impl MockProfiles {
+    /// One profile per id, in the order given.
+    ///
+    /// # Panics
+    ///
+    /// If an id is not a usable [`ProfileId`].
+    #[must_use]
+    pub fn new<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            profiles: ids.into_iter().map(mock_summary).collect(),
+        }
+    }
+}
+
+impl Default for MockProfiles {
+    /// The single connection M0 used to hardcode.
+    fn default() -> Self {
+        Self::new(["mock"])
+    }
+}
+
+impl Profiles for MockProfiles {
+    fn list(&self) -> Vec<ProfileSummary> {
+        self.profiles.clone()
+    }
+
+    fn resolve(&self, id: &ProfileId) -> Result<ResolvedProfile, ProfileError> {
+        if self.profiles.iter().any(|p| &p.id == id) {
+            Ok(mock_profile(id.as_str()))
+        } else {
+            Err(ProfileError::new(format!("no profile called `{id}`")))
+        }
+    }
+}
 
 /// A two-level hierarchy, deliberately shorter than PostgreSQL's three.
 pub const HIERARCHY: &[HierarchyLevel] = &[
@@ -242,7 +322,16 @@ impl Driver for MockDriver {
         self.capabilities
     }
 
-    async fn connect(&self) -> DriverResult<Box<dyn Session>> {
+    async fn connect(&self, profile: &ResolvedProfile) -> DriverResult<Box<dyn Session>> {
+        // The mock needs nothing from the profile, but a profile built for
+        // another driver reaching this one is a wiring mistake, and the point
+        // of taking the argument is to be the thing that notices.
+        if !matches!(profile.params, Params::Mock) {
+            return Err(DriverError::Connect(format!(
+                "mock: profile `{}` is not a mock profile",
+                profile.id
+            )));
+        }
         self.behaviour.delay_for(&[]).await;
         if self.behaviour.connect_fails {
             return Err(DriverError::Connect(
@@ -427,7 +516,7 @@ mod tests {
 
     async fn session() -> Box<dyn Session> {
         MockDriver::new(Behaviour::instant())
-            .connect()
+            .connect(&mock_profile("mock"))
             .await
             .unwrap()
     }
@@ -490,7 +579,7 @@ mod tests {
             connect_fails: true,
             ..Behaviour::instant()
         });
-        let err = driver.connect().await.unwrap_err();
+        let err = driver.connect(&mock_profile("mock")).await.unwrap_err();
         assert!(matches!(err, DriverError::Connect(_)), "{err:?}");
         assert!(err.is_retryable());
     }
@@ -501,7 +590,7 @@ mod tests {
             flaky_nodes: vec![(vec!["public".to_owned()], 2)],
             ..Behaviour::instant()
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let node = NodeRef::new(NodeKind::Namespace, ["public"]);
 
         assert!(s.children(&node).await.is_err(), "first attempt");
@@ -518,7 +607,7 @@ mod tests {
             failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
             ..Behaviour::instant()
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let table = TableRef::new(["public", "big"]);
 
         assert!(s.preview(&table, &PageRequest::first()).await.is_ok());
@@ -532,7 +621,7 @@ mod tests {
             hierarchy: DEEP_HIERARCHY,
             ..CAPABILITIES
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
 
         let catalogs = s.children(&NodeRef::root()).await.unwrap();
         assert_eq!(catalogs.len(), 1);
@@ -556,7 +645,7 @@ mod tests {
             hierarchy: DEEP_HIERARCHY,
             ..CAPABILITIES
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let rs = s
             .preview(
                 &TableRef::new([CATALOG_NAME, "public", "users"]),
@@ -605,7 +694,7 @@ mod tests {
             failing_nodes: vec![vec!["restricted".to_owned()]],
             ..Behaviour::instant()
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let node = NodeRef::new(NodeKind::Namespace, ["restricted"]);
         let err = s.children(&node).await.unwrap_err();
         assert!(matches!(err, DriverError::Query(_)), "{err:?}");
@@ -662,7 +751,7 @@ mod tests {
             failing_nodes: vec![vec!["analytics".to_owned(), "broken".to_owned()]],
             ..Behaviour::instant()
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let err = s
             .preview(
                 &TableRef::new(["analytics", "broken"]),
@@ -703,7 +792,7 @@ mod tests {
             slow_latency: Duration::from_secs(2),
             ..Behaviour::instant()
         });
-        let s = driver.connect().await.unwrap();
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let start = tokio::time::Instant::now();
         s.preview(&TableRef::new(["analytics", "slow"]), &PageRequest::first())
             .await
