@@ -114,10 +114,11 @@ fn init_logging(level: &str) -> Result<tracing_appender::non_blocking::WorkerGua
     Ok(guard)
 }
 
+/// The state directory, or a temporary one.
+///
+/// Losing the log is better than refusing to start over it, which is what
+/// happens in the one case `sqlake-config` cannot answer: no `$HOME` and no
+/// `$XDG_STATE_HOME` at all.
 fn log_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("sqlake")
+    sqlake_config::paths::state_dir().unwrap_or_else(|_| std::env::temp_dir().join("sqlake"))
 }

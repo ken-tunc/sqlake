@@ -287,7 +287,7 @@ id = "bq-analytics"
 driver = "bigquery"
 project = "my-project"
 location = "asia-northeast1"
-auth = { adc = true }           # or { service_account = "~/.config/.../sa.json" }
+auth = { adc = true }           # or { service_account = "/home/me/.config/.../sa.json" }
 max_bytes_billed = "20GB"       # queries above this are refused
 ```
 
@@ -457,10 +457,8 @@ The workspace `Cargo.toml` is the record of what is in use. What is not there ye
 choice already made:
 
 ```toml
-# configuration and secrets (M1)
-toml = "0.9"
-directories = "6"
-keyring = "3"
+# secrets (M1)
+keyring = "4"
 zeroize = "1"
 
 # persistence (M7, M8)

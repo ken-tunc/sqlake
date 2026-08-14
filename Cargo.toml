@@ -12,6 +12,7 @@ authors = ["ken-tunc"]
 
 [workspace.dependencies]
 sqlake-app = { path = "crates/sqlake-app" }
+sqlake-config = { path = "crates/sqlake-config" }
 sqlake-core = { path = "crates/sqlake-core" }
 sqlake-driver-mock = { path = "crates/sqlake-driver-mock" }
 sqlake-tui = { path = "crates/sqlake-tui" }
@@ -28,9 +29,11 @@ insta = "1"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml = "1"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
