@@ -309,7 +309,7 @@ const fn is_bidi_control(c: char) -> bool {
 /// A raw newline or tab breaks the grid apart, an escape sequence repaints it,
 /// a bidi override reorders it, and a megabyte-long value must not be measured
 /// in full on every frame.
-fn sanitise(s: &str) -> String {
+pub(crate) fn sanitise(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_CELL_CHARS));
     for (i, ch) in s.chars().enumerate() {
         if i >= MAX_CELL_CHARS {
@@ -329,7 +329,7 @@ fn sanitise(s: &str) -> String {
 }
 
 /// Terminal columns occupied, which is not the character count.
-fn display_width(s: &str) -> u16 {
+pub(crate) fn display_width(s: &str) -> u16 {
     u16::try_from(UnicodeWidthStr::width(s)).unwrap_or(u16::MAX)
 }
 

@@ -98,6 +98,13 @@ pub struct UiState {
     explorer_width: Option<u16>,
     /// Rectangles as of the last frame drawn. See the module doc.
     viewport: HashMap<PaneId, Rect>,
+    /// The whole frame, as of the last one drawn.
+    ///
+    /// Recorded separately from the viewports because those are the areas
+    /// *inside* the pane borders: adding them back up loses a column per border
+    /// and the splitter would then move by a different amount than it was
+    /// dragged.
+    screen: Rect,
 }
 
 /// The panes `Tab` cycles through, in order. The tab bar and status bar are not
@@ -113,6 +120,12 @@ impl UiState {
     /// Record the layout that was just drawn.
     pub fn set_viewport(&mut self, pane: PaneId, rect: Rect) {
         self.viewport.insert(pane, rect);
+    }
+
+    /// Record the frame the layout was divided from. Called by
+    /// [`crate::chrome::layout`], so it cannot drift from what was drawn.
+    pub fn set_screen(&mut self, area: Rect) {
+        self.screen = area;
     }
 
     #[must_use]
@@ -149,9 +162,10 @@ impl UiState {
         let wanted = self.explorer_width.unwrap_or_else(|| {
             u16::try_from(u32::from(total) * DEFAULT_EXPLORER_PERMILLE / 1000).unwrap_or(total)
         });
-        // The other side needs room too, and on a screen too narrow for both
-        // the explorer is the one that yields.
-        let ceiling = total.saturating_sub(MIN_PANE_WIDTH);
+        // The other side needs room too — and the splitter between them takes a
+        // column of its own, which is why this is not `total - MIN_PANE_WIDTH`.
+        // On a screen too narrow for both, the explorer is the one that yields.
+        let ceiling = total.saturating_sub(MIN_PANE_WIDTH + 1);
         wanted.clamp(MIN_PANE_WIDTH.min(ceiling), ceiling)
     }
 
@@ -209,8 +223,7 @@ impl UiState {
             }
             ViewCmd::MoveSplit { split, delta } => {
                 let SplitId::Explorer = split;
-                let total = self.total_width();
-                let current = self.explorer_width(total);
+                let current = self.explorer_width(self.screen.width);
                 let wanted = i32::from(current) + i32::from(delta);
                 self.explorer_width = Some(wanted.clamp(0, i32::from(u16::MAX)) as u16);
             }
@@ -232,13 +245,6 @@ impl UiState {
             None => 0,
         };
         self.focus = FOCUS_ORDER[next];
-    }
-
-    fn total_width(&self) -> u16 {
-        let explorer = self.viewport(PaneId::Explorer).width;
-        let grid = self.viewport(PaneId::Grid).width;
-        // The splitter itself sits between them.
-        explorer.saturating_add(grid).saturating_add(1)
     }
 
     fn offset(&self, pane: PaneId, snapshot: &Snapshot) -> usize {
@@ -306,14 +312,38 @@ impl UiState {
         }
         let (row, col) = (row.min(rows - 1), col.min(cols - 1));
         let page = self.page(PaneId::Grid);
+        let leftmost = self.leftmost_visible(col, snapshot);
         if let Some(grid) = self.active_grid_mut(snapshot) {
             grid.row = row;
             grid.col = col;
             grid.row_offset = scroll_into_view(grid.row_offset, row, page);
-            if col < grid.col_offset {
-                grid.col_offset = col;
-            }
+            // Left of the offset the cursor is scrolled back to; right of the
+            // last column that fits, forward to. Leaving the second one out
+            // walks the cursor off the edge and nothing follows it.
+            grid.col_offset = grid.col_offset.clamp(leftmost, col);
         }
+    }
+
+    /// The furthest left the grid can be scrolled while `col` is still drawn.
+    fn leftmost_visible(&mut self, col: usize, snapshot: &Snapshot) -> usize {
+        let available = usize::from(self.viewport(PaneId::Grid).width);
+        let mut used = 0;
+        let mut first = col;
+        for c in (0..=col).rev() {
+            let natural = self.natural_width(c, snapshot);
+            let drawn = self
+                .active_grid(snapshot)
+                .map_or(natural, |g| g.width(c, natural));
+            // One cell for the separator that follows every column.
+            used += usize::from(drawn) + 1;
+            // The cursor's own column is kept even when it is wider than the
+            // pane: there is nowhere better to put it.
+            if used > available && c != col {
+                break;
+            }
+            first = c;
+        }
+        first
     }
 
     fn rows_of(snapshot: &Snapshot) -> Option<&Arc<PagedResult>> {
@@ -453,6 +483,9 @@ mod tests {
 
     fn ui(snap: &Snapshot) -> UiState {
         let mut ui = UiState::new();
+        // As a frame would leave it: the pane viewports are the areas inside
+        // the borders, the screen is the whole of it.
+        ui.set_screen(Rect::new(0, 0, 82, 12));
         ui.set_viewport(PaneId::Explorer, Rect::new(0, 1, 20, 10));
         ui.set_viewport(PaneId::Grid, Rect::new(21, 1, 60, 10));
         let _ = snap;
@@ -576,6 +609,25 @@ mod tests {
     }
 
     #[test]
+    fn the_cell_cursor_pulls_the_grid_sideways() {
+        // Sixty columns of at least the minimum width: the cursor cannot reach
+        // column fifty without the grid scrolling after it.
+        let snap = snapshot(0, 10, 60);
+        let mut ui = ui(&snap);
+        ui.apply(ViewCmd::SelectCell { row: 0, col: 50 }, &snap);
+        let grid = ui.grid(TabId::new(1)).unwrap();
+        assert_eq!(grid.col, 50);
+        assert!(
+            grid.col_offset > 0 && grid.col_offset <= 50,
+            "{}",
+            grid.col_offset
+        );
+
+        ui.apply(ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
+        assert_eq!(ui.grid(TabId::new(1)).unwrap().col_offset, 0, "and back");
+    }
+
+    #[test]
     fn a_grid_with_no_rows_ignores_the_cursor() {
         let snap = snapshot(0, 0, 0);
         let mut ui = ui(&snap);
@@ -663,7 +715,31 @@ mod tests {
             },
             &snap,
         );
-        assert_eq!(ui.explorer_width(80), 80 - MIN_PANE_WIDTH);
+        // The splitter's own column comes out of the explorer's side, so the
+        // grid still gets `MIN_PANE_WIDTH`.
+        assert_eq!(ui.explorer_width(80), 80 - MIN_PANE_WIDTH - 1);
+    }
+
+    #[test]
+    fn the_splitter_ends_up_where_it_was_dragged() {
+        // Deriving the screen width from the pane viewports loses a column per
+        // border, and a drag one cell to the right then moves the splitter one
+        // cell to the left.
+        let snap = snapshot(0, 0, 0);
+        let mut ui = UiState::new();
+        ui.set_screen(Rect::new(0, 0, 100, 30));
+        ui.set_viewport(PaneId::Explorer, Rect::new(1, 2, 26, 26));
+        ui.set_viewport(PaneId::Grid, Rect::new(30, 2, 68, 26));
+
+        let before = ui.explorer_width(100);
+        ui.apply(
+            ViewCmd::MoveSplit {
+                split: SplitId::Explorer,
+                delta: 1,
+            },
+            &snap,
+        );
+        assert_eq!(ui.explorer_width(100), before + 1);
     }
 
     #[test]

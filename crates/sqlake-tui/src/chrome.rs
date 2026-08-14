@@ -12,7 +12,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use sqlake_app::snapshot::Snapshot;
+use unicode_width::UnicodeWidthChar;
 
+use crate::grid::{display_width, sanitise};
 use crate::hit::{ButtonId, HitMap, PaneId, ScrollPart, SplitId, Target, Z_BASE, Z_CHROME};
 use crate::ui::{MIN_PANE_WIDTH, UiState};
 
@@ -32,9 +34,12 @@ pub struct Frames {
 }
 
 /// Divide the screen. The explorer's width comes from [`UiState`], so dragging
-/// the splitter survives a redraw.
+/// the splitter survives a redraw; the frame goes back into it, because a drag
+/// is measured against the screen it was drawn on.
 #[must_use]
-pub fn layout(area: Rect, ui: &UiState) -> Frames {
+pub fn layout(area: Rect, ui: &mut UiState) -> Frames {
+    ui.set_screen(area);
+
     let [tab_bar, body, status_bar] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -119,6 +124,11 @@ pub fn pane(
 
 /// The draggable divider between the two panes.
 pub fn splitter(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, hovered: bool) {
+    if area.is_empty() {
+        // The line is drawn a cell wide whatever `area` says, so without this a
+        // squeezed-out splitter would paint over the pane beside it.
+        return;
+    }
     // One cell is too thin to hit with a mouse, so the grab area is widened
     // while the drawn line stays one cell.
     hits.push(
@@ -194,6 +204,11 @@ pub fn scrollbar(
     }
 }
 
+/// The close box drawn after every tab's title.
+const CLOSE_WIDTH: u16 = 2;
+/// The `[×]` that stops a running job.
+const CANCEL_WIDTH: u16 = 3;
+
 /// One entry per open tab, each with a close box.
 pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &Snapshot) {
     hits.push(area, Z_BASE, Target::Pane(PaneId::TabBar));
@@ -205,11 +220,21 @@ pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &
     let mut x = area.x;
     for tab in &snapshot.tabs {
         let active = snapshot.active_tab == Some(tab.id);
-        let label = format!(" {} ", tab.title);
-        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-        // Stop at the edge rather than drawing a tab half off the screen.
-        if x + width + 2 > area.right() {
-            break;
+        // A relation's name is data: it can carry a newline, and it is measured
+        // in terminal columns rather than characters, or a double-width name
+        // would be cut in half and take its close box out of position.
+        let mut label = format!(" {} ", sanitise(&tab.title));
+        let mut width = display_width(&label);
+        let room = area.right().saturating_sub(x);
+        // Stop at the edge rather than drawing a tab half off the screen. The
+        // first tab is cut short instead: one long name must not leave the bar
+        // empty and the tab with no close box to click.
+        if width.saturating_add(CLOSE_WIDTH) > room {
+            if x != area.x || room <= CLOSE_WIDTH {
+                break;
+            }
+            label = fit(&label, room - CLOSE_WIDTH);
+            width = display_width(&label);
         }
 
         let style = if active {
@@ -224,11 +249,11 @@ pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &
         frame.render_widget(Paragraph::new(label).style(style), title_rect);
         hits.push(title_rect, Z_CHROME, Target::Tab(tab.id));
 
-        let close_rect = Rect::new(x + width, area.y, 2, 1);
+        let close_rect = Rect::new(x + width, area.y, CLOSE_WIDTH, 1);
         frame.render_widget(Paragraph::new("× ").style(style), close_rect);
         hits.push(close_rect, Z_CHROME, Target::TabClose(tab.id));
 
-        x += width + 2;
+        x += width + CLOSE_WIDTH;
     }
 }
 
@@ -241,21 +266,25 @@ pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot
     let mut x = area.x;
 
     for item in &snapshot.busy {
-        let label = format!(" ⟳ {} ", item.label);
-        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-        if x + width + 3 > area.right() {
+        // A label carries a relation's name, so it goes through the same
+        // treatment as a cell: measured in columns, and stripped of anything
+        // that would rewrite the row. Miscounting either way puts the cancel
+        // button's hit box somewhere other than where the `[×]` is drawn.
+        let label = format!(" ⟳ {} ", sanitise(&item.label));
+        let width = display_width(&label);
+        if x.saturating_add(width).saturating_add(CANCEL_WIDTH) > area.right() {
             break;
         }
         spans.push(Span::styled(label, Style::new().fg(Color::Yellow)));
         x += width;
 
-        let cancel = Rect::new(x, area.y, 3, 1);
+        let cancel = Rect::new(x, area.y, CANCEL_WIDTH, 1);
         spans.push(Span::styled(
             "[×]",
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
         hits.push(cancel, Z_CHROME, Target::Button(ButtonId::Cancel(item.id)));
-        x += 3;
+        x += CANCEL_WIDTH;
     }
 
     if spans.is_empty() {
@@ -268,6 +297,29 @@ pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// `text` cut to `max` terminal columns, with an ellipsis where it was cut.
+fn fit(text: &str, max: u16) -> String {
+    if display_width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = u16::try_from(UnicodeWidthChar::width(ch).unwrap_or(0)).unwrap_or(u16::MAX);
+        // The ellipsis needs the last column.
+        if used + width + 1 > max {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -338,9 +390,9 @@ mod tests {
 
     #[test]
     fn the_layout_accounts_for_every_row_and_column() {
-        let ui = UiState::new();
+        let mut ui = UiState::new();
         let area = Rect::new(0, 0, 100, 30);
-        let f = layout(area, &ui);
+        let f = layout(area, &mut ui);
 
         assert_eq!(f.tab_bar.height, 1);
         assert_eq!(f.status_bar.height, 1);
@@ -353,8 +405,8 @@ mod tests {
 
     #[test]
     fn a_narrow_terminal_still_leaves_both_panes_usable() {
-        let ui = UiState::new();
-        let f = layout(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT), &ui);
+        let mut ui = UiState::new();
+        let f = layout(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT), &mut ui);
         assert!(f.explorer.width >= MIN_PANE_WIDTH, "{}", f.explorer.width);
         assert!(f.grid.width >= MIN_PANE_WIDTH, "{}", f.grid.width);
     }
@@ -508,6 +560,41 @@ mod tests {
     }
 
     #[test]
+    fn a_double_width_title_keeps_its_close_box_under_the_cross() {
+        // Counting characters rather than columns puts the close box two cells
+        // to the left of the × the user is aiming at.
+        let mut snap = snapshot(1, 0);
+        snap.tabs[0].title = "ユーザー".into();
+        let area = Rect::new(0, 0, 30, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &snap), 30, 1);
+
+        // " ユーザー " is ten columns wide, so the cross starts at ten.
+        assert_eq!(
+            hits.at(Position::new(9, 0)),
+            Some(Target::Tab(TabId::new(0)))
+        );
+        assert_eq!(
+            hits.at(Position::new(10, 0)),
+            Some(Target::TabClose(TabId::new(0)))
+        );
+    }
+
+    #[test]
+    fn a_title_too_wide_for_the_bar_is_cut_rather_than_dropped() {
+        // Dropping it would leave an empty bar with a tab open behind it, and
+        // no close box to click.
+        let mut snap = snapshot(1, 0);
+        snap.tabs[0].title = "a_very_long_relation_name".into();
+        let area = Rect::new(0, 0, 12, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &snap), 12, 1);
+
+        let closes = (0..12)
+            .filter(|x| matches!(hits.at(Position::new(*x, 0)), Some(Target::TabClose(_))))
+            .count();
+        assert_eq!(closes, 2, "the only tab must still be closable");
+    }
+
+    #[test]
     fn a_running_job_gets_a_cancel_button() {
         let snap = snapshot(0, 1);
         let area = Rect::new(0, 0, 60, 1);
@@ -517,6 +604,31 @@ mod tests {
             .filter_map(|x| hits.at(Position::new(x, 0)))
             .any(|t| matches!(t, Target::Button(ButtonId::Cancel(_))));
         assert!(found, "no way to stop it");
+    }
+
+    #[test]
+    fn the_cancel_button_sits_under_the_cross_it_draws() {
+        // A busy label carries a relation's name, so it can be wider than it is
+        // long. Measuring it in characters leaves the button unclickable.
+        let mut snap = snapshot(0, 1);
+        snap.busy[0].label = "loading 顧客".into();
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        let mut hits = HitMap::new();
+        terminal
+            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap))
+            .unwrap();
+
+        let cross = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .position(|cell| cell.symbol() == "×")
+            .expect("no cross drawn");
+        assert!(matches!(
+            hits.at(Position::new(u16::try_from(cross).unwrap(), 0)),
+            Some(Target::Button(ButtonId::Cancel(_)))
+        ));
     }
 
     #[test]
