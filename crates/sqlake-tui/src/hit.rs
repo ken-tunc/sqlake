@@ -9,8 +9,25 @@
 //! becomes a way to trigger the very thing it was confirming.
 
 use ratatui::layout::{Position, Rect};
-use sqlake_app::action::{BusyId, ToastId};
+use sqlake_app::action::BusyId;
 use sqlake_core::id::TabId;
+
+/// A transient message, minted and owned entirely by this crate: nothing
+/// about which notices are on screen is a fact the application layer knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ToastId(u64);
+
+impl ToastId {
+    #[must_use]
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Background of a pane, behind its content.
 pub const Z_BASE: u8 = 0;

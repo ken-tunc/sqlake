@@ -12,11 +12,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
-use sqlake_app::snapshot::{Severity, Snapshot};
 
 use crate::chrome;
 use crate::grid::{display_width, sanitise};
 use crate::hit::{ButtonId, HitMap, Target, Z_BACKDROP, Z_CHROME, Z_MODAL};
+use crate::ui::{Severity, Toast};
 
 /// A dialog's contents. Held by `UiState`, because whether a dialog is open is
 /// a fact about this screen and not about the data.
@@ -102,8 +102,8 @@ pub fn modal(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, dialog: &Moda
 ///
 /// Above the content but below a dialog: a toast that covered a dialog would
 /// hide the thing waiting for an answer.
-pub fn toasts(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &Snapshot) {
-    if snapshot.toasts.is_empty() || area.height == 0 {
+pub fn toasts(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, toasts: &[Toast]) {
+    if toasts.is_empty() || area.height == 0 {
         return;
     }
 
@@ -111,9 +111,9 @@ pub fn toasts(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &S
     let x = area.right().saturating_sub(width);
     let mut y = area.bottom();
 
-    // Newest last in the snapshot, and newest nearest the bottom edge, so a new
+    // Newest last in the list, and newest nearest the bottom edge, so a new
     // message never shifts the ones already being read.
-    for toast in snapshot.toasts.iter().rev() {
+    for toast in toasts.iter().rev() {
         if y <= area.y {
             break;
         }
@@ -196,39 +196,26 @@ fn wrapped_rows(text: &str, width: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use sqlake_driver_mock::mock_summary;
-    use std::sync::Arc;
     use std::time::Instant;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
-    use sqlake_app::action::ToastId;
-    use sqlake_app::snapshot::Toast;
 
     use super::*;
+    use crate::hit::ToastId;
 
-    fn snapshot(items: Vec<(Severity, &str)>) -> Snapshot {
-        Snapshot {
-            rev: 1,
-            explorer: std::sync::Arc::new(sqlake_app::tree::TreeView::default()),
-            profiles: Arc::new(vec![mock_summary("mock")]),
-            connections: Vec::new(),
-            tabs: Vec::new(),
-            active_tab: None,
-            busy: Vec::new(),
-            toasts: items
-                .into_iter()
-                .enumerate()
-                .map(|(i, (severity, text))| Toast {
-                    id: ToastId::new(i as u64),
-                    text: text.into(),
-                    severity,
-                    created_at: Instant::now(),
-                })
-                .collect(),
-            should_quit: false,
-        }
+    fn toast_list(items: Vec<(Severity, &str)>) -> Vec<Toast> {
+        items
+            .into_iter()
+            .enumerate()
+            .map(|(i, (severity, text))| Toast {
+                id: ToastId::new(i as u64),
+                text: text.into(),
+                severity,
+                created_at: Instant::now(),
+            })
+            .collect()
     }
 
     fn draw(f: impl FnOnce(&mut Frame<'_>, &mut HitMap), w: u16, h: u16) -> (Vec<String>, HitMap) {
@@ -406,7 +393,7 @@ mod tests {
 
     #[test]
     fn every_toast_can_be_dismissed_by_clicking_it() {
-        let snap = snapshot(vec![
+        let snap = toast_list(vec![
             (Severity::Info, "connected"),
             (Severity::Error, "boom"),
         ]);
@@ -428,7 +415,7 @@ mod tests {
 
     #[test]
     fn a_new_toast_does_not_shift_the_one_being_read() {
-        let first = snapshot(vec![(Severity::Info, "first")]);
+        let first = toast_list(vec![(Severity::Info, "first")]);
         let (before, _) = draw(
             |frame, hits| toasts(frame, hits, Rect::new(0, 0, 80, 24), &first),
             80,
@@ -437,7 +424,7 @@ mod tests {
         let row_of = |text: &[String], needle: &str| text.iter().position(|l| l.contains(needle));
         let was = row_of(&before, "first").expect("not drawn");
 
-        let both = snapshot(vec![(Severity::Info, "first"), (Severity::Error, "second")]);
+        let both = toast_list(vec![(Severity::Info, "first"), (Severity::Error, "second")]);
         let (after, _) = draw(
             |frame, hits| toasts(frame, hits, Rect::new(0, 0, 80, 24), &both),
             80,
@@ -456,7 +443,7 @@ mod tests {
             (Severity::Warning, "!"),
             (Severity::Error, "✕"),
         ] {
-            let snap = snapshot(vec![(severity, "message")]);
+            let snap = toast_list(vec![(severity, "message")]);
             let (text, _) = draw(
                 |frame, hits| toasts(frame, hits, Rect::new(0, 0, 40, 6), &snap),
                 40,
@@ -468,7 +455,7 @@ mod tests {
 
     #[test]
     fn more_toasts_than_rows_do_not_draw_off_the_top() {
-        let snap = snapshot((0..30).map(|_| (Severity::Info, "message")).collect());
+        let snap = toast_list((0..30).map(|_| (Severity::Info, "message")).collect());
         let (_, hits) = draw(
             |frame, hits| toasts(frame, hits, Rect::new(0, 2, 40, 3), &snap),
             40,
@@ -482,7 +469,7 @@ mod tests {
     #[test]
     fn a_toast_wider_than_the_screen_is_cut_to_it() {
         let long = "x".repeat(200);
-        let snap = snapshot(vec![(Severity::Error, &long)]);
+        let snap = toast_list(vec![(Severity::Error, &long)]);
         let (text, _) = draw(
             |frame, hits| toasts(frame, hits, Rect::new(0, 0, 30, 4), &snap),
             30,

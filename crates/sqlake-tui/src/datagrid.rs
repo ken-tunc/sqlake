@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use sqlake_app::snapshot::{LoadState, PreviewTab};
+use sqlake_app::snapshot::{LoadState, PreviewView};
 use sqlake_core::result::{Sort, SortDir};
 
 use crate::chrome;
@@ -48,7 +48,7 @@ pub fn render(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
     area: Rect,
-    tab: &PreviewTab,
+    tab: &PreviewView,
     ui: &mut GridUi,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -288,6 +288,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
     use sqlake_app::PagedResult;
+    use sqlake_core::id::ConnId;
     use sqlake_core::node::TableRef;
     use sqlake_core::result::{Column, ResultSet, Row};
     use sqlake_core::value::Value;
@@ -310,17 +311,19 @@ mod tests {
         )
     }
 
-    fn tab(data: LoadState<Arc<PagedResult>>, sort: Option<Sort>) -> PreviewTab {
-        PreviewTab {
+    fn tab(data: LoadState<Arc<PagedResult>>, sort: Option<Sort>) -> PreviewView {
+        PreviewView {
+            conn: ConnId::new(),
             table: TableRef::new(["public", "users"]),
             sort,
             loaded_rows: 0,
             data,
+            last_error: None,
         }
     }
 
     fn draw(
-        tab: &PreviewTab,
+        tab: &PreviewView,
         ui: &mut GridUi,
         w: u16,
         h: u16,

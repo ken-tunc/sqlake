@@ -203,7 +203,7 @@ const CLOSE_WIDTH: u16 = 2;
 /// The `[×]` that stops a running job.
 const CANCEL_WIDTH: u16 = 3;
 
-pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &Snapshot) {
+pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, ui: &UiState) {
     hits.push(area, Z_BASE, Target::Pane(PaneId::TabBar));
     frame.render_widget(
         Paragraph::new("").style(Style::new().bg(Color::Black)),
@@ -211,12 +211,12 @@ pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &
     );
 
     let mut x = area.x;
-    for tab in &snapshot.tabs {
-        let active = snapshot.active_tab == Some(tab.id);
+    for tab in &ui.tabs {
+        let active = ui.active_tab == Some(tab.id);
         // A relation's name is data: it can carry a newline, and it is measured
         // in terminal columns rather than characters, or a double-width name
         // would be cut in half and take its close box out of position.
-        let mut label = format!(" {} ", sanitise(&tab.title));
+        let mut label = format!(" {} ", sanitise(tab.table.name()));
         let mut width = display_width(&label);
         let room = area.right().saturating_sub(x);
         // Stop at the edge rather than drawing a tab half off the screen. The
@@ -324,16 +324,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Position;
     use sqlake_app::action::BusyId;
-    use sqlake_app::snapshot::{
-        BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, TabContent, TabView,
-    };
+    use sqlake_app::snapshot::{BusyItem, BusyOwner, ConnStatus, ConnectionView};
     use sqlake_core::capability::DriverKind;
     use sqlake_core::id::{ConnId, TabId};
     use sqlake_core::node::TableRef;
 
     use super::*;
+    use crate::ui::OpenTab;
 
-    fn snapshot(tabs: usize, busy: usize) -> Snapshot {
+    fn snapshot(busy: usize) -> Snapshot {
         let conn = ConnId::new();
         Snapshot {
             rev: 1,
@@ -348,20 +347,7 @@ mod tests {
                 status: ConnStatus::Ready,
                 capabilities: None,
             }],
-            tabs: (0..tabs)
-                .map(|i| TabView {
-                    id: TabId::new(i as u32),
-                    conn,
-                    title: format!("t{i}"),
-                    content: TabContent::Preview(PreviewTab {
-                        table: TableRef::new(["public", "users"]),
-                        sort: None,
-                        loaded_rows: 0,
-                        data: LoadState::Idle,
-                    }),
-                })
-                .collect(),
-            active_tab: (tabs > 0).then(|| TabId::new(0)),
+            previews: Vec::new(),
             busy: (0..busy)
                 .map(|i| BusyItem {
                     id: BusyId::new(i as u64),
@@ -370,9 +356,38 @@ mod tests {
                     started_at: Instant::now(),
                 })
                 .collect(),
-            toasts: Vec::new(),
             should_quit: false,
         }
+    }
+
+    /// A `UiState` with `n` tabs open, named `t0`..`t{n-1}`, the first active
+    /// — what `tab_bar` reads instead of the snapshot now that tabs are this
+    /// crate's own bookkeeping.
+    fn ui_with_tabs(n: usize) -> UiState {
+        let mut ui = UiState::new();
+        for i in 0..n {
+            ui.tabs.push(OpenTab {
+                id: TabId::new(i as u32),
+                conn: ConnId::new(),
+                table: TableRef::new(["public", &format!("t{i}")]),
+            });
+        }
+        ui.active_tab = ui.tabs.first().map(|t| t.id);
+        ui
+    }
+
+    /// A `UiState` with one tab open, named exactly `title` — for the tests
+    /// that need to control the rendered label precisely.
+    fn ui_with_tab_named(title: &str) -> UiState {
+        let mut ui = UiState::new();
+        let id = TabId::new(0);
+        ui.tabs.push(OpenTab {
+            id,
+            conn: ConnId::new(),
+            table: TableRef::new(["public", title]),
+        });
+        ui.active_tab = Some(id);
+        ui
     }
 
     fn draw(f: impl FnOnce(&mut Frame<'_>, &mut HitMap), w: u16, h: u16) -> HitMap {
@@ -514,9 +529,9 @@ mod tests {
 
     #[test]
     fn every_tab_offers_its_own_close_box() {
-        let snap = snapshot(3, 0);
+        let ui = ui_with_tabs(3);
         let area = Rect::new(0, 0, 60, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &snap), 60, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 60, 1);
 
         let mut seen_titles = 0;
         let mut seen_closes = 0;
@@ -533,12 +548,12 @@ mod tests {
 
     #[test]
     fn a_tab_that_does_not_fit_is_left_out_rather_than_cut() {
-        let snap = snapshot(20, 0);
+        let ui = ui_with_tabs(20);
         // Each tab is " tN " plus a two-cell close box: six cells. Thirty-one
         // holds five of them with one cell spare, and the sixth is dropped
         // rather than drawn with its close box off the edge.
         let area = Rect::new(0, 0, 31, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &snap), 31, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 31, 1);
 
         let mut tabs = std::collections::BTreeSet::new();
         for x in 0..31 {
@@ -559,10 +574,9 @@ mod tests {
     fn a_double_width_title_keeps_its_close_box_under_the_cross() {
         // Counting characters rather than columns puts the close box two cells
         // to the left of the × the user is aiming at.
-        let mut snap = snapshot(1, 0);
-        snap.tabs[0].title = "ユーザー".into();
+        let ui = ui_with_tab_named("ユーザー");
         let area = Rect::new(0, 0, 30, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &snap), 30, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 30, 1);
 
         // " ユーザー " is ten columns wide, so the cross starts at ten.
         assert_eq!(
@@ -579,10 +593,9 @@ mod tests {
     fn a_title_too_wide_for_the_bar_is_cut_rather_than_dropped() {
         // Dropping it would leave an empty bar with a tab open behind it, and
         // no close box to click.
-        let mut snap = snapshot(1, 0);
-        snap.tabs[0].title = "a_very_long_relation_name".into();
+        let ui = ui_with_tab_named("a_very_long_relation_name");
         let area = Rect::new(0, 0, 12, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &snap), 12, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 12, 1);
 
         let closes = (0..12)
             .filter(|x| matches!(hits.at(Position::new(*x, 0)), Some(Target::TabClose(_))))
@@ -592,7 +605,7 @@ mod tests {
 
     #[test]
     fn a_running_job_gets_a_cancel_button() {
-        let snap = snapshot(0, 1);
+        let snap = snapshot(1);
         let area = Rect::new(0, 0, 60, 1);
         let hits = draw(|frame, hits| status_bar(frame, hits, area, &snap), 60, 1);
 
@@ -606,7 +619,7 @@ mod tests {
     fn the_cancel_button_sits_under_the_cross_it_draws() {
         // A busy label carries a relation's name, so it can be wider than it is
         // long. Measuring it in characters leaves the button unclickable.
-        let mut snap = snapshot(0, 1);
+        let mut snap = snapshot(1);
         snap.busy[0].label = "loading 顧客".into();
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut hits = HitMap::new();
@@ -629,7 +642,7 @@ mod tests {
 
     #[test]
     fn an_idle_status_bar_says_how_to_select_text() {
-        let snap = snapshot(0, 0);
+        let snap = snapshot(0);
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut hits = HitMap::new();
         terminal

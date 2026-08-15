@@ -10,9 +10,17 @@
 //! the user is looking at. That frame's rectangles are recorded during drawing,
 //! the same as [`crate::hit::HitMap`] — an event is always answered against the
 //! layout that produced the pixels it was aimed at.
+//!
+//! Which of the store's previews this screen has open, in what order, and
+//! which has focus lives here for the same reason: `Snapshot` holds the data
+//! a preview is, addressed by connection and table, and this crate decides
+//! what to call a tab of it. [`Toast`] is the same kind of thing one layer
+//! further out — a note this screen chose to show, not a fact the store
+//! recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
@@ -20,10 +28,43 @@ use sqlake_app::snapshot::Snapshot;
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::node::TableRef;
 
 use crate::grid::RenderedGrid;
-use crate::hit::{PaneId, SplitId, Target};
+use crate::hit::{PaneId, SplitId, Target, ToastId};
 use crate::intent::ViewCmd;
+
+/// A tab this screen has open, pointing at one connection's relation.
+///
+/// Minted here, not by the store: two front-ends asking for the same
+/// `(conn, table)` are asking for the same data, not fighting over a tab
+/// number. At most one of these exists per `(conn, table)` — opening a
+/// relation already open selects it instead (see `input::open_or_focus_tab`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTab {
+    pub id: TabId,
+    pub conn: ConnId,
+    pub table: TableRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// A transient notice. Purely this screen's own: the application layer
+/// returns failures the ordinary way, and deciding "show this briefly and let
+/// it go" rather than "attach it to the row it is about" is a rendering
+/// choice, not a fact about the data.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub id: ToastId,
+    pub text: String,
+    pub severity: Severity,
+    pub created_at: Instant,
+}
 
 /// Neither pane is useful below this, so the splitter stops here rather than
 /// letting one side be dragged out of existence.
@@ -112,6 +153,19 @@ pub struct UiState {
     /// the last leaves a second connection's failure unreported, because the
     /// first stays in the list and is what a search keeps finding.
     pub reported_failures: HashSet<ConnId>,
+    /// Every tab this screen has open, in the order they appear in the tab
+    /// bar. At most one per `(conn, table)`.
+    pub tabs: Vec<OpenTab>,
+    pub active_tab: Option<TabId>,
+    next_tab: u32,
+    pub toasts: Vec<Toast>,
+    next_toast: u64,
+    /// The text of the last error raised as a toast for each preview, so a
+    /// snapshot that repeats the same failure does not raise it again — only
+    /// a *new* one does. Keyed by `(conn, table)` rather than carried on the
+    /// toast itself: the preview it is about may have several replies land
+    /// before anyone reads the first notice.
+    reported_preview_errors: HashMap<(ConnId, TableRef), String>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
@@ -167,14 +221,6 @@ impl UiState {
         self.grids.get(&tab)
     }
 
-    /// Forget the state of tabs that are gone.
-    ///
-    /// Without this a long session accumulates a `GridUi` — and the rendered
-    /// grid it caches — for every tab ever opened.
-    pub fn retain_tabs(&mut self, snapshot: &Snapshot) {
-        self.grids.retain(|id, _| snapshot.tab(*id).is_some());
-    }
-
     /// The explorer's width for a screen `total` cells wide.
     #[must_use]
     pub fn explorer_width(&self, total: u16) -> u16 {
@@ -188,6 +234,53 @@ impl UiState {
         wanted.clamp(MIN_PANE_WIDTH.min(ceiling), ceiling)
     }
 
+    /// Turn a new `last_error` on one of this screen's open previews into a
+    /// toast.
+    ///
+    /// Skips ones already raised, the same way `run::raise_connection_failure`
+    /// skips connections already reported — remembering only the newest
+    /// message would let a second preview's failure hide behind the first
+    /// one still in the map, because that is what a plain lookup keeps
+    /// finding. Clearing the record on success means the *same* message
+    /// raised again later — a second timeout, say — is treated as new rather
+    /// than silently swallowed.
+    pub fn raise_preview_errors(&mut self, snapshot: &Snapshot) {
+        // Collected before mutating: `push_toast` needs `&mut self`, and
+        // `self.tabs` is what decides which previews are even in view.
+        let keys: Vec<(ConnId, TableRef)> = self
+            .tabs
+            .iter()
+            .map(|t| (t.conn, t.table.clone()))
+            .collect();
+
+        for (conn, table) in keys {
+            let Some(preview) = snapshot.preview(conn, &table) else {
+                continue;
+            };
+            let key = (conn, table);
+            match &preview.last_error {
+                Some(text) if self.reported_preview_errors.get(&key) != Some(text) => {
+                    self.reported_preview_errors.insert(key, text.clone());
+                    self.push_toast(Severity::Error, text.clone());
+                }
+                None => {
+                    self.reported_preview_errors.remove(&key);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn push_toast(&mut self, severity: Severity, text: impl Into<String>) {
+        self.next_toast += 1;
+        self.toasts.push(Toast {
+            id: ToastId::new(self.next_toast),
+            text: text.into(),
+            severity,
+            created_at: Instant::now(),
+        });
+    }
+
     /// Apply a view command, synchronously and without touching the store.
     pub fn apply(&mut self, cmd: ViewCmd, snapshot: &Snapshot) {
         match cmd {
@@ -196,7 +289,7 @@ impl UiState {
             ViewCmd::FocusPrevPane => self.cycle_focus(-1),
 
             ViewCmd::ScrollBy { pane, delta } => {
-                let offset = self.offset(pane, snapshot);
+                let offset = self.offset(pane);
                 self.set_offset(pane, step(offset, delta), snapshot);
             }
             ViewCmd::ScrollToRatio { pane, permille } => {
@@ -208,7 +301,7 @@ impl UiState {
             ViewCmd::ScrollToEnd(pane) => self.set_offset(pane, usize::MAX, snapshot),
             ViewCmd::ScrollXBy { delta } => {
                 let columns = self.column_count(snapshot);
-                if let Some(grid) = self.active_grid_mut(snapshot) {
+                if let Some(grid) = self.active_grid_mut() {
                     grid.col_offset = step(grid.col_offset, delta).min(columns.saturating_sub(1));
                 }
             }
@@ -228,15 +321,13 @@ impl UiState {
 
             ViewCmd::SelectCell { row, col } => self.select_cell(row, col, snapshot),
             ViewCmd::MoveCellSelection { drow, dcol } => {
-                let (row, col) = self
-                    .active_grid(snapshot)
-                    .map_or((0, 0), |g| (g.row, g.col));
+                let (row, col) = self.active_grid().map_or((0, 0), |g| (g.row, g.col));
                 self.select_cell(step(row, drow), step(col, dcol), snapshot);
             }
 
             ViewCmd::ResizeColumn { col, delta } => {
                 let natural = self.natural_width(col, snapshot);
-                if let Some(grid) = self.active_grid_mut(snapshot) {
+                if let Some(grid) = self.active_grid_mut() {
                     grid.resize(col, delta, natural);
                 }
             }
@@ -252,6 +343,44 @@ impl UiState {
             }
 
             ViewCmd::DismissModal => self.modal = None,
+
+            // A relation already open is raised, not duplicated — the same
+            // rule the store used to apply when tabs lived there.
+            ViewCmd::OpenTab { conn, table } => {
+                if let Some(existing) = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.conn == conn && t.table == table)
+                {
+                    self.active_tab = Some(existing.id);
+                } else {
+                    self.next_tab += 1;
+                    let id = TabId::new(self.next_tab);
+                    self.tabs.push(OpenTab { id, conn, table });
+                    self.active_tab = Some(id);
+                }
+            }
+            ViewCmd::SelectTab(id) => {
+                if self.tabs.iter().any(|t| t.id == id) {
+                    self.active_tab = Some(id);
+                }
+            }
+            ViewCmd::CloseTab(id) => {
+                let position = self.tabs.iter().position(|t| t.id == id);
+                self.tabs.retain(|t| t.id != id);
+                // The cached grid and column widths belonged to this tab and
+                // nothing else; without dropping them a long session
+                // accumulates a `GridUi` — and the `RenderedGrid` it caches —
+                // for every tab ever opened.
+                self.grids.remove(&id);
+                if self.active_tab == Some(id) {
+                    // Select the neighbour, which is what every tabbed UI does.
+                    self.active_tab = position
+                        .and_then(|p| self.tabs.get(p.min(self.tabs.len().saturating_sub(1))))
+                        .map(|t| t.id);
+                }
+            }
+            ViewCmd::DismissToast(id) => self.toasts.retain(|t| t.id != id),
         }
     }
 
@@ -266,10 +395,10 @@ impl UiState {
         self.focus = FOCUS_ORDER[next];
     }
 
-    fn offset(&self, pane: PaneId, snapshot: &Snapshot) -> usize {
+    fn offset(&self, pane: PaneId) -> usize {
         match pane {
             PaneId::Explorer => self.tree.offset,
-            PaneId::Grid => self.active_grid(snapshot).map_or(0, |g| g.row_offset),
+            PaneId::Grid => self.active_grid().map_or(0, |g| g.row_offset),
             PaneId::TabBar | PaneId::StatusBar => 0,
         }
     }
@@ -293,7 +422,7 @@ impl UiState {
         match pane {
             PaneId::Explorer => self.tree.offset = clamped,
             PaneId::Grid => {
-                if let Some(grid) = self.active_grid_mut(snapshot) {
+                if let Some(grid) = self.active_grid_mut() {
                     grid.row_offset = clamped;
                 }
             }
@@ -301,12 +430,12 @@ impl UiState {
         }
     }
 
-    fn active_grid(&self, snapshot: &Snapshot) -> Option<&GridUi> {
-        self.grids.get(&snapshot.active_tab?)
+    fn active_grid(&self) -> Option<&GridUi> {
+        self.grids.get(&self.active_tab?)
     }
 
-    fn active_grid_mut(&mut self, snapshot: &Snapshot) -> Option<&mut GridUi> {
-        let tab = snapshot.active_tab?;
+    fn active_grid_mut(&mut self) -> Option<&mut GridUi> {
+        let tab = self.active_tab?;
         Some(self.grids.entry(tab).or_default())
     }
 
@@ -332,7 +461,7 @@ impl UiState {
         let (row, col) = (row.min(rows - 1), col.min(cols - 1));
         let page = self.page(PaneId::Grid);
         let leftmost = self.leftmost_visible(col, snapshot);
-        if let Some(grid) = self.active_grid_mut(snapshot) {
+        if let Some(grid) = self.active_grid_mut() {
             grid.row = row;
             grid.col = col;
             grid.row_offset = scroll_into_view(grid.row_offset, row, page);
@@ -356,9 +485,7 @@ impl UiState {
         let mut first = col;
         for c in (0..=col).rev() {
             let natural = self.natural_width(c, snapshot);
-            let drawn = self
-                .active_grid(snapshot)
-                .map_or(natural, |g| g.width(c, natural));
+            let drawn = self.active_grid().map_or(natural, |g| g.width(c, natural));
             // One cell for the separator that follows every column.
             used += usize::from(drawn) + 1;
             // The cursor's own column is kept even when it is wider than the
@@ -371,30 +498,37 @@ impl UiState {
         first
     }
 
-    fn rows_of(snapshot: &Snapshot) -> Option<&Arc<PagedResult>> {
-        snapshot.active()?.preview()?.data.ready()
+    /// The rows behind the active tab, if it points at a preview the
+    /// snapshot actually has. The two can disagree for one frame: a tab just
+    /// opened has nothing in the snapshot yet, and a preview a connection's
+    /// `Disconnect` just dropped still has a tab pointing at it until
+    /// `ViewCmd::CloseTab` catches up.
+    fn rows_of<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
+        let tab = self.active_tab?;
+        let open = self.tabs.iter().find(|t| t.id == tab)?;
+        snapshot.preview(open.conn, &open.table)?.data.ready()
     }
 
     fn row_count(&self, snapshot: &Snapshot) -> usize {
-        let Some(rows) = Self::rows_of(snapshot) else {
+        let Some(rows) = self.rows_of(snapshot) else {
             return 0;
         };
         rows.row_count()
     }
 
     fn column_count(&self, snapshot: &Snapshot) -> usize {
-        let Some(rows) = Self::rows_of(snapshot) else {
+        let Some(rows) = self.rows_of(snapshot) else {
             return 0;
         };
         rows.columns().len()
     }
 
     fn natural_width(&mut self, col: usize, snapshot: &Snapshot) -> u16 {
-        let Some(rows) = Self::rows_of(snapshot) else {
+        let Some(rows) = self.rows_of(snapshot) else {
             return 0;
         };
         let rows = Arc::clone(rows);
-        let Some(tab) = snapshot.active_tab else {
+        let Some(tab) = self.active_tab else {
             return 0;
         };
         let grid = self.grids.entry(tab).or_default();
@@ -437,7 +571,7 @@ mod tests {
     use sqlake_driver_mock::mock_summary;
     use std::sync::Arc;
 
-    use sqlake_app::snapshot::{LoadState, PreviewTab, TabContent, TabView};
+    use sqlake_app::snapshot::{LoadState, PreviewView};
     use sqlake_app::tree::{NodeState, VisibleNode};
     use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeKind, NodeRef, TableRef};
@@ -445,6 +579,10 @@ mod tests {
     use sqlake_core::value::Value;
 
     use super::*;
+
+    fn table() -> TableRef {
+        TableRef::new(["public", "users"])
+    }
 
     fn rows(count: usize, columns: usize) -> Arc<PagedResult> {
         let cols: Vec<Column> = (0..columns)
@@ -456,9 +594,7 @@ mod tests {
         Arc::new(PagedResult::new(&ResultSet::new(cols, data, None)))
     }
 
-    fn snapshot(tree_rows: usize, grid_rows: usize, grid_cols: usize) -> Snapshot {
-        let conn = ConnId::new();
-        let tab = TabId::new(1);
+    fn snapshot(conn: ConnId, tree_rows: usize, grid_rows: usize, grid_cols: usize) -> Snapshot {
         let explorer = Arc::new(TreeView {
             nodes: (0..tree_rows)
                 .map(|i| VisibleNode {
@@ -485,39 +621,44 @@ mod tests {
                 capabilities: None,
             }],
             explorer,
-            tabs: vec![TabView {
-                id: tab,
+            previews: vec![PreviewView {
                 conn,
-                title: "users".into(),
-                content: TabContent::Preview(PreviewTab {
-                    table: TableRef::new(["public", "users"]),
-                    sort: None,
-                    loaded_rows: grid_rows,
-                    data: LoadState::Ready(rows(grid_rows, grid_cols)),
-                }),
+                table: table(),
+                sort: None,
+                loaded_rows: grid_rows,
+                data: LoadState::Ready(rows(grid_rows, grid_cols)),
+                last_error: None,
             }],
-            active_tab: Some(tab),
             busy: Vec::new(),
-            toasts: Vec::new(),
             should_quit: false,
         }
     }
 
-    fn ui(snap: &Snapshot) -> UiState {
+    /// A snapshot and a `UiState` with its one preview already open as tab
+    /// `TabId::new(1)` — what the render loop would have done on the frame
+    /// that first drew it.
+    fn setup(tree_rows: usize, grid_rows: usize, grid_cols: usize) -> (Snapshot, UiState) {
+        let conn = ConnId::new();
+        let snap = snapshot(conn, tree_rows, grid_rows, grid_cols);
         let mut ui = UiState::new();
         // As a frame would leave it: the pane viewports are the areas inside
         // the borders, the screen is the whole of it.
         ui.set_screen(Rect::new(0, 0, 82, 12));
         ui.set_viewport(PaneId::Explorer, Rect::new(0, 1, 20, 10));
         ui.set_viewport(PaneId::Grid, Rect::new(21, 1, 60, 10));
-        let _ = snap;
-        ui
+        ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        (snap, ui)
     }
 
     #[test]
     fn scrolling_stops_at_the_last_screenful() {
-        let snap = snapshot(30, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(30, 0, 0);
         ui.apply(
             ViewCmd::ScrollBy {
                 pane: PaneId::Explorer,
@@ -531,8 +672,7 @@ mod tests {
 
     #[test]
     fn scrolling_the_grid_continues_from_where_it_was() {
-        let snap = snapshot(0, 50, 2);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 50, 2);
         for _ in 0..3 {
             ui.apply(
                 ViewCmd::ScrollBy {
@@ -549,16 +689,14 @@ mod tests {
 
     #[test]
     fn content_shorter_than_the_pane_never_scrolls() {
-        let snap = snapshot(3, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(3, 0, 0);
         ui.apply(ViewCmd::ScrollToEnd(PaneId::Explorer), &snap);
         assert_eq!(ui.tree.offset, 0, "there is nothing below to reach");
     }
 
     #[test]
     fn a_track_click_lands_proportionally() {
-        let snap = snapshot(30, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(30, 0, 0);
         ui.apply(
             ViewCmd::ScrollToRatio {
                 pane: PaneId::Explorer,
@@ -571,8 +709,7 @@ mod tests {
 
     #[test]
     fn the_selection_pulls_the_viewport_with_it() {
-        let snap = snapshot(30, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(30, 0, 0);
         ui.apply(ViewCmd::SelectTreeRow(25), &snap);
         assert_eq!(ui.tree.selected, Some(25));
         // Just far enough that row 25 is the last visible row, not a jump that
@@ -585,8 +722,7 @@ mod tests {
 
     #[test]
     fn the_first_move_selects_the_first_row() {
-        let snap = snapshot(30, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(30, 0, 0);
         assert_eq!(ui.tree.selected, None);
         ui.apply(ViewCmd::MoveTreeSelection(1), &snap);
         assert_eq!(ui.tree.selected, Some(0), "not row one");
@@ -594,8 +730,7 @@ mod tests {
 
     #[test]
     fn selection_cannot_leave_the_content() {
-        let snap = snapshot(3, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(3, 0, 0);
         ui.apply(ViewCmd::MoveTreeSelection(-5), &snap);
         assert_eq!(ui.tree.selected, Some(0));
         ui.apply(ViewCmd::SelectTreeRow(99), &snap);
@@ -604,16 +739,14 @@ mod tests {
 
     #[test]
     fn an_empty_tree_has_nothing_selected() {
-        let snap = snapshot(0, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 0, 0);
         ui.apply(ViewCmd::SelectTreeRow(0), &snap);
         assert_eq!(ui.tree.selected, None);
     }
 
     #[test]
     fn the_cell_cursor_stays_inside_the_result() {
-        let snap = snapshot(0, 50, 4);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 50, 4);
         ui.apply(ViewCmd::SelectCell { row: 99, col: 99 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
         assert_eq!((grid.row, grid.col), (49, 3));
@@ -621,8 +754,7 @@ mod tests {
 
     #[test]
     fn moving_the_cell_cursor_scrolls_the_grid() {
-        let snap = snapshot(0, 50, 4);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 50, 4);
         ui.apply(ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
         ui.apply(ViewCmd::MoveCellSelection { drow: 20, dcol: 0 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
@@ -634,8 +766,7 @@ mod tests {
     fn the_cell_cursor_pulls_the_grid_sideways() {
         // Sixty columns of at least the minimum width: the cursor cannot reach
         // column fifty without the grid scrolling after it.
-        let snap = snapshot(0, 10, 60);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 10, 60);
         ui.apply(ViewCmd::SelectCell { row: 0, col: 50 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
         assert_eq!(grid.col, 50);
@@ -651,18 +782,16 @@ mod tests {
 
     #[test]
     fn a_grid_with_no_rows_ignores_the_cursor() {
-        let snap = snapshot(0, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 0, 0);
         ui.apply(ViewCmd::SelectCell { row: 3, col: 3 }, &snap);
         assert!(ui.grid(TabId::new(1)).is_none_or(|g| g.row == 0));
     }
 
     #[test]
     fn a_resized_column_keeps_its_width() {
-        let snap = snapshot(0, 10, 3);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 10, 3);
         let natural = {
-            let rows = UiState::rows_of(&snap).unwrap().clone();
+            let rows = ui.rows_of(&snap).unwrap().clone();
             ui.grid_mut(TabId::new(1)).grid(&rows).columns()[1].natural_width
         };
         ui.apply(ViewCmd::ResizeColumn { col: 1, delta: 5 }, &snap);
@@ -673,8 +802,7 @@ mod tests {
 
     #[test]
     fn a_column_cannot_be_dragged_to_nothing() {
-        let snap = snapshot(0, 10, 3);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 10, 3);
         ui.apply(
             ViewCmd::ResizeColumn {
                 col: 0,
@@ -687,9 +815,8 @@ mod tests {
 
     #[test]
     fn the_rendered_grid_is_built_once_per_page() {
-        let snap = snapshot(0, 10, 2);
-        let mut ui = ui(&snap);
-        let rows = UiState::rows_of(&snap).unwrap().clone();
+        let (snap, mut ui) = setup(0, 10, 2);
+        let rows = ui.rows_of(&snap).unwrap().clone();
         let first = ui.grid_mut(TabId::new(1)).grid(&rows) as *const RenderedGrid;
         let again = ui.grid_mut(TabId::new(1)).grid(&rows) as *const RenderedGrid;
         assert_eq!(first, again, "an unchanged snapshot must not rebuild it");
@@ -697,8 +824,7 @@ mod tests {
 
     #[test]
     fn focus_cycles_between_the_two_panes() {
-        let snap = snapshot(0, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 0, 0);
         assert_eq!(ui.focus, PaneId::Explorer);
         ui.apply(ViewCmd::FocusNextPane, &snap);
         assert_eq!(ui.focus, PaneId::Grid);
@@ -710,8 +836,7 @@ mod tests {
 
     #[test]
     fn focus_from_outside_the_cycle_enters_it() {
-        let snap = snapshot(0, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 0, 0);
         ui.apply(ViewCmd::FocusPane(PaneId::StatusBar), &snap);
         ui.apply(ViewCmd::FocusNextPane, &snap);
         assert_eq!(ui.focus, PaneId::Explorer);
@@ -719,8 +844,7 @@ mod tests {
 
     #[test]
     fn the_splitter_leaves_both_panes_usable() {
-        let snap = snapshot(0, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 0, 0);
         ui.apply(
             ViewCmd::MoveSplit {
                 split: SplitId::Explorer,
@@ -747,7 +871,7 @@ mod tests {
         // Deriving the screen width from the pane viewports loses a column per
         // border, and a drag one cell to the right then moves the splitter one
         // cell to the left.
-        let snap = snapshot(0, 0, 0);
+        let snap = snapshot(ConnId::new(), 0, 0, 0);
         let mut ui = UiState::new();
         ui.set_screen(Rect::new(0, 0, 100, 30));
         ui.set_viewport(PaneId::Explorer, Rect::new(1, 2, 26, 26));
@@ -766,8 +890,7 @@ mod tests {
 
     #[test]
     fn evening_the_split_returns_to_a_fraction_of_the_screen() {
-        let snap = snapshot(0, 0, 0);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 0, 0);
         let default = ui.explorer_width(100);
         ui.apply(
             ViewCmd::MoveSplit {
@@ -785,25 +908,96 @@ mod tests {
 
     #[test]
     fn a_screen_too_narrow_for_both_still_yields_a_layout() {
-        let snap = snapshot(0, 0, 0);
-        let ui = ui(&snap);
+        let (_snap, ui) = setup(0, 0, 0);
         let width = ui.explorer_width(10);
         assert!(width <= 10, "{width}");
     }
 
     #[test]
     fn closing_a_tab_releases_its_view_state() {
-        let mut snap = snapshot(0, 10, 2);
-        let mut ui = ui(&snap);
+        let (snap, mut ui) = setup(0, 10, 2);
         ui.apply(ViewCmd::SelectCell { row: 1, col: 1 }, &snap);
-        assert!(ui.grid(TabId::new(1)).is_some());
+        let tab = ui.active_tab.unwrap();
+        assert!(ui.grid(tab).is_some());
 
-        snap.tabs.clear();
-        snap.active_tab = None;
-        ui.retain_tabs(&snap);
-        assert!(
-            ui.grid(TabId::new(1)).is_none(),
-            "the cached grid goes with it"
+        ui.apply(ViewCmd::CloseTab(tab), &snap);
+        assert!(ui.grid(tab).is_none(), "the cached grid goes with it");
+    }
+
+    #[test]
+    fn opening_a_relation_already_open_selects_it_instead_of_duplicating() {
+        let (snap, mut ui) = setup(0, 0, 0);
+        let first = ui.active_tab.unwrap();
+        let conn = ui.tabs[0].conn;
+
+        // A second tab, so the first is no longer active — reopening it must
+        // find it rather than assume it is still in front.
+        ui.apply(
+            ViewCmd::OpenTab {
+                conn: ConnId::new(),
+                table: TableRef::new(["public", "orders"]),
+            },
+            &snap,
         );
+        assert_ne!(ui.active_tab, Some(first));
+
+        ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        assert_eq!(ui.tabs.len(), 2, "the first relation must not open twice");
+        assert_eq!(ui.active_tab, Some(first));
+    }
+
+    #[test]
+    fn closing_a_tab_selects_its_neighbour() {
+        let (snap, mut ui) = setup(0, 0, 0);
+        let first = ui.active_tab.unwrap();
+        ui.apply(
+            ViewCmd::OpenTab {
+                conn: ConnId::new(),
+                table: TableRef::new(["public", "orders"]),
+            },
+            &snap,
+        );
+
+        ui.apply(ViewCmd::CloseTab(first), &snap);
+        assert_eq!(ui.tabs.len(), 1);
+        assert_eq!(ui.active_tab, Some(ui.tabs[0].id));
+    }
+
+    #[test]
+    fn closing_the_last_tab_leaves_nothing_selected() {
+        let (snap, mut ui) = setup(0, 0, 0);
+        let tab = ui.active_tab.unwrap();
+        ui.apply(ViewCmd::CloseTab(tab), &snap);
+        assert!(ui.tabs.is_empty());
+        assert_eq!(ui.active_tab, None);
+    }
+
+    #[test]
+    fn a_new_preview_error_becomes_a_toast_once() {
+        let (mut snap, mut ui) = setup(0, 0, 0);
+
+        snap.previews[0].last_error = Some("timed out".to_owned());
+        ui.raise_preview_errors(&snap);
+        assert_eq!(ui.toasts.len(), 1);
+        assert_eq!(ui.toasts[0].text, "timed out");
+
+        // The same snapshot again — a redraw with nothing new — must not
+        // raise a second toast for a message already shown.
+        ui.raise_preview_errors(&snap);
+        assert_eq!(ui.toasts.len(), 1);
+
+        // Success clears the record, so the *same* text failing again later
+        // is treated as new rather than silently swallowed.
+        snap.previews[0].last_error = None;
+        ui.raise_preview_errors(&snap);
+        snap.previews[0].last_error = Some("timed out".to_owned());
+        ui.raise_preview_errors(&snap);
+        assert_eq!(ui.toasts.len(), 2);
     }
 }

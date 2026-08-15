@@ -2,18 +2,22 @@
 //!
 //! Published on a watch channel and cloned freely, so every heavy field sits
 //! behind an `Arc`. Nothing here describes appearance: scroll offsets, column
-//! widths, selection and focus belong to `UiState` in the TUI crate.
+//! widths, selection and focus belong to `UiState` in the TUI crate — and
+//! nothing here describes a screen at all: which previews a front-end has
+//! open, in what order, and which one it is looking at is that front-end's
+//! own bookkeeping, not a fact about the data. A preview is addressed by the
+//! connection and table it belongs to, not by a number this crate hands out.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
-use sqlake_core::id::{ConnId, ProfileId, TabId};
+use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
 use sqlake_core::result::Sort;
 
-use crate::action::{BusyId, ToastId};
+use crate::action::BusyId;
 use crate::pages::PagedResult;
 use crate::tree::{TreeView, VisibleNode};
 
@@ -81,49 +85,37 @@ impl ConnectionView {
     }
 }
 
+/// A relation's data, as far as it has been fetched.
+///
+/// Addressed by `(conn, table)`, not by an id this crate mints: two
+/// front-ends asking for the same relation on the same connection are asking
+/// for the same thing, and neither owns "the" view onto it. Which of these a
+/// screen has open, their order, and which has focus belongs to the
+/// front-end.
 #[derive(Debug, Clone)]
-pub struct PreviewTab {
+pub struct PreviewView {
+    pub conn: ConnId,
     pub table: TableRef,
     pub sort: Option<Sort>,
     /// Rows fetched so far. Paging appends, so this only grows.
     pub loaded_rows: usize,
     pub data: LoadState<Arc<PagedResult>>,
+    /// A page that failed to extend `data`, without disturbing it.
+    ///
+    /// Set instead of turning `data` into `Failed`: the rows already on
+    /// screen are still good, and replacing them with an error panel would
+    /// both lose them and leave the next request starting from the wrong
+    /// offset. Cleared by the next request that reaches this preview, success
+    /// or failure — a front-end that wants a fleeting notice can watch for the
+    /// text changing; that decision belongs to it, not to this crate.
+    pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub enum TabContent {
-    Preview(PreviewTab),
-}
-
-#[derive(Debug, Clone)]
-pub struct TabView {
-    pub id: TabId,
-    pub conn: ConnId,
-    pub title: String,
-    pub content: TabContent,
-}
-
-impl TabView {
-    #[must_use]
-    pub fn preview(&self) -> Option<&PreviewTab> {
-        let TabContent::Preview(p) = &self.content;
-        Some(p)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Severity {
     Info,
     Warning,
     Error,
-}
-
-#[derive(Debug, Clone)]
-pub struct Toast {
-    pub id: ToastId,
-    pub text: String,
-    pub severity: Severity,
-    pub created_at: Instant,
 }
 
 /// What a busy item is waiting for.
@@ -136,10 +128,10 @@ pub struct Toast {
 pub enum BusyOwner {
     Connection(ConnId),
     Node { conn: ConnId, node: NodeRef },
-    Tab(TabId),
+    Preview { conn: ConnId, table: TableRef },
 }
 
-/// A running operation, shown in the status bar with a way to stop it.
+/// A running, cancellable operation.
 #[derive(Debug, Clone)]
 pub struct BusyItem {
     pub id: BusyId,
@@ -168,10 +160,8 @@ pub struct Snapshot {
     /// row like any other, and its objects are rows underneath it. Drawing is
     /// still a slice and an index — there is simply more than one root now.
     pub explorer: Arc<TreeView>,
-    pub tabs: Vec<TabView>,
-    pub active_tab: Option<TabId>,
+    pub previews: Vec<PreviewView>,
     pub busy: Vec<BusyItem>,
-    pub toasts: Vec<Toast>,
     pub should_quit: bool,
 }
 
@@ -190,13 +180,10 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub fn tab(&self, id: TabId) -> Option<&TabView> {
-        self.tabs.iter().find(|t| t.id == id)
-    }
-
-    #[must_use]
-    pub fn active(&self) -> Option<&TabView> {
-        self.active_tab.and_then(|id| self.tab(id))
+    pub fn preview(&self, conn: ConnId, table: &TableRef) -> Option<&PreviewView> {
+        self.previews
+            .iter()
+            .find(|p| p.conn == conn && &p.table == table)
     }
 
     #[must_use]
@@ -225,7 +212,7 @@ mod tests {
     fn a_fresh_snapshot_shows_nothing_and_does_not_quit() {
         let s = Snapshot::default();
         assert!(s.connections.is_empty());
-        assert!(s.active().is_none());
+        assert!(s.previews.is_empty());
         assert!(!s.is_busy());
         assert!(!s.should_quit);
     }
@@ -234,7 +221,10 @@ mod tests {
     fn lookups_miss_cleanly() {
         let s = Snapshot::default();
         assert!(s.connection(ConnId::new()).is_none());
-        assert!(s.tab(TabId::new(1)).is_none());
+        assert!(
+            s.preview(ConnId::new(), &TableRef::new(["public", "users"]))
+                .is_none()
+        );
         assert_eq!(s.tree(ConnId::new()).count(), 0);
     }
 
@@ -261,33 +251,23 @@ mod tests {
     }
 
     #[test]
-    fn the_active_tab_resolves_through_the_tab_list() {
-        let id = TabId::new(3);
+    fn a_preview_resolves_by_connection_and_table() {
+        let conn_id = ConnId::new();
+        let table = TableRef::new(["public", "users"]);
         let s = Snapshot {
-            tabs: vec![TabView {
-                id,
-                conn: ConnId::new(),
-                title: "users".into(),
-                content: TabContent::Preview(PreviewTab {
-                    table: TableRef::new(["public", "users"]),
-                    sort: None,
-                    loaded_rows: 0,
-                    data: LoadState::Loading,
-                }),
+            previews: vec![PreviewView {
+                conn: conn_id,
+                table: table.clone(),
+                sort: None,
+                loaded_rows: 0,
+                data: LoadState::Loading,
+                last_error: None,
             }],
-            active_tab: Some(id),
             ..Snapshot::default()
         };
-        assert_eq!(s.active().map(|t| t.title.as_str()), Some("users"));
-        assert!(s.active().unwrap().preview().unwrap().data.is_loading());
-    }
-
-    #[test]
-    fn a_dangling_active_tab_id_does_not_panic() {
-        let s = Snapshot {
-            active_tab: Some(TabId::new(9)),
-            ..Snapshot::default()
-        };
-        assert!(s.active().is_none());
+        assert!(s.preview(conn_id, &table).unwrap().data.is_loading());
+        // A different connection asking for the same table name is not this
+        // preview: the two have nothing to do with each other.
+        assert!(s.preview(ConnId::new(), &table).is_none());
     }
 }

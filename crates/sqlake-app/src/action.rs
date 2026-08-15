@@ -7,11 +7,15 @@
 //! Everything here either touches data or performs I/O. Scrolling, selection,
 //! column widths and split positions are *not* actions: they are handled inside
 //! the render loop, because routing them through an async task adds a round
-//! trip to every wheel tick.
+//! trip to every wheel tick. Nor is which of these previews a screen currently
+//! has open, in what order, or which one has focus — that is the front-end's
+//! own bookkeeping, addressed here by connection and table rather than by a
+//! tab number, so a second front-end asking for the same relation is asking
+//! for the same thing rather than a tab it does not have.
 
 use std::fmt;
 
-use sqlake_core::id::{ConnId, ProfileId, TabId};
+use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::node::{NodeRef, TableRef};
 
 /// Identifies one long-running operation, so it can be shown and cancelled.
@@ -19,21 +23,6 @@ use sqlake_core::node::{NodeRef, TableRef};
 pub struct BusyId(u64);
 
 impl BusyId {
-    #[must_use]
-    pub const fn new(n: u64) -> Self {
-        Self(n)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ToastId(u64);
-
-impl ToastId {
     #[must_use]
     pub const fn new(n: u64) -> Self {
         Self(n)
@@ -60,8 +49,7 @@ pub enum Action {
         node: NodeRef,
     },
 
-    /// Open a preview tab for a relation, reusing an existing tab if one is
-    /// already showing it.
+    /// Fetch a relation, reusing what is already cached for it.
     PreviewTable {
         conn: ConnId,
         table: TableRef,
@@ -73,22 +61,26 @@ pub enum Action {
     /// toggles it. Sending a direction computed by the view would race with a
     /// sort that is already in flight.
     SortPreview {
-        tab: TabId,
+        conn: ConnId,
+        table: TableRef,
         column: usize,
     },
 
     /// Fetch the next page into an existing preview.
     LoadMore {
-        tab: TabId,
+        conn: ConnId,
+        table: TableRef,
     },
 
-    SelectTab(TabId),
-    CloseTab(TabId),
+    /// A front-end no longer has this preview open anywhere, so its cache
+    /// entry and any page still in flight for it can go.
+    ForgetPreview {
+        conn: ConnId,
+        table: TableRef,
+    },
 
     /// Cancel a running operation.
     Cancel(BusyId),
-
-    DismissToast(ToastId),
 
     Quit,
 }
@@ -101,12 +93,10 @@ impl fmt::Display for Action {
             Self::Disconnect(id) => write!(f, "disconnect({})", id.short()),
             Self::ToggleNode { node, .. } => write!(f, "toggle({node})"),
             Self::PreviewTable { table, .. } => write!(f, "preview({table})"),
-            Self::SortPreview { tab, column } => write!(f, "sort({tab}, col {column})"),
-            Self::LoadMore { tab } => write!(f, "load_more({tab})"),
-            Self::SelectTab(tab) => write!(f, "select_tab({tab})"),
-            Self::CloseTab(tab) => write!(f, "close_tab({tab})"),
+            Self::SortPreview { table, column, .. } => write!(f, "sort({table}, col {column})"),
+            Self::LoadMore { table, .. } => write!(f, "load_more({table})"),
+            Self::ForgetPreview { table, .. } => write!(f, "forget_preview({table})"),
             Self::Cancel(id) => write!(f, "cancel({})", id.get()),
-            Self::DismissToast(id) => write!(f, "dismiss_toast({})", id.get()),
             Self::Quit => f.write_str("quit"),
         }
     }
@@ -131,9 +121,10 @@ mod tests {
         // If a direction were carried here, two fast clicks would race against
         // the sort already in flight. The store owns the current direction.
         let a = Action::SortPreview {
-            tab: TabId::new(1),
+            conn: ConnId::new(),
+            table: TableRef::new(["public", "users"]),
             column: 2,
         };
-        assert_eq!(a.to_string(), "sort(#1, col 2)");
+        assert_eq!(a.to_string(), "sort(public.users, col 2)");
     }
 }

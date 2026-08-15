@@ -15,20 +15,19 @@ use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
-use sqlake_core::id::{ConnId, ProfileId, TabId};
+use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
-use crate::action::{Action, BusyId, ToastId};
+use crate::action::{Action, BusyId};
 use crate::error::{AppError, AppResult};
 use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
-    BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot,
-    TabContent, TabView, Toast,
+    BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewView, Snapshot,
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
@@ -92,12 +91,9 @@ impl Store {
             page_size: page_size.max(1),
             events: event_tx,
             conns: Vec::new(),
-            tabs: Vec::new(),
-            active_tab: None,
+            previews: Vec::new(),
             busy: Vec::new(),
             tasks: HashMap::new(),
-            toasts: Vec::new(),
-            next_tab: 1,
             next_id: 1,
             should_quit: false,
             rev: 0,
@@ -145,7 +141,8 @@ enum Event {
         result: AppResult<ExpandNodeOutput>,
     },
     Previewed {
-        tab: TabId,
+        conn: ConnId,
+        table: TableRef,
         /// Likewise: a stale reply, successful or not, must not overwrite a
         /// newer page.
         page: PageRequest,
@@ -193,8 +190,8 @@ fn root_state(conn: &Conn) -> NodeState {
 
 /// A page request that has gone out and not yet come back.
 ///
-/// The tab keeps this rather than optimistically advancing `page`, so that a
-/// failed or cancelled request leaves the tab describing what it actually
+/// The preview keeps this rather than optimistically advancing `page`, so
+/// that a failed or cancelled request leaves it describing what it actually
 /// holds. It is also the only correct guard against a second `LoadMore`: the
 /// old one tested `data`, which an append deliberately leaves `Ready`.
 #[derive(Debug)]
@@ -204,9 +201,11 @@ struct PendingPage {
     append: bool,
 }
 
+/// A relation's data, addressed by the connection and table it belongs to —
+/// not by an id this crate mints. Which of these a screen has open, their
+/// order, and which has focus is the front-end's own bookkeeping.
 #[derive(Debug)]
-struct Tab {
-    id: TabId,
+struct Preview {
     conn: ConnId,
     table: TableRef,
     sort: Option<Sort>,
@@ -215,6 +214,7 @@ struct Tab {
     pending: Option<PendingPage>,
     data: LoadState<Arc<PagedResult>>,
     loaded_rows: usize,
+    last_error: Option<String>,
 }
 
 struct Runtime {
@@ -224,12 +224,9 @@ struct Runtime {
     page_size: u32,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
-    tabs: Vec<Tab>,
-    active_tab: Option<TabId>,
+    previews: Vec<Preview>,
     busy: Vec<BusyItem>,
     tasks: HashMap<BusyId, AbortHandle>,
-    toasts: Vec<Toast>,
-    next_tab: u32,
     next_id: u64,
     should_quit: bool,
     rev: u64,
@@ -290,16 +287,6 @@ impl Runtime {
         self.tasks.remove(&id);
     }
 
-    fn toast(&mut self, severity: Severity, text: impl Into<String>) {
-        let id = ToastId::new(self.alloc_id());
-        self.toasts.push(Toast {
-            id,
-            text: text.into(),
-            severity,
-            created_at: Instant::now(),
-        });
-    }
-
     fn spawn_task<F>(&mut self, busy: BusyId, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -314,8 +301,10 @@ impl Runtime {
         self.conns.iter_mut().find(|c| c.id == id)
     }
 
-    fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
-        self.tabs.iter_mut().find(|t| t.id == id)
+    fn preview_mut(&mut self, conn: ConnId, table: &TableRef) -> Option<&mut Preview> {
+        self.previews
+            .iter_mut()
+            .find(|p| p.conn == conn && &p.table == table)
     }
 
     fn session(&self, id: ConnId) -> Option<SessionHandle> {
@@ -333,16 +322,16 @@ impl Runtime {
             Action::Disconnect(id) => self.disconnect(id),
             Action::ToggleNode { conn, node } => self.toggle_node(conn, node),
             Action::PreviewTable { conn, table } => self.preview_table(conn, table),
-            Action::SortPreview { tab, column } => self.sort_preview(tab, column),
-            Action::LoadMore { tab } => self.load_more(tab),
-            Action::SelectTab(id) => {
-                if self.tabs.iter().any(|t| t.id == id) {
-                    self.active_tab = Some(id);
-                }
+            Action::SortPreview {
+                conn,
+                table,
+                column,
+            } => {
+                self.sort_preview(conn, table, column);
             }
-            Action::CloseTab(id) => self.close_tab(id),
+            Action::LoadMore { conn, table } => self.load_more(conn, table),
+            Action::ForgetPreview { conn, table } => self.forget_preview(conn, &table),
             Action::Cancel(id) => self.cancel(id),
-            Action::DismissToast(id) => self.toasts.retain(|t| t.id != id),
             Action::Quit => self.should_quit = true,
         }
     }
@@ -350,15 +339,38 @@ impl Runtime {
     fn connect(&mut self, profile: &ProfileId) {
         // The summary answers both questions a connection needs before its
         // secret has been read: what to call it, and which driver it wants.
+        //
+        // Unreachable from the interactive client, which only ever names a
+        // profile it already listed: a caller that can send an arbitrary id
+        // — the agent surface, eventually — sent one that does not exist, and
+        // there is no connection to attach the reason to. Logged rather than
+        // surfaced, the same as any other malformed request in this file
+        // (`SelectTab` on an unknown id was the precedent).
         let Some(summary) = self.profile_list.iter().find(|p| &p.id == profile).cloned() else {
-            self.toast(Severity::Error, format!("no profile called `{profile}`"));
+            tracing::warn!(%profile, "connect: no such profile");
             return;
         };
 
         let driver = match self.drivers.get(summary.kind) {
             Ok(d) => d,
             Err(err) => {
-                self.toast(Severity::Error, err.user_message());
+                // Unlike the lookup above, this one is real: a profile can
+                // legitimately name a driver this build has not shipped yet.
+                // A connection row is where every other connection failure
+                // shows up, so this one gets one too rather than a message
+                // with nowhere to be dismissed from.
+                self.conns.push(Conn {
+                    id: ConnId::new(),
+                    expanded: true,
+                    profile: summary.id,
+                    name: summary.name,
+                    kind: summary.kind,
+                    status: ConnStatus::Failed(err.user_message()),
+                    capabilities: None,
+                    session: None,
+                    tree: TreeState::new(),
+                    view: Arc::new(TreeView::default()),
+                });
                 return;
             }
         };
@@ -408,18 +420,12 @@ impl Runtime {
         // Nothing still in flight for this connection can be applied now, and
         // leaving the rows behind means "connecting to mock" stays in the
         // status bar after the user closed it.
-        let tabs: Vec<TabId> = self
-            .tabs
-            .iter()
-            .filter(|t| t.conn == id)
-            .map(|t| t.id)
-            .collect();
         let orphaned: Vec<BusyId> = self
             .busy
             .iter()
             .filter(|b| match &b.owner {
                 BusyOwner::Connection(c) | BusyOwner::Node { conn: c, .. } => *c == id,
-                BusyOwner::Tab(t) => tabs.contains(t),
+                BusyOwner::Preview { conn, .. } => *conn == id,
             })
             .map(|b| b.id)
             .collect();
@@ -427,12 +433,9 @@ impl Runtime {
             self.drop_task(busy);
         }
 
-        // Tabs belong to a connection; leaving them behind would show stale
-        // rows with no way to refresh them.
-        self.tabs.retain(|t| t.conn != id);
-        if !self.tabs.iter().any(|t| Some(t.id) == self.active_tab) {
-            self.active_tab = self.tabs.last().map(|t| t.id);
-        }
+        // Previews belong to a connection; leaving them behind would show
+        // stale rows with no way to refresh them.
+        self.previews.retain(|p| p.conn != id);
     }
 
     fn toggle_node(&mut self, conn_id: ConnId, node: NodeRef) {
@@ -486,37 +489,27 @@ impl Runtime {
             return;
         }
 
-        // Reuse a tab already showing this relation rather than stacking
-        // duplicates every time the user double-clicks.
-        if let Some(existing) = self
-            .tabs
-            .iter()
-            .find(|t| t.conn == conn_id && t.table == table)
-        {
-            let (id, sort) = (existing.id, existing.sort);
-            self.active_tab = Some(id);
-            // A tab whose page failed holds no rows, and `LoadMore` refuses to
-            // extend rows that are not there — so without this, opening the
-            // relation again would raise a dead tab and the only way back to
-            // the table would be closing it first. Its ordering is kept: the
-            // header is already showing the arrow.
+        // Reuse what is already cached for this relation rather than fetching
+        // it again every time a front-end asks.
+        let page_size = self.page_size;
+        if let Some(existing) = self.preview_mut(conn_id, &table) {
+            // A preview whose page failed holds no rows, and `LoadMore`
+            // refuses to extend rows that are not there — so without this,
+            // asking for the relation again would find a dead entry with no
+            // way back to the table. Its ordering is kept: a front-end
+            // already showing the sort arrow should not have it ignored.
             if existing.data.error().is_some() {
-                let page = PageRequest::first_of(self.page_size).with_sort(sort);
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.page = page;
-                    tab.data = LoadState::Loading;
-                    tab.loaded_rows = 0;
-                }
-                self.fetch_page(id, page, false);
+                let page = PageRequest::first_of(page_size).with_sort(existing.sort);
+                existing.page = page;
+                existing.data = LoadState::Loading;
+                existing.loaded_rows = 0;
+                self.fetch_page(conn_id, table, page, false);
             }
             return;
         }
 
-        let id = TabId::new(self.next_tab);
-        self.next_tab += 1;
         let page = PageRequest::first_of(self.page_size);
-        self.tabs.push(Tab {
-            id,
+        self.previews.push(Preview {
             conn: conn_id,
             table: table.clone(),
             sort: None,
@@ -524,117 +517,115 @@ impl Runtime {
             pending: None,
             data: LoadState::Loading,
             loaded_rows: 0,
+            last_error: None,
         });
-        self.active_tab = Some(id);
-        self.fetch_page(id, page, false);
+        self.fetch_page(conn_id, table, page, false);
     }
 
-    fn sort_preview(&mut self, tab_id: TabId, column: usize) {
-        let Some(conn) = self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.conn) else {
-            return;
-        };
-        // Without this, a tab whose connection has already died goes to
+    fn sort_preview(&mut self, conn_id: ConnId, table: TableRef, column: usize) {
+        // Without this, a preview whose connection has already died goes to
         // `Loading` below and stays there for ever: `fetch_page` returns
         // before sending anything, so no reply ever arrives to un-stick it.
-        if self.session(conn).is_none() {
+        if self.session(conn_id).is_none() {
             return;
         }
-        let Some(tab) = self.tab_mut(tab_id) else {
+        let Some(preview) = self.preview_mut(conn_id, &table) else {
             return;
         };
         // The store owns the direction. Deriving it in the view would race
         // with a sort already in flight.
-        let dir = match tab.sort {
+        let dir = match preview.sort {
             Some(s) if s.column == column => s.dir.toggled(),
             _ => SortDir::Asc,
         };
         let sort = Sort::new(column, dir);
-        tab.sort = Some(sort);
-        tab.data = LoadState::Loading;
-        tab.loaded_rows = 0;
+        preview.sort = Some(sort);
+        preview.data = LoadState::Loading;
+        preview.loaded_rows = 0;
         // A new ordering invalidates every page already fetched.
         let page = PageRequest::first_of(self.page_size).with_sort(Some(sort));
-        self.fetch_page(tab_id, page, false);
+        self.fetch_page(conn_id, table, page, false);
     }
 
-    fn load_more(&mut self, tab_id: TabId) {
-        let Some(tab) = self.tab_mut(tab_id) else {
+    fn load_more(&mut self, conn_id: ConnId, table: TableRef) {
+        let Some(preview) = self.preview_mut(conn_id, &table) else {
             return;
         };
-        // One page request per tab at a time. The old guard tested `data`,
-        // which an append deliberately leaves `Ready` — so two quick
-        // `LoadMore`s both went out, the first reply was dropped as stale, and
-        // the rows it carried could never be asked for again.
-        if tab.pending.is_some() {
+        // One page request per preview at a time. The old guard tested
+        // `data`, which an append deliberately leaves `Ready` — so two quick
+        // `LoadMore`s both went out, the first reply was dropped as stale,
+        // and the rows it carried could never be asked for again.
+        if preview.pending.is_some() {
             return;
         }
-        // And there has to be something to extend. After a failed page `page`
-        // still names the page that failed, so the next offset steps over it —
-        // and `previewed` has nothing to append to, so it would install that
-        // reply as the whole relation: the second page shown as the first, with
-        // nothing to say the rows before it are missing.
-        if tab.data.ready().is_none() {
+        // And there has to be something to extend. After a failed page
+        // `page` still names the page that failed, so the next offset steps
+        // over it — and `previewed` has nothing to append to, so it would
+        // install that reply as the whole relation: the second page shown
+        // as the first, with nothing to say the rows before it are missing.
+        if preview.data.ready().is_none() {
             return;
         }
-        let next = tab.page.next_page();
-        self.fetch_page(tab_id, next, true);
+        let next = preview.page.next_page();
+        self.fetch_page(conn_id, table, next, true);
     }
 
-    fn fetch_page(&mut self, tab_id: TabId, page: PageRequest, append: bool) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
-            return;
-        };
-        let (conn_id, table) = (tab.conn, tab.table.clone());
+    fn forget_preview(&mut self, conn_id: ConnId, table: &TableRef) {
+        // A page in flight for this preview has no front-end waiting on it
+        // anymore, so its busy row would otherwise stay on screen — "loading
+        // …" for something nobody is looking at — until the reply arrives
+        // and `previewed` finds nothing left to apply it to.
+        if let Some(busy) = self
+            .preview_mut(conn_id, table)
+            .and_then(|p| p.pending.as_ref())
+            .map(|p| p.busy)
+        {
+            self.drop_task(busy);
+        }
+        self.previews
+            .retain(|p| !(p.conn == conn_id && &p.table == table));
+    }
+
+    fn fetch_page(&mut self, conn_id: ConnId, table: TableRef, page: PageRequest, append: bool) {
         let Some(session) = self.session(conn_id) else {
             return;
         };
 
-        // A new request supersedes whatever was in flight — re-sorting while a
-        // page is loading, for instance. Leaving the old task running would
-        // hold a busy row on screen for a reply that is now discarded as stale.
-        if let Some(previous) = self.tab_mut(tab_id).and_then(|t| t.pending.take()) {
+        // A new request supersedes whatever was in flight — re-sorting while
+        // a page is loading, for instance. Leaving the old task running
+        // would hold a busy row on screen for a reply that is now discarded
+        // as stale.
+        if let Some(previous) = self
+            .preview_mut(conn_id, &table)
+            .and_then(|p| p.pending.take())
+        {
             self.drop_task(previous.busy);
         }
 
-        let busy = self.begin_busy(BusyOwner::Tab(tab_id), format!("loading {table}"));
-        if let Some(tab) = self.tab_mut(tab_id) {
-            tab.pending = Some(PendingPage { busy, page, append });
+        let busy = self.begin_busy(
+            BusyOwner::Preview {
+                conn: conn_id,
+                table: table.clone(),
+            },
+            format!("loading {table}"),
+        );
+        if let Some(preview) = self.preview_mut(conn_id, &table) {
+            preview.pending = Some(PendingPage { busy, page, append });
         }
         let events = self.events.clone();
+        let event_table = table.clone();
         self.spawn_task(busy, async move {
             let result = PreviewTable { session }
                 .execute(PreviewTableInput { table, page })
                 .await;
             let _ = events.send(Event::Previewed {
-                tab: tab_id,
+                conn: conn_id,
+                table: event_table,
                 page,
                 busy,
                 result,
             });
         });
-    }
-
-    fn close_tab(&mut self, id: TabId) {
-        let position = self.tabs.iter().position(|t| t.id == id);
-        // Otherwise a page in flight for this tab keeps its busy row on
-        // screen — "loading …" for a tab that is no longer there — until the
-        // reply arrives and `previewed` finds nothing left to apply it to.
-        if let Some(busy) = self
-            .tabs
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.pending.as_ref())
-            .map(|p| p.busy)
-        {
-            self.drop_task(busy);
-        }
-        self.tabs.retain(|t| t.id != id);
-        if self.active_tab == Some(id) {
-            // Select the neighbour, which is what every tabbed UI does.
-            self.active_tab = position
-                .and_then(|p| self.tabs.get(p.min(self.tabs.len().saturating_sub(1))))
-                .map(|t| t.id);
-        }
     }
 
     /// This does not stop work already running inside the driver: real
@@ -679,13 +670,13 @@ impl Runtime {
                     conn.view = Arc::new(conn.tree.flatten(conn.id));
                 }
             }
-            BusyOwner::Tab(id) => {
-                if let Some(tab) = self.tab_mut(*id) {
-                    tab.pending = None;
+            BusyOwner::Preview { conn, table } => {
+                if let Some(preview) = self.preview_mut(*conn, table) {
+                    preview.pending = None;
                     // An append that never lands leaves the rows already on
                     // screen perfectly usable.
-                    if tab.data.ready().is_none() {
-                        tab.data = LoadState::Failed(reason.to_owned());
+                    if preview.data.ready().is_none() {
+                        preview.data = LoadState::Failed(reason.to_owned());
                     }
                 }
             }
@@ -710,13 +701,14 @@ impl Runtime {
                 self.expanded(conn, node, result);
             }
             Event::Previewed {
-                tab,
+                conn,
+                table,
                 page,
                 busy,
                 result,
             } => {
                 self.end_busy(busy);
-                self.previewed(tab, page, result);
+                self.previewed(conn, table, page, result);
             }
         }
     }
@@ -739,11 +731,8 @@ impl Runtime {
                 _ => out.session.close(),
             },
             Err(err) => {
-                // Recorded on the connection and nowhere else. How a failure is
-                // surfaced is the front-end's decision — the interactive client
-                // raises a dialog for this one, and a toast beside it would be
-                // the same error reported twice, which is worse than reporting
-                // it once. The same rule as `expanded` below.
+                // Recorded on the connection and nowhere else. How a failure
+                // is surfaced is the front-end's decision.
                 if let Some(conn) = self.conn_mut(id) {
                     conn.status = ConnStatus::Failed(err.user_message());
                 }
@@ -753,8 +742,7 @@ impl Runtime {
 
     fn expanded(&mut self, id: ConnId, node: NodeRef, result: AppResult<ExpandNodeOutput>) {
         let session_died = matches!(result, Err(AppError::SessionClosed));
-        // The failure is shown on the node itself, so no toast as well: an
-        // error reported twice is worse than an error reported once.
+        // The failure is shown on the node itself.
         let outcome = result
             .map(|out| out.children)
             .map_err(|err| err.user_message());
@@ -768,68 +756,79 @@ impl Runtime {
         }
     }
 
-    /// Whether this reply appends or replaces comes from the tab's own record
-    /// of the request, not from the reply. The two can only disagree when
-    /// something has already gone wrong.
-    fn previewed(&mut self, id: TabId, page: PageRequest, result: AppResult<PreviewTableOutput>) {
+    /// Whether this reply appends or replaces comes from the preview's own
+    /// record of the request, not from the reply. The two can only disagree
+    /// when something has already gone wrong.
+    fn previewed(
+        &mut self,
+        conn_id: ConnId,
+        table: TableRef,
+        page: PageRequest,
+        result: AppResult<PreviewTableOutput>,
+    ) {
         let session_died = matches!(result, Err(AppError::SessionClosed));
         let mut conn_died = None;
-        let mut toast = None;
 
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-            // A reply for a page the tab is no longer waiting for must not
-            // overwrite what is on screen. The tab's own record is the
-            // authority, not the flag that travelled with the request.
-            let Some(pending) = tab.pending.take_if(|p| p.page == page) else {
+        if let Some(preview) = self.preview_mut(conn_id, &table) {
+            // A reply for a page the preview is no longer waiting for must
+            // not overwrite what is on screen. The preview's own record is
+            // the authority, not the flag that travelled with the request.
+            let Some(pending) = preview.pending.take_if(|p| p.page == page) else {
                 return;
             };
 
             match result {
                 Ok(out) => {
                     let rows = if pending.append {
-                        match tab.data.ready() {
+                        match preview.data.ready() {
                             Some(existing) => match existing.append(&out.result) {
-                                Some(merged) => merged,
+                                Some(merged) => {
+                                    // A successful append supersedes whatever
+                                    // the previous attempt left behind.
+                                    preview.last_error = None;
+                                    merged
+                                }
                                 None => {
-                                    toast = Some(format!(
-                                        "{} changed shape; showing the new page only",
-                                        tab.table
+                                    preview.last_error = Some(format!(
+                                        "{table} changed shape; showing the new page only"
                                     ));
                                     PagedResult::new(&out.result)
                                 }
                             },
-                            None => PagedResult::new(&out.result),
+                            None => {
+                                preview.last_error = None;
+                                PagedResult::new(&out.result)
+                            }
                         }
                     } else {
+                        preview.last_error = None;
                         PagedResult::new(&out.result)
                     };
-                    tab.page = page;
+                    preview.page = page;
                     let rows = Arc::new(rows);
-                    tab.loaded_rows = rows.row_count();
-                    tab.data = LoadState::Ready(rows);
+                    preview.loaded_rows = rows.row_count();
+                    preview.data = LoadState::Ready(rows);
                 }
                 Err(err) => {
                     let message = err.user_message();
-                    if pending.append && tab.data.ready().is_some() {
+                    if pending.append && preview.data.ready().is_some() {
                         // A failed "load more" has not invalidated the rows
                         // already fetched. Replacing them with an error panel
                         // loses them *and* leaves the next request starting
                         // from the wrong offset, because `page` never advanced.
-                        toast = Some(message);
+                        preview.last_error = Some(message);
                     } else {
-                        tab.data = LoadState::Failed(message);
-                        tab.loaded_rows = 0;
+                        preview.data = LoadState::Failed(message);
+                        preview.loaded_rows = 0;
+                        preview.last_error = None;
                     }
                     if session_died {
-                        conn_died = Some(tab.conn);
+                        conn_died = Some(conn_id);
                     }
                 }
             }
         }
 
-        if let Some(text) = toast {
-            self.toast(Severity::Error, text);
-        }
         if let Some(conn) = conn_died {
             self.session_died(conn);
         }
@@ -838,9 +837,9 @@ impl Runtime {
     /// The session actor is gone, so everything under this connection will
     /// fail the same way.
     ///
-    /// Reporting it only on the node or tab that happened to ask leaves the
-    /// connection reading `Ready` while every click on it fails, which tells
-    /// the user nothing about needing to reconnect.
+    /// Reporting it only on the node or preview that happened to ask leaves
+    /// the connection reading `Ready` while every click on it fails, which
+    /// tells the user nothing about needing to reconnect.
     fn session_died(&mut self, id: ConnId) {
         let Some(conn) = self.conn_mut(id) else {
             return;
@@ -903,24 +902,19 @@ impl Runtime {
                 })
                 .collect(),
             explorer: Arc::new(self.explorer()),
-            tabs: self
-                .tabs
+            previews: self
+                .previews
                 .iter()
-                .map(|t| TabView {
-                    id: t.id,
-                    conn: t.conn,
-                    title: t.table.name().to_owned(),
-                    content: TabContent::Preview(PreviewTab {
-                        table: t.table.clone(),
-                        sort: t.sort,
-                        loaded_rows: t.loaded_rows,
-                        data: t.data.clone(),
-                    }),
+                .map(|p| PreviewView {
+                    conn: p.conn,
+                    table: p.table.clone(),
+                    sort: p.sort,
+                    loaded_rows: p.loaded_rows,
+                    data: p.data.clone(),
+                    last_error: p.last_error.clone(),
                 })
                 .collect(),
-            active_tab: self.active_tab,
             busy: self.busy.clone(),
-            toasts: self.toasts.clone(),
             should_quit: self.should_quit,
         }
     }
@@ -1006,6 +1000,10 @@ mod tests {
         .await;
         let id = snap.connections[0].id;
         (store, rx, id)
+    }
+
+    fn preview_of<'a>(snap: &'a Snapshot, conn: ConnId, table: &TableRef) -> &'a PreviewView {
+        snap.preview(conn, table).expect("a preview")
     }
 
     #[tokio::test]
@@ -1158,15 +1156,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connecting_to_a_profile_nobody_configured_says_so() {
+    async fn connecting_to_a_profile_nobody_configured_is_ignored() {
+        // Unreachable from the interactive client, which only ever names a
+        // profile it already listed — so there is nothing to show this on:
+        // no connection row exists yet, and inventing one for a name that
+        // does not exist would misrepresent what was asked for.
         let store = store(Behaviour::instant());
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(pid("typo")));
-
-        let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
-        assert!(snap.toasts[0].text.contains("typo"), "{:?}", snap.toasts[0]);
-        // No half-made connection row for something that cannot be opened.
+        store.dispatch(Action::Quit);
+        let snap = until(&mut rx, |s| s.should_quit).await;
         assert!(snap.connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_profile_naming_an_unbuilt_driver_fails_as_a_connection() {
+        let store = Store::spawn(
+            Drivers::new(),
+            Arc::new(UnservedProfile(DriverKind::Postgres)),
+            PageRequest::DEFAULT_LIMIT,
+        );
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("unserved")));
+
+        let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
+        assert_eq!(
+            snap.connections[0].status,
+            ConnStatus::Failed("no driver registered for postgres".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -1182,21 +1199,6 @@ mod tests {
         let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
         assert_eq!(snap.connections[0].status, ConnStatus::Connecting);
         assert!(snap.is_busy());
-    }
-
-    #[tokio::test]
-    async fn a_failed_connection_is_reported_on_the_connection_and_in_a_toast() {
-        let store = Store::spawn(
-            Drivers::new(),
-            Arc::new(UnservedProfile(DriverKind::Postgres)),
-            PageRequest::DEFAULT_LIMIT,
-        );
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("unserved")));
-
-        let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
-        assert_eq!(snap.toasts[0].severity, Severity::Error);
-        assert!(snap.toasts[0].text.contains("no driver registered"));
     }
 
     #[tokio::test]
@@ -1231,50 +1233,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn previewing_opens_a_tab_and_fills_it() {
-        let (store, mut rx, conn) = connected_store().await;
-        store.dispatch(Action::PreviewTable {
-            conn,
-            table: TableRef::new(["public", "users"]),
-        });
-
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
-                .is_some_and(|p| p.data.ready().is_some())
-        })
-        .await;
-        let tab = snap.active().unwrap();
-        assert_eq!(tab.title, "users");
-        assert_eq!(tab.preview().unwrap().data.ready().unwrap().row_count(), 50);
-    }
-
-    #[tokio::test]
-    async fn previewing_the_same_relation_twice_reuses_its_tab() {
+    async fn previewing_fills_a_preview_for_that_relation() {
         let (store, mut rx, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| s.tabs.len() == 1).await;
+
+        let snap = until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let preview = preview_of(&snap, conn, &table);
+        assert_eq!(preview.data.ready().unwrap().row_count(), 50);
+    }
+
+    #[tokio::test]
+    async fn previewing_the_same_relation_twice_does_not_duplicate_it() {
+        let (store, mut rx, conn) = connected_store().await;
+        let table = TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        until(&mut rx, |s| s.previews.len() == 1).await;
 
         store.dispatch(Action::PreviewTable { conn, table });
         store.dispatch(Action::PreviewTable {
             conn,
             table: TableRef::new(["public", "empty"]),
         });
-        let snap = until(&mut rx, |s| s.tabs.len() == 2).await;
-        assert_eq!(snap.tabs.len(), 2, "the first relation must not open twice");
+        let snap = until(&mut rx, |s| s.previews.len() == 2).await;
+        assert_eq!(
+            snap.previews.len(),
+            2,
+            "the first relation must not open twice"
+        );
     }
 
     #[tokio::test]
-    async fn opening_a_relation_whose_page_failed_asks_again() {
-        // Reuse and failure meet here: the tab is raised rather than opened
-        // twice, and a raised tab holding an error has nothing to raise. Since
-        // `LoadMore` will not extend rows that are not there, opening the
-        // relation is the only retry there is — without this, the tab is dead
-        // until it is closed.
+    async fn asking_again_for_a_relation_whose_page_failed_retries_it() {
+        // Reuse and failure meet here: asking for an already-cached relation
+        // does not refetch it, and a cached relation holding an error has
+        // nothing to reuse. Since `LoadMore` will not extend rows that are
+        // not there, asking again is the only retry there is — without this,
+        // the entry is dead until something forgets it.
         let store = store(Behaviour {
             flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 1)],
             ..Behaviour::instant()
@@ -1292,28 +1297,28 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
-        store.dispatch(Action::PreviewTable { conn, table });
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
         .await;
 
-        assert_eq!(snap.tabs.len(), 1, "the retry opened a second tab");
-        assert_eq!(rows_of(&snap, tab), 50);
+        assert_eq!(snap.previews.len(), 1, "the retry duplicated the entry");
+        assert_eq!(rows_of(&snap, conn, &table), 50);
     }
 
     #[tokio::test]
-    async fn a_failing_preview_marks_the_tab_not_the_whole_app() {
+    async fn a_failing_preview_marks_itself_not_the_whole_app() {
         let store = store(Behaviour {
             failing_nodes: vec![vec!["analytics".to_owned(), "broken".to_owned()]],
             ..Behaviour::instant()
@@ -1325,22 +1330,19 @@ mod tests {
         })
         .await;
         let conn = snap.connections[0].id;
+        let table = TableRef::new(["analytics", "broken"]);
 
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["analytics", "broken"]),
+            table: table.clone(),
         });
         let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
         .await;
         assert!(
-            snap.active()
-                .unwrap()
-                .preview()
-                .unwrap()
+            preview_of(&snap, conn, &table)
                 .data
                 .error()
                 .unwrap()
@@ -1352,71 +1354,86 @@ mod tests {
     #[tokio::test]
     async fn sorting_replaces_the_page_rather_than_appending() {
         let (store, mut rx, conn) = connected_store().await;
+        let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "users"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
-        store.dispatch(Action::SortPreview { tab, column: 0 });
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 0,
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
-                .and_then(|p| p.sort)
-                .is_some()
+            s.preview(conn, &table).and_then(|p| p.sort).is_some()
         })
         .await;
-        let preview = snap.tab(tab).unwrap().preview().unwrap();
-        assert_eq!(preview.sort.unwrap().dir, SortDir::Asc);
+        assert_eq!(
+            preview_of(&snap, conn, &table).sort.unwrap().dir,
+            SortDir::Asc
+        );
 
-        store.dispatch(Action::SortPreview { tab, column: 0 });
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 0,
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .and_then(|p| p.sort)
                 .is_some_and(|s| s.dir == SortDir::Desc)
         })
         .await;
         // Still one page: a re-sort invalidates everything already fetched.
-        let preview = snap.tab(tab).unwrap().preview().unwrap();
-        assert_eq!(preview.data.ready().unwrap().row_count(), 50);
+        assert_eq!(
+            preview_of(&snap, conn, &table)
+                .data
+                .ready()
+                .unwrap()
+                .row_count(),
+            50
+        );
     }
 
     #[tokio::test]
     async fn two_quick_load_mores_do_not_skip_a_page() {
         let (store, mut rx, conn) = connected_store().await;
+        let table = TableRef::new(["public", "big"]);
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "big"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
         // Key repeat, or a wheel resting on the last row. The old guard tested
         // `data`, which an append leaves `Ready`, so both went out: the first
         // reply was dropped as stale and rows 201-400 could never be asked for
         // again, leaving a table that silently joined 1-200 to 401-600.
-        store.dispatch(Action::LoadMore { tab });
-        store.dispatch(Action::LoadMore { tab });
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
 
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows >= 400)
         })
         .await;
-        let preview = snap.tab(tab).and_then(TabView::preview).unwrap();
+        let preview = preview_of(&snap, conn, &table);
         assert_eq!(preview.loaded_rows, 400);
 
         let grid = preview.data.ready().unwrap();
@@ -1444,37 +1461,44 @@ mod tests {
         })
         .await;
         let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "big"]);
 
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "big"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
-        store.dispatch(Action::LoadMore { tab });
-        let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.last_error.is_some())
+        })
+        .await;
 
         // The rows already fetched are still good. Replacing them with an
         // error panel loses them and leaves the next request starting from the
         // wrong offset.
-        let preview = snap.tab(tab).and_then(TabView::preview).unwrap();
+        let preview = preview_of(&snap, conn, &table);
         assert_eq!(preview.loaded_rows, 200);
         assert!(preview.data.ready().is_some(), "the table is still there");
-        assert_eq!(snap.toasts[0].severity, Severity::Error);
+        assert!(preview.last_error.is_some());
     }
 
     #[tokio::test]
     async fn load_more_on_a_page_that_failed_asks_for_nothing() {
         // Fails once, so a second request would succeed and be believed. The
-        // tab is still on the page that failed, so the next offset steps over
-        // it: rows 201-400 would arrive with nothing to append them to and be
-        // shown as the whole relation, the first 200 missing without a word.
+        // preview is still on the page that failed, so the next offset steps
+        // over it: rows 201-400 would arrive with nothing to append them to
+        // and be shown as the whole relation, the first 200 missing without a
+        // word.
         let store = store(Behaviour {
             flaky_nodes: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
             ..Behaviour::instant()
@@ -1486,27 +1510,29 @@ mod tests {
         })
         .await;
         let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "big"]);
 
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "big"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
-        store.dispatch(Action::LoadMore { tab });
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
         // Actions are handled in order, so a snapshot that has seen the quit
         // has seen the `LoadMore` — and nothing is loading because of it.
         store.dispatch(Action::Quit);
         let snap = until(&mut rx, |s| s.should_quit).await;
 
         assert!(snap.busy.is_empty(), "a page went out anyway");
-        let preview = snap.tab(tab).and_then(TabView::preview).unwrap();
+        let preview = preview_of(&snap, conn, &table);
         assert!(preview.data.error().is_some(), "still the failed page");
         assert_eq!(preview.loaded_rows, 0);
     }
@@ -1573,33 +1599,27 @@ mod tests {
     #[tokio::test]
     async fn load_more_appends_to_what_is_already_there() {
         let (store, mut rx, conn) = connected_store().await;
+        let table = TableRef::new(["public", "big"]);
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "big"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
-        store.dispatch(Action::LoadMore { tab });
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 400)
         })
         .await;
-        let grid = snap
-            .tab(tab)
-            .unwrap()
-            .preview()
-            .unwrap()
-            .data
-            .ready()
-            .unwrap();
+        let grid = preview_of(&snap, conn, &table).data.ready().unwrap();
         assert_eq!(grid.row_count(), 400);
         assert_eq!(grid.total_rows(), Some(200_000));
     }
@@ -1617,45 +1637,44 @@ mod tests {
         })
         .await;
         let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "big"]);
 
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "big"]),
+            table: table.clone(),
         });
         let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
         .await;
-        let tab = snap.active_tab.unwrap();
-        assert_eq!(rows_of(&snap, tab), 25);
+        assert_eq!(rows_of(&snap, conn, &table), 25);
 
         // Sorting starts the relation again, and starting again is also a page.
-        store.dispatch(Action::SortPreview { tab, column: 0 });
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 0,
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.sort.is_some() && p.data.ready().is_some())
         })
         .await;
-        assert_eq!(rows_of(&snap, tab), 25);
+        assert_eq!(rows_of(&snap, conn, &table), 25);
 
         // And the page after it starts where this one stopped, rather than at
         // the built-in size: an offset that moves by more than the page leaves
         // a gap no scroll can reach.
-        store.dispatch(Action::LoadMore { tab });
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
-                .is_some_and(|p| p.loaded_rows == 50)
+            s.preview(conn, &table).is_some_and(|p| p.loaded_rows == 50)
         })
         .await;
-        let grid = snap
-            .tab(tab)
-            .and_then(TabView::preview)
-            .and_then(|p| p.data.ready())
-            .expect("a loaded page");
+        let grid = preview_of(&snap, conn, &table).data.ready().unwrap();
         assert_eq!(grid.row_count(), 50);
         for row in 0..grid.row_count() {
             assert_eq!(
@@ -1668,10 +1687,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_retry_keeps_the_ordering_the_header_is_showing() {
-        // Sorting a tab whose page failed leaves the arrow drawn and no rows
-        // under it. If the retry asked for the relation unordered, the header
-        // would be describing an order the rows do not have — the arrow is the
-        // only thing telling the user what they are looking at.
+        // Sorting a preview whose page failed leaves the arrow drawn and no
+        // rows under it. If the retry asked for the relation unordered, the
+        // header would be describing an order the rows do not have — the
+        // arrow is the only thing telling the user what they are looking at.
         let store = store(Behaviour {
             flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 3)],
             ..Behaviour::instant()
@@ -1689,38 +1708,38 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
         .await;
-        let tab = snap.active_tab.unwrap();
 
         // Twice, because the first toggle is ascending and the fixture is
         // already in that order: only descending can tell the two apart.
         for dir in [SortDir::Asc, SortDir::Desc] {
-            store.dispatch(Action::SortPreview { tab, column: 0 });
+            store.dispatch(Action::SortPreview {
+                conn,
+                table: table.clone(),
+                column: 0,
+            });
             until(&mut rx, |s| {
-                s.busy.is_empty() && sort_of(s, tab) == Some(dir)
+                s.busy.is_empty() && sort_of(s, conn, &table) == Some(dir)
             })
             .await;
         }
 
-        store.dispatch(Action::PreviewTable { conn, table });
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
         let snap = until(&mut rx, |s| {
-            s.tab(tab)
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
         .await;
 
-        let grid = snap
-            .tab(tab)
-            .and_then(TabView::preview)
-            .and_then(|p| p.data.ready())
-            .expect("a loaded page");
-        assert_eq!(sort_of(&snap, tab), Some(SortDir::Desc));
+        let grid = preview_of(&snap, conn, &table).data.ready().unwrap();
+        assert_eq!(sort_of(&snap, conn, &table), Some(SortDir::Desc));
         assert_eq!(
             grid.value(0, 0),
             Some(&Value::Int(50)),
@@ -1728,9 +1747,8 @@ mod tests {
         );
     }
 
-    fn sort_of(snap: &Snapshot, tab: TabId) -> Option<SortDir> {
-        snap.tab(tab)
-            .and_then(TabView::preview)
+    fn sort_of(snap: &Snapshot, conn: ConnId, table: &TableRef) -> Option<SortDir> {
+        snap.preview(conn, table)
             .and_then(|p| p.sort)
             .map(|s| s.dir)
     }
@@ -1748,50 +1766,33 @@ mod tests {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
+        let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "users"]);
 
         store.dispatch(Action::PreviewTable {
-            conn: snap.connections[0].id,
-            table: TableRef::new(["public", "users"]),
+            conn,
+            table: table.clone(),
         });
         let snap = until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
         .await;
-        assert_eq!(rows_of(&snap, snap.active_tab.unwrap()), 1);
+        assert_eq!(rows_of(&snap, conn, &table), 1);
     }
 
-    fn rows_of(snap: &Snapshot, tab: TabId) -> usize {
-        snap.tab(tab)
-            .and_then(TabView::preview)
+    fn rows_of(snap: &Snapshot, conn: ConnId, table: &TableRef) -> usize {
+        snap.preview(conn, table)
             .and_then(|p| p.data.ready())
             .expect("a loaded page")
             .row_count()
     }
 
     #[tokio::test]
-    async fn closing_a_tab_selects_its_neighbour() {
-        let (store, mut rx, conn) = connected_store().await;
-        for name in ["users", "empty"] {
-            store.dispatch(Action::PreviewTable {
-                conn,
-                table: TableRef::new(["public", name]),
-            });
-        }
-        let snap = until(&mut rx, |s| s.tabs.len() == 2).await;
-        let first = snap.tabs[0].id;
-
-        store.dispatch(Action::CloseTab(first));
-        let snap = until(&mut rx, |s| s.tabs.len() == 1).await;
-        assert_eq!(snap.active_tab, Some(snap.tabs[0].id));
-    }
-
-    #[tokio::test]
-    async fn closing_a_tab_drops_its_own_page_in_flight() {
-        // Otherwise the busy row for a page nobody is waiting on anymore stays
-        // on screen until the slow reply eventually arrives — "loading …" for
-        // a tab that closed a while ago.
+    async fn forgetting_a_preview_drops_its_own_page_in_flight() {
+        // Otherwise the busy row for a page nobody is waiting on anymore
+        // stays on screen until the slow reply eventually arrives — "loading
+        // …" for a preview nothing has open anymore.
         let store = store(Behaviour {
             latency: std::time::Duration::from_millis(1),
             slow_nodes: vec![vec!["public".to_owned(), "users".to_owned()]],
@@ -1805,64 +1806,39 @@ mod tests {
         })
         .await;
         let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "users"]);
 
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "users"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, Snapshot::is_busy).await;
-        let tab = snap.active_tab.unwrap();
+        until(&mut rx, Snapshot::is_busy).await;
 
-        store.dispatch(Action::CloseTab(tab));
-        let snap = until(&mut rx, |s| s.tabs.is_empty()).await;
+        store.dispatch(Action::ForgetPreview {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| s.previews.is_empty()).await;
         assert!(
             snap.busy.is_empty(),
-            "the closed tab's page is still loading"
+            "the forgotten preview's page is still loading"
         );
     }
 
     #[tokio::test]
-    async fn closing_the_last_tab_leaves_nothing_selected() {
+    async fn disconnecting_removes_that_connection_s_previews() {
         let (store, mut rx, conn) = connected_store().await;
+        let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "users"]),
+            table: table.clone(),
         });
-        let snap = until(&mut rx, |s| s.tabs.len() == 1).await;
-
-        store.dispatch(Action::CloseTab(snap.tabs[0].id));
-        let snap = until(&mut rx, |s| s.tabs.is_empty()).await;
-        assert_eq!(snap.active_tab, None);
-    }
-
-    #[tokio::test]
-    async fn disconnecting_removes_that_connection_s_tabs() {
-        let (store, mut rx, conn) = connected_store().await;
-        store.dispatch(Action::PreviewTable {
-            conn,
-            table: TableRef::new(["public", "users"]),
-        });
-        until(&mut rx, |s| s.tabs.len() == 1).await;
+        until(&mut rx, |s| s.previews.len() == 1).await;
 
         store.dispatch(Action::Disconnect(conn));
-        let snap = until(&mut rx, |s| s.tabs.is_empty()).await;
+        let snap = until(&mut rx, |s| s.previews.is_empty()).await;
         assert_eq!(snap.connections[0].status, ConnStatus::Closed);
         assert_eq!(snap.tree(conn).count(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_toast_can_be_dismissed() {
-        let store = Store::spawn(
-            Drivers::new(),
-            Arc::new(UnservedProfile(DriverKind::BigQuery)),
-            PageRequest::DEFAULT_LIMIT,
-        );
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("unserved")));
-        let snap = until(&mut rx, |s| !s.toasts.is_empty()).await;
-
-        store.dispatch(Action::DismissToast(snap.toasts[0].id));
-        until(&mut rx, |s| s.toasts.is_empty()).await;
     }
 
     #[tokio::test]
@@ -1889,15 +1865,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actions_for_unknown_ids_are_ignored() {
+    async fn actions_for_unknown_relations_are_ignored() {
         let store = store(Behaviour::instant());
         let mut rx = store.subscribe();
-        store.dispatch(Action::SelectTab(TabId::new(99)));
-        store.dispatch(Action::CloseTab(TabId::new(99)));
+        let conn = ConnId::new();
+        let table = TableRef::new(["public", "ghost"]);
         store.dispatch(Action::LoadMore {
-            tab: TabId::new(99),
+            conn,
+            table: table.clone(),
         });
-        store.dispatch(Action::Disconnect(ConnId::new()));
+        store.dispatch(Action::ForgetPreview { conn, table });
+        store.dispatch(Action::Disconnect(conn));
         store.dispatch(Action::Cancel(BusyId::new(99)));
         store.dispatch(Action::Quit);
 

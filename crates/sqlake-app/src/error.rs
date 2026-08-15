@@ -25,13 +25,10 @@ pub enum AppError {
 
     #[error("no such connection")]
     UnknownConnection,
-
-    #[error("no such tab")]
-    UnknownTab,
 }
 
 impl AppError {
-    /// The single-line form shown in a toast or on a failed node.
+    /// The single-line form a front-end shows next to whatever failed.
     #[must_use]
     pub fn user_message(&self) -> String {
         self.to_string()
