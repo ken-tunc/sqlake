@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use sqlake_core::capability::DriverKind;
 use sqlake_core::id::ProfileId;
-use sqlake_core::profile::SslMode;
+use sqlake_core::profile::{ProfileColor, SslMode};
 
 use crate::bytes::ByteSize;
 use crate::error::{ConfigError, ConfigResult};
@@ -107,17 +107,6 @@ pub enum SecretRef {
     Env(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProfileColor {
-    Red,
-    Yellow,
-    Green,
-    Blue,
-    Magenta,
-    Cyan,
-}
-
 // ── the shape on disk ──────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
@@ -139,7 +128,7 @@ pub(crate) struct RawConnection {
     name: Option<String>,
     driver: String,
     readonly: Option<bool>,
-    color: Option<ProfileColor>,
+    color: Option<String>,
     tunnel: Option<String>,
 
     // postgres
@@ -190,6 +179,13 @@ impl RawConnection {
             }
         };
 
+        let color = self
+            .color
+            .as_deref()
+            .map(ProfileColor::parse)
+            .transpose()
+            .map_err(|why| ConfigError::invalid(path, format!("connection `{id}`: {why}")))?;
+
         Ok(Profile {
             // `name = ""` is the blank tab the id fallback exists to prevent.
             name: self
@@ -199,7 +195,7 @@ impl RawConnection {
             id,
             driver,
             readonly: self.readonly.unwrap_or(false),
-            color: self.color,
+            color,
             tunnel: self.tunnel,
         })
     }

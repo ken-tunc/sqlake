@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use sqlake_core::id::ConnId;
 use sqlake_core::node::{NodeRef, RelationKind, TreeNode};
 
 /// How a node appears in the tree.
@@ -39,6 +40,12 @@ impl NodeState {
 /// One row of the flattened tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleNode {
+    /// Which connection the row belongs to.
+    ///
+    /// The explorer holds every connection at once, so a row is the only thing
+    /// that knows which one it came from — without it, acting on the selected
+    /// row would mean guessing, and the guess would be "the first one".
+    pub conn: ConnId,
     pub depth: u16,
     pub label: String,
     pub node_ref: NodeRef,
@@ -169,10 +176,10 @@ impl TreeState {
 
     /// Depth-first flattening of everything currently visible.
     #[must_use]
-    pub fn flatten(&self) -> TreeView {
+    pub fn flatten(&self, conn: ConnId) -> TreeView {
         let mut nodes = Vec::new();
         let mut open = HashSet::new();
-        self.walk(&NodeRef::root(), 0, &mut open, &mut nodes);
+        self.walk(conn, &NodeRef::root(), 0, &mut open, &mut nodes);
         TreeView { nodes }
     }
 
@@ -184,6 +191,7 @@ impl TreeState {
     /// survive bad input rather than trust it.
     fn walk(
         &self,
+        conn: ConnId,
         parent: &NodeRef,
         depth: u16,
         open: &mut HashSet<NodeRef>,
@@ -199,6 +207,7 @@ impl TreeState {
             let state = self.state_of(child);
             let expanded = state.is_expanded();
             out.push(VisibleNode {
+                conn,
                 depth,
                 label: child.label.clone(),
                 node_ref: child.node_ref.clone(),
@@ -206,7 +215,7 @@ impl TreeState {
                 state,
             });
             if expanded {
-                self.walk(&child.node_ref, depth.saturating_add(1), open, out);
+                self.walk(conn, &child.node_ref, depth.saturating_add(1), open, out);
             }
         }
         open.remove(parent);
@@ -225,6 +234,11 @@ impl TreeState {
 
 #[cfg(test)]
 mod tests {
+    /// The rows carry a connection now; which one is irrelevant here.
+    fn conn() -> ConnId {
+        ConnId::new()
+    }
+
     use sqlake_core::node::NodeKind;
 
     use super::*;
@@ -257,8 +271,11 @@ mod tests {
     #[test]
     fn an_unexpanded_tree_shows_only_the_top_level() {
         let t = state_with_roots();
-        assert_eq!(labels(&t.flatten()), [(0, "public"), (0, "analytics")]);
-        assert_eq!(t.flatten().nodes[0].state, NodeState::Collapsed);
+        assert_eq!(
+            labels(&t.flatten(conn())),
+            [(0, "public"), (0, "analytics")]
+        );
+        assert_eq!(t.flatten(conn()).nodes[0].state, NodeState::Collapsed);
     }
 
     #[test]
@@ -266,7 +283,7 @@ mod tests {
         let mut t = state_with_roots();
         let node = NodeRef::new(NodeKind::Namespace, ["public"]);
         assert_eq!(t.toggle(&node), Toggle::Load);
-        assert_eq!(t.flatten().nodes[0].state, NodeState::Loading);
+        assert_eq!(t.flatten(conn()).nodes[0].state, NodeState::Loading);
     }
 
     #[test]
@@ -275,7 +292,7 @@ mod tests {
         let node = NodeRef::new(NodeKind::Namespace, ["public"]);
         assert_eq!(t.toggle(&node), Toggle::Load);
         assert_eq!(t.toggle(&node), Toggle::Local);
-        assert_eq!(t.flatten().nodes[0].state, NodeState::Loading);
+        assert_eq!(t.flatten(conn()).nodes[0].state, NodeState::Loading);
     }
 
     #[test]
@@ -286,7 +303,7 @@ mod tests {
         t.finish_load(&node, Ok(vec![table("public", "users")]));
 
         assert_eq!(
-            labels(&t.flatten()),
+            labels(&t.flatten(conn())),
             [(0, "public"), (1, "users"), (0, "analytics")]
         );
     }
@@ -298,7 +315,7 @@ mod tests {
         t.toggle(&node);
         t.finish_load(&node, Ok(vec![table("public", "users")]));
 
-        let view = t.flatten();
+        let view = t.flatten(conn());
         assert_eq!(view.nodes[1].state, NodeState::Leaf);
         assert!(!view.nodes[1].state.is_toggleable());
     }
@@ -311,11 +328,14 @@ mod tests {
         t.finish_load(&node, Ok(vec![table("public", "users")]));
 
         assert_eq!(t.toggle(&node), Toggle::Local);
-        assert_eq!(labels(&t.flatten()), [(0, "public"), (0, "analytics")]);
+        assert_eq!(
+            labels(&t.flatten(conn())),
+            [(0, "public"), (0, "analytics")]
+        );
 
         // Re-expanding is local: the children are still in memory.
         assert_eq!(t.toggle(&node), Toggle::Local);
-        assert_eq!(t.flatten().len(), 3);
+        assert_eq!(t.flatten(conn()).len(), 3);
     }
 
     #[test]
@@ -325,7 +345,7 @@ mod tests {
         t.toggle(&node);
         t.finish_load(&node, Err("permission denied".into()));
 
-        let view = t.flatten();
+        let view = t.flatten(conn());
         assert_eq!(
             view.nodes[1].state,
             NodeState::Failed("permission denied".into())
@@ -344,7 +364,7 @@ mod tests {
         assert_eq!(t.toggle(&node), Toggle::Load);
         t.finish_load(&node, Ok(vec![table("analytics", "events")]));
         assert_eq!(
-            labels(&t.flatten()),
+            labels(&t.flatten(conn())),
             [(0, "public"), (0, "analytics"), (1, "events")]
         );
     }
@@ -360,7 +380,10 @@ mod tests {
         t.finish_load(&node, Err("gone".into()));
 
         assert!(!t.is_loaded(&node));
-        assert_eq!(labels(&t.flatten()), [(0, "public"), (0, "analytics")]);
+        assert_eq!(
+            labels(&t.flatten(conn())),
+            [(0, "public"), (0, "analytics")]
+        );
     }
 
     #[test]
@@ -391,14 +414,14 @@ mod tests {
         );
 
         assert_eq!(
-            labels(&t.flatten()),
+            labels(&t.flatten(conn())),
             [(0, "db"), (1, "public"), (2, "users")]
         );
     }
 
     #[test]
     fn an_empty_tree_flattens_to_nothing() {
-        assert!(TreeState::new().flatten().is_empty());
+        assert!(TreeState::new().flatten(conn()).is_empty());
     }
 
     #[test]
@@ -414,7 +437,11 @@ mod tests {
         let users = NodeRef::new(NodeKind::Relation, ["public", "users"]);
         assert_eq!(t.toggle(&users), Toggle::Local);
         assert_eq!(t.toggle(&users), Toggle::Local);
-        assert_eq!(t.flatten().nodes.len(), 3, "nothing appeared or vanished");
+        assert_eq!(
+            t.flatten(conn()).nodes.len(),
+            3,
+            "nothing appeared or vanished"
+        );
     }
 
     #[test]
@@ -431,7 +458,7 @@ mod tests {
         t.set_roots(vec![schema("public")]);
         assert!(!t.is_loaded(&public));
         assert_eq!(t.toggle(&public), Toggle::Load);
-        assert_eq!(labels(&t.flatten()), [(0, "public")]);
+        assert_eq!(labels(&t.flatten(conn())), [(0, "public")]);
     }
 
     #[test]
@@ -444,7 +471,7 @@ mod tests {
         // bad input rather than trust it.
         t.finish_load(&public, Ok(vec![schema("public")]));
 
-        let view = t.flatten();
+        let view = t.flatten(conn());
         assert!(view.nodes.iter().any(|n| n.label == "public"));
     }
 
@@ -455,12 +482,15 @@ mod tests {
 
         assert_eq!(t.toggle(&public), Toggle::Load);
         t.finish_load(&public, Err("permission denied".to_owned()));
-        assert!(matches!(t.flatten().nodes[0].state, NodeState::Failed(_)));
+        assert!(matches!(
+            t.flatten(conn()).nodes[0].state,
+            NodeState::Failed(_)
+        ));
 
         assert_eq!(t.toggle(&public), Toggle::Load, "clicking an error retries");
         t.finish_load(&public, Ok(vec![table("public", "users")]));
         assert_eq!(
-            labels(&t.flatten()),
+            labels(&t.flatten(conn())),
             [(0, "public"), (1, "users"), (0, "analytics")]
         );
     }

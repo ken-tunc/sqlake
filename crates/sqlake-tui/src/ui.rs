@@ -17,6 +17,7 @@ use std::sync::Arc;
 use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
 use sqlake_app::snapshot::Snapshot;
+#[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_core::id::{ConnId, TabId};
 
@@ -107,9 +108,9 @@ pub struct UiState {
     /// screen rather than about the data, so it lives here.
     pub modal: Option<crate::overlay::Modal>,
     /// The connections whose failure has already been raised as a dialog, so
-    /// dismissing one is final rather than undone by the next snapshot. A set
-    /// rather than one id: remembering only the last leaves a second connection
-    /// failing in silence behind the first.
+    /// that dismissing it is final. A set rather than one id: remembering only
+    /// the last leaves a second connection's failure unreported, because the
+    /// first stays in the list and is what a search keeps finding.
     pub reported_failures: HashSet<ConnId>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
@@ -405,11 +406,7 @@ impl UiState {
 }
 
 fn tree_len(snapshot: &Snapshot) -> usize {
-    snapshot
-        .connections
-        .first()
-        .and_then(|c| snapshot.tree(c.id))
-        .map_or(0, TreeView::len)
+    snapshot.explorer.len()
 }
 
 /// Apply a signed delta to an index without wrapping past zero.
@@ -438,7 +435,6 @@ fn scroll_into_view(offset: usize, index: usize, page: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use sqlake_driver_mock::mock_summary;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use sqlake_app::snapshot::{LoadState, PreviewTab, TabContent, TabView};
@@ -463,21 +459,18 @@ mod tests {
     fn snapshot(tree_rows: usize, grid_rows: usize, grid_cols: usize) -> Snapshot {
         let conn = ConnId::new();
         let tab = TabId::new(1);
-        let mut trees = HashMap::new();
-        trees.insert(
-            conn,
-            Arc::new(TreeView {
-                nodes: (0..tree_rows)
-                    .map(|i| VisibleNode {
-                        depth: 0,
-                        label: format!("n{i}"),
-                        node_ref: NodeRef::new(NodeKind::Namespace, [format!("n{i}")]),
-                        relation_kind: None,
-                        state: NodeState::Collapsed,
-                    })
-                    .collect(),
-            }),
-        );
+        let explorer = Arc::new(TreeView {
+            nodes: (0..tree_rows)
+                .map(|i| VisibleNode {
+                    conn,
+                    depth: 0,
+                    label: format!("n{i}"),
+                    node_ref: NodeRef::new(NodeKind::Namespace, [format!("n{i}")]),
+                    relation_kind: None,
+                    state: NodeState::Collapsed,
+                })
+                .collect(),
+        });
 
         Snapshot {
             rev: 1,
@@ -486,11 +479,12 @@ mod tests {
                 id: conn,
                 profile: mock_summary("mock").id,
                 name: "mock".into(),
+                color: None,
                 kind: sqlake_core::capability::DriverKind::Mock,
                 status: sqlake_app::snapshot::ConnStatus::Ready,
                 capabilities: None,
             }],
-            trees,
+            explorer,
             tabs: vec![TabView {
                 id: tab,
                 conn,

@@ -40,6 +40,42 @@ pub struct ProfileSummary {
     pub id: ProfileId,
     pub name: String,
     pub kind: DriverKind,
+    pub color: Option<ProfileColor>,
+}
+
+/// A colour the user gave a connection, so that production does not look like
+/// a scratch database.
+///
+/// Named colours rather than anything finer: this has to survive a sixteen
+/// colour terminal, and "red" is a thing every one of them has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileColor {
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    Magenta,
+    Cyan,
+}
+
+impl ProfileColor {
+    /// The five spellings a config file may use.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        Ok(match text {
+            "red" => Self::Red,
+            "yellow" => Self::Yellow,
+            "green" => Self::Green,
+            "blue" => Self::Blue,
+            "magenta" => Self::Magenta,
+            "cyan" => Self::Cyan,
+            other => {
+                return Err(format!(
+                    "`{other}` is not a colour; \
+                     it is one of red, yellow, green, blue, magenta, cyan"
+                ));
+            }
+        })
+    }
 }
 
 /// A string rather than a structured error: the causes live in

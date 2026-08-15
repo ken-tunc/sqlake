@@ -30,7 +30,7 @@ use crate::snapshot::{
     BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot,
     TabContent, TabView, Toast,
 };
-use crate::tree::{Toggle, TreeState, TreeView};
+use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
     Connect, ConnectInput, ConnectOutput, ExpandNode, ExpandNodeInput, ExpandNodeOutput,
     PreviewTable, PreviewTableInput, PreviewTableOutput, UseCase,
@@ -148,6 +148,10 @@ enum Event {
 #[derive(Debug)]
 struct Conn {
     id: ConnId,
+    /// Whether this connection's own row is open. Its objects were fetched at
+    /// connect, so this is view state the store happens to own — closing a
+    /// connection's rows must not throw its tree away.
+    expanded: bool,
     /// Which profile this connection was opened from. Two connections can
     /// share one, which is what makes a second window onto the same database
     /// possible rather than a name collision.
@@ -163,6 +167,20 @@ struct Conn {
 }
 
 const CANCELLED: &str = "cancelled";
+
+/// How a connection's own row looks.
+///
+/// The same states an object node uses, so the explorer draws one kind of row:
+/// a connection that is opening spins like a node that is loading, and one
+/// that failed reports on itself rather than in a dialog nobody kept.
+fn root_state(conn: &Conn) -> NodeState {
+    match &conn.status {
+        ConnStatus::Connecting => NodeState::Loading,
+        ConnStatus::Failed(why) => NodeState::Failed(why.clone()),
+        _ if !conn.expanded => NodeState::Collapsed,
+        _ => NodeState::Expanded,
+    }
+}
 
 /// A page request that has gone out and not yet come back.
 ///
@@ -339,6 +357,9 @@ impl Runtime {
         let name = summary.name.clone();
         self.conns.push(Conn {
             id,
+            // Open, because the first thing anyone does after connecting is
+            // look at what is in there.
+            expanded: true,
             profile: summary.id.clone(),
             name: name.clone(),
             kind: summary.kind,
@@ -405,6 +426,17 @@ impl Runtime {
     }
 
     fn toggle_node(&mut self, conn_id: ConnId, node: NodeRef) {
+        // The connection's own row. Its children arrived with `Connect`, so
+        // this is opening and closing rather than fetching — and it works on a
+        // connection that failed, which is the only way to get its error off
+        // the screen without disconnecting.
+        if node.path.is_empty() {
+            if let Some(conn) = self.conn_mut(conn_id) {
+                conn.expanded = !conn.expanded;
+            }
+            return;
+        }
+
         let Some(session) = self.session(conn_id) else {
             return;
         };
@@ -413,7 +445,7 @@ impl Runtime {
         };
 
         let outcome = conn.tree.toggle(&node);
-        conn.view = Arc::new(conn.tree.flatten());
+        conn.view = Arc::new(conn.tree.flatten(conn.id));
         if outcome == Toggle::Local {
             return;
         }
@@ -589,7 +621,7 @@ impl Runtime {
             BusyOwner::Node { conn, node } => {
                 if let Some(conn) = self.conn_mut(*conn) {
                     conn.tree.finish_load(node, Err(reason.to_owned()));
-                    conn.view = Arc::new(conn.tree.flatten());
+                    conn.view = Arc::new(conn.tree.flatten(conn.id));
                 }
             }
             BusyOwner::Tab(id) => {
@@ -647,7 +679,7 @@ impl Runtime {
                     conn.capabilities = Some(out.capabilities);
                     conn.session = Some(out.session);
                     conn.tree.set_roots(out.roots);
-                    conn.view = Arc::new(conn.tree.flatten());
+                    conn.view = Arc::new(conn.tree.flatten(conn.id));
                 }
                 _ => out.session.close(),
             },
@@ -674,7 +706,7 @@ impl Runtime {
 
         if let Some(conn) = self.conn_mut(id) {
             conn.tree.finish_load(&node, outcome);
-            conn.view = Arc::new(conn.tree.flatten());
+            conn.view = Arc::new(conn.tree.flatten(conn.id));
         }
         if session_died {
             self.session_died(id);
@@ -767,6 +799,32 @@ impl Runtime {
 
     // ── publishing ─────────────────────────────────────────────────────────
 
+    /// Every connection as a row, with its objects underneath it.
+    ///
+    /// Built here rather than cached per connection because the *order* is a
+    /// fact about the whole list, and a connection's own row carries its
+    /// status — which changes without its tree changing at all.
+    fn explorer(&self) -> TreeView {
+        let mut nodes = Vec::new();
+        for conn in &self.conns {
+            nodes.push(VisibleNode {
+                conn: conn.id,
+                depth: 0,
+                label: conn.name.clone(),
+                node_ref: NodeRef::root(),
+                relation_kind: None,
+                state: root_state(conn),
+            });
+            if conn.expanded {
+                nodes.extend(conn.view.nodes.iter().map(|node| VisibleNode {
+                    depth: node.depth.saturating_add(1),
+                    ..node.clone()
+                }));
+            }
+        }
+        TreeView { nodes }
+    }
+
     fn snapshot(&mut self) -> Snapshot {
         self.rev += 1;
         Snapshot {
@@ -779,16 +837,17 @@ impl Runtime {
                     id: c.id,
                     profile: c.profile.clone(),
                     name: c.name.clone(),
+                    color: self
+                        .profile_list
+                        .iter()
+                        .find(|p| p.id == c.profile)
+                        .and_then(|p| p.color),
                     kind: c.kind,
                     status: c.status.clone(),
                     capabilities: c.capabilities,
                 })
                 .collect(),
-            trees: self
-                .conns
-                .iter()
-                .map(|c| (c.id, Arc::clone(&c.view)))
-                .collect(),
+            explorer: Arc::new(self.explorer()),
             tabs: self
                 .tabs
                 .iter()
@@ -843,6 +902,7 @@ mod tests {
                 id: pid("unserved"),
                 name: "unserved".to_owned(),
                 kind: self.0,
+                color: None,
             }]
         }
 
@@ -927,17 +987,98 @@ mod tests {
         // when the second connection is handed the first one's tree.
         let ids: Vec<ConnId> = snap.connections.iter().map(|c| c.id).collect();
         assert_ne!(ids[0], ids[1]);
-        let before = snap.tree(ids[1]).expect("a tree").len();
+        let before = snap.tree(ids[1]).count();
 
         store.dispatch(Action::ToggleNode {
             conn: ids[0],
             node: NodeRef::new(NodeKind::Namespace, ["public"]),
         });
+        let snap = until(&mut rx, |s| s.tree(ids[0]).count() > before).await;
+        assert_eq!(snap.tree(ids[1]).count(), before);
+    }
+
+    #[tokio::test]
+    async fn the_explorer_holds_every_connection_at_once() {
+        // The thing the UI could not show before: with one flat list per
+        // connection it drew the first and nothing else, so a second
+        // connection was open and unreachable.
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::new(["replica", "staging"])),
+        );
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("replica")));
+        store.dispatch(Action::Connect(pid("staging")));
         let snap = until(&mut rx, |s| {
-            s.tree(ids[0]).is_some_and(|t| t.len() > before)
+            s.connections.len() == 2 && s.connections.iter().all(ConnectionView::is_ready)
         })
         .await;
-        assert_eq!(snap.tree(ids[1]).expect("a tree").len(), before);
+
+        // Two rows at depth zero, one per connection, each above its own
+        // objects.
+        let roots: Vec<&str> = snap
+            .explorer
+            .nodes
+            .iter()
+            .filter(|n| n.depth == 0)
+            .map(|n| n.label.as_str())
+            .collect();
+        assert_eq!(roots, ["replica", "staging"]);
+        assert!(snap.explorer.len() > 2, "the objects are missing");
+
+        // Every row knows which connection it belongs to, which is what lets a
+        // click act on the one under the cursor.
+        let ids: Vec<ConnId> = snap.connections.iter().map(|c| c.id).collect();
+        assert!(snap.explorer.nodes.iter().all(|n| ids.contains(&n.conn)));
+    }
+
+    #[tokio::test]
+    async fn closing_a_connections_row_keeps_its_tree() {
+        // Collapsing is not disconnecting: the objects were fetched once and
+        // must still be there when the row is opened again, without a round
+        // trip and without a spinner.
+        let (store, mut rx, conn) = connected_store().await;
+        let before = rx.borrow_and_update().tree(conn).count();
+        assert!(before > 0);
+
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: NodeRef::root(),
+        });
+        let snap = until(&mut rx, |s| s.tree(conn).count() == 0).await;
+        assert_eq!(snap.explorer.len(), 1, "the connection's own row stays");
+        assert!(!snap.is_busy(), "closing a row is not a fetch");
+
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: NodeRef::root(),
+        });
+        let snap = until(&mut rx, |s| s.tree(conn).count() > 0).await;
+        assert_eq!(snap.tree(conn).count(), before);
+    }
+
+    #[tokio::test]
+    async fn a_connections_row_says_what_the_connection_is_doing() {
+        // The row is the state: opening, open, or broken. A dialog can be
+        // dismissed; the row cannot, which is what makes it the record.
+        let store = store(Behaviour {
+            connect_fails: true,
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+
+        let snap = until(&mut rx, |s| {
+            s.explorer
+                .nodes
+                .first()
+                .is_some_and(|n| matches!(n.state, NodeState::Failed(_)))
+        })
+        .await;
+        let NodeState::Failed(why) = &snap.explorer.nodes[0].state else {
+            panic!("expected a failed row");
+        };
+        assert!(why.contains("refused"), "{why}");
     }
 
     #[tokio::test]
@@ -1004,10 +1145,10 @@ mod tests {
             node: node.clone(),
         });
 
-        let snap = until(&mut rx, |s| s.tree(conn).is_some_and(|t| t.len() > 3)).await;
-        let tree = snap.tree(conn).unwrap();
-        assert_eq!(tree.nodes[0].state, NodeState::Expanded);
-        assert!(tree.nodes.iter().any(|n| n.label == "users"));
+        let snap = until(&mut rx, |s| s.tree(conn).count() > 3).await;
+        let rows: Vec<&VisibleNode> = snap.tree(conn).collect();
+        assert_eq!(rows[0].state, NodeState::Expanded);
+        assert!(rows.iter().any(|n| n.label == "users"));
     }
 
     #[tokio::test]
@@ -1018,14 +1159,12 @@ mod tests {
             conn,
             node: node.clone(),
         });
-        until(&mut rx, |s| s.tree(conn).is_some_and(|t| t.len() > 3)).await;
+        until(&mut rx, |s| s.tree(conn).count() > 3).await;
 
         store.dispatch(Action::ToggleNode { conn, node });
-        let snap = until(&mut rx, |s| s.tree(conn).is_some_and(|t| t.len() == 3)).await;
-        assert_eq!(
-            snap.tree(conn).unwrap().nodes[0].state,
-            NodeState::Collapsed
-        );
+        let snap = until(&mut rx, |s| s.tree(conn).count() == 3).await;
+        let rows: Vec<&VisibleNode> = snap.tree(conn).collect();
+        assert_eq!(rows[0].state, NodeState::Collapsed);
     }
 
     #[tokio::test]
@@ -1252,11 +1391,8 @@ mod tests {
         // toggled again, so it would be permanently dead rather than merely
         // failed.
         let snap = until(&mut rx, |s| {
-            s.tree(conn).is_some_and(|t| {
-                t.nodes
-                    .iter()
-                    .any(|n| n.node_ref == node && matches!(n.state, NodeState::Failed(_)))
-            })
+            s.tree(conn)
+                .any(|n| n.node_ref == node && matches!(n.state, NodeState::Failed(_)))
         })
         .await;
         assert!(!snap.is_busy());
@@ -1282,7 +1418,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let snap = rx.borrow_and_update().clone();
         assert_eq!(snap.connections[0].status, ConnStatus::Closed);
-        assert!(snap.tree(conn).is_none_or(TreeView::is_empty));
+        assert_eq!(snap.tree(conn).count(), 0);
     }
 
     #[tokio::test]
@@ -1362,7 +1498,7 @@ mod tests {
         store.dispatch(Action::Disconnect(conn));
         let snap = until(&mut rx, |s| s.tabs.is_empty()).await;
         assert_eq!(snap.connections[0].status, ConnStatus::Closed);
-        assert!(snap.tree(conn).unwrap().is_empty());
+        assert_eq!(snap.tree(conn).count(), 0);
     }
 
     #[tokio::test]

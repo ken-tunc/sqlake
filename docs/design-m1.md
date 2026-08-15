@@ -84,9 +84,10 @@ Each is one PR, reviewed before the next starts.
 
 Left open deliberately; the answers belong in the code that settles them.
 
-1. **What a connection tab is.** M0 has one tab bar holding preview tabs. Connections need
-   somewhere to live too, and the mockup in design.md §5 shows them as a separate bar. Whether
-   that is really two bars or one is a question about how crowded the screen gets.
+1. ~~**What a connection tab is.**~~ Answered by building it: there is no second bar. The
+   explorer holds every connection as a row with its objects underneath, because the tree
+   already has indentation, selection, scrolling and hit targets — and at 60 columns a second
+   bar costs a row that the grid needs more.
 2. **Where the page size lives.** A global setting, or per profile? BigQuery will want a
    different answer from PostgreSQL, which is an argument for the profile.
 3. **What happens when a connection drops.** Reconnecting silently is friendly right up until

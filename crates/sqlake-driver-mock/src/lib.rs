@@ -53,6 +53,7 @@ pub fn mock_summary(id: &str) -> ProfileSummary {
         id: ProfileId::parse(id).expect("a usable profile id"),
         name: id.to_owned(),
         kind: DriverKind::Mock,
+        color: None,
     }
 }
 
