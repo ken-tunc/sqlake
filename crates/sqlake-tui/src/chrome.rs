@@ -23,7 +23,6 @@ use crate::ui::{MIN_PANE_WIDTH, UiState};
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 20;
 
-/// Where each part of the screen ended up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frames {
     pub tab_bar: Rect,
@@ -64,7 +63,6 @@ pub fn layout(area: Rect, ui: &mut UiState) -> Frames {
     }
 }
 
-/// True when the terminal is too small to lay out at all.
 #[must_use]
 pub fn too_small(area: Rect) -> bool {
     area.width < MIN_WIDTH || area.height < MIN_HEIGHT
@@ -81,8 +79,8 @@ pub fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-/// A titled box. Returns the area inside the border, which is where the caller
-/// draws and what it should record as the pane's viewport.
+/// Returns the area *inside* the border: what the caller draws into, and what
+/// it records as the pane's viewport.
 pub fn pane(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
@@ -122,7 +120,6 @@ pub fn pane(
     inner
 }
 
-/// The draggable divider between the two panes.
 pub fn splitter(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, hovered: bool) {
     if area.is_empty() {
         // The line is drawn a cell wide whatever `area` says, so without this a
@@ -147,8 +144,6 @@ pub fn splitter(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, hovered: b
     }
 }
 
-/// A vertical scrollbar down the right edge of `area`.
-///
 /// Drawn by hand rather than with ratatui's `Scrollbar` because the thumb's
 /// rectangle has to be recorded for hit testing, and reproducing the widget's
 /// arithmetic to guess where it drew is worse than doing the arithmetic once.
@@ -204,12 +199,10 @@ pub fn scrollbar(
     }
 }
 
-/// The close box drawn after every tab's title.
 const CLOSE_WIDTH: u16 = 2;
 /// The `[×]` that stops a running job.
 const CANCEL_WIDTH: u16 = 3;
 
-/// One entry per open tab, each with a close box.
 pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &Snapshot) {
     hits.push(area, Z_BASE, Target::Pane(PaneId::TabBar));
     frame.render_widget(
@@ -299,7 +292,6 @@ pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// `text` cut to `max` terminal columns, with an ellipsis where it was cut.
 pub(crate) fn fit(text: &str, max: u16) -> String {
     if display_width(text) <= max {
         return text.to_owned();

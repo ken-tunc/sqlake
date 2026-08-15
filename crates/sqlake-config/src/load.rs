@@ -26,7 +26,6 @@ impl Config {
         Self::load_from(&paths::config_dir()?)
     }
 
-    /// Read both files from `dir`, whether or not either exists.
     pub fn load_from(dir: &Path) -> ConfigResult<Self> {
         let settings_path = paths::settings_file(dir);
         let settings = match read_optional(&settings_path)? {

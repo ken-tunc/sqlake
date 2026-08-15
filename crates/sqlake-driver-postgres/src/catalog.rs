@@ -13,15 +13,11 @@ use sqlake_core::driver::DriverResult;
 use sqlake_core::node::{NodeKind, NodeRef, RelationKind, TreeNode};
 use tokio_postgres::Client;
 
-/// The database this connection is attached to.
-///
 /// PostgreSQL has no cross-database queries, so the tree shows the one
 /// database the connection was opened against rather than everything on the
 /// server: a node nobody can open is worse than a node that is not there.
 pub(crate) const CURRENT_DATABASE: &str = "SELECT current_database()";
 
-/// Schemas, minus the ones that are never worth reading.
-///
 /// `pg_toast` holds the out-of-line storage for other tables and `pg_temp_*`
 /// is this session's own scratch space. Both are internal bookkeeping. What is
 /// *not* filtered is `pg_catalog` and `information_schema`: knowing what is in
@@ -32,8 +28,6 @@ const SCHEMAS: &str = "\
     WHERE nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp%' \
     ORDER BY nspname";
 
-/// Relations in one schema.
-///
 /// Partitions are excluded — `relispartition` — because a table partitioned by
 /// day has a child per day, and a tree that lists them buries the table they
 /// belong to. Which partitions exist is a fact about the parent, and belongs
@@ -57,8 +51,6 @@ const RELATIONS: &str = "\
 /// `&[&str]` bound to that is refused by the client before it is ever sent.
 const RELKINDS: [i8; 5] = [b'r' as i8, b'p' as i8, b'v' as i8, b'm' as i8, b'f' as i8];
 
-/// One level of the tree.
-///
 /// `database` is the one the session is attached to, asked for once when the
 /// connection was opened: it cannot change under a live connection, so the top
 /// level is answered without a round trip.

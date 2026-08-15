@@ -22,15 +22,12 @@ use ratatui::crossterm::terminal::{
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-/// Restores the terminal when dropped.
 #[derive(Debug)]
 pub struct TerminalGuard {
     mouse: bool,
 }
 
 impl TerminalGuard {
-    /// Take over the terminal and return it along with a drawing handle.
-    ///
     /// `mouse` is false under `--no-mouse`, and in terminals where capture
     /// would take native text selection away from the user.
     pub fn enter(mouse: bool) -> io::Result<(Self, Tui)> {
@@ -59,8 +56,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Undo everything [`TerminalGuard::enter`] did.
-///
 /// A free function so the panic hook can call it without owning a guard.
 /// Safe to call when the terminal was never taken over: each step fails
 /// independently and the errors are reported, not acted on.

@@ -28,7 +28,6 @@ use rustls::{
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::profile::SslMode;
 
-/// How far a certificate is checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verification {
     /// Encrypted and nothing more: `prefer` and `require`.
@@ -53,8 +52,6 @@ impl Verification {
     }
 }
 
-/// The client configuration a mode calls for.
-///
 /// Loads the platform's trust store for the verifying modes, which is where a
 /// company's own CA lives — the one an internal database is signed by.
 pub fn client_config(verification: Verification) -> DriverResult<ClientConfig> {
@@ -74,15 +71,12 @@ pub fn client_config(verification: Verification) -> DriverResult<ClientConfig> {
         .with_no_client_auth())
 }
 
-/// The ordinary verifier, over the platform's trust store.
 fn web_pki(provider: &Arc<CryptoProvider>) -> DriverResult<Arc<WebPkiServerVerifier>> {
     WebPkiServerVerifier::builder_with_provider(native_roots()?, provider.clone())
         .build()
         .map_err(|err| DriverError::Connect(format!("setting up certificate checks: {err}")))
 }
 
-/// The platform's trust store, read once.
-///
 /// Reading it is blocking file or keychain I/O — on macOS a Security framework
 /// query — and this runs inside `connect`, on a runtime worker. Once per
 /// process is a pause nobody notices; once per connection would be a pause on

@@ -127,7 +127,6 @@ fn drivers() -> Drivers {
         .with(Arc::new(PgDriver::new()))
 }
 
-/// Where connections come from: the config file, or the built-in mock.
 fn profiles(args: &Args) -> Result<Arc<dyn Profiles>> {
     if args.mock {
         return Ok(Arc::new(MockProfiles::default()));

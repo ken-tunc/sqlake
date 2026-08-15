@@ -79,7 +79,6 @@ impl NodeRef {
         self.path.len()
     }
 
-    /// The child of this node named `name`, at level `kind`.
     pub fn child(&self, kind: NodeKind, name: impl Into<String>) -> Self {
         let mut path = self.path.clone();
         path.push(name.into());

@@ -23,7 +23,6 @@ use tokio_postgres::Client;
 
 use crate::value::RawValue;
 
-/// A page of a relation, and the columns it came with.
 pub async fn preview(
     client: &Client,
     database: &str,
@@ -79,8 +78,6 @@ pub async fn preview(
     Ok(ResultSet::new(columns, rows, None))
 }
 
-/// The statement for one page.
-///
 /// `$1` is the page size and `$2` the offset.
 pub fn sql(database: &str, table: &TableRef, request: &PageRequest) -> DriverResult<String> {
     let (schema, relation) = split(database, table)?;
@@ -110,7 +107,6 @@ pub fn sql(database: &str, table: &TableRef, request: &PageRequest) -> DriverRes
     Ok(sql)
 }
 
-/// Split a three-part path, and refuse the one that cannot work.
 fn split<'a>(database: &str, table: &'a TableRef) -> DriverResult<(&'a str, &'a str)> {
     match table.path.as_slice() {
         [db, schema, relation] => {

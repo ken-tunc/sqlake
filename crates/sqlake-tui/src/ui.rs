@@ -37,8 +37,6 @@ pub struct TreeUi {
     pub selected: Option<usize>,
 }
 
-/// Per-tab grid state.
-///
 /// Per tab because two tabs showing different relations have nothing to say to
 /// each other about column widths or which cell is selected.
 #[derive(Debug, Default)]
@@ -50,16 +48,12 @@ pub struct GridUi {
     pub col_offset: usize,
     pub row: usize,
     pub col: usize,
-    /// Widths the user set by dragging, overriding the sampled ones.
     widths: HashMap<usize, u16>,
     grid: Option<RenderedGrid>,
 }
 
 impl GridUi {
-    /// The rendered view of `rows`, rebuilt only when the rows themselves
-    /// change.
-    ///
-    /// A snapshot is republished for reasons that have nothing to do with this
+    /// Rebuilt only when the rows change. A snapshot is republished for reasons that have nothing to do with this
     /// tab — a spinner tick will do it — and rebuilding on each one would
     /// re-sample the column widths and make them twitch as pages arrive.
     pub fn grid(&mut self, rows: &Arc<PagedResult>) -> &RenderedGrid {
@@ -71,8 +65,6 @@ impl GridUi {
             .expect("just built when it was missing or stale")
     }
 
-    /// The grid [`GridUi::grid`] last built, if any.
-    ///
     /// Drawing needs the grid and the widths and offsets beside it at the same
     /// time, and the `&mut` that builds the grid cannot lend out both. Building
     /// through `grid` and then reading through this one keeps the caller from
@@ -144,7 +136,6 @@ impl UiState {
         Self::default()
     }
 
-    /// Record the layout that was just drawn.
     pub fn set_viewport(&mut self, pane: PaneId, rect: Rect) {
         self.viewport.insert(pane, rect);
     }

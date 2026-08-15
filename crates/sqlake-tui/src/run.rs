@@ -129,8 +129,6 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
     }
 }
 
-/// The state the first frame is drawn from.
-///
 /// A connection dispatched before the terminal was taken over can already have
 /// failed by the time the loop starts, and a failed connect publishes nothing
 /// afterwards — so waiting for the next snapshot would mean waiting for one
@@ -141,8 +139,6 @@ fn initial_ui(snapshot: &Snapshot) -> UiState {
     ui
 }
 
-/// Open a dialog for a connection that failed to open.
-///
 /// A toast is right for something that went wrong beside work that is still
 /// going; a connection that never opened leaves nothing to do at all, and a
 /// message that fades on its own leaves the user with an empty explorer and no

@@ -80,9 +80,8 @@ pub enum Toggle {
 
 #[derive(Debug, Default)]
 pub struct TreeState {
-    /// Children that have been fetched, keyed by their parent.
     loaded: HashMap<NodeRef, Vec<TreeNode>>,
-    /// Expansion status. Leaves never appear here.
+    /// Leaves never appear here.
     status: HashMap<NodeRef, NodeState>,
 }
 
@@ -152,7 +151,6 @@ impl TreeState {
         matches!(self.status.get(node), Some(NodeState::Failed(_)))
     }
 
-    /// Record the result of a fetch started by [`TreeState::toggle`].
     pub fn finish_load(&mut self, node: &NodeRef, result: Result<Vec<TreeNode>, String>) {
         match result {
             Ok(children) => {
