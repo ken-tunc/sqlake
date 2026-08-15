@@ -138,9 +138,14 @@ impl PageRequest {
 
     #[must_use]
     pub const fn first() -> Self {
+        Self::first_of(Self::DEFAULT_LIMIT)
+    }
+
+    #[must_use]
+    pub const fn first_of(limit: u32) -> Self {
         Self {
             offset: 0,
-            limit: Self::DEFAULT_LIMIT,
+            limit,
             sort: None,
         }
     }

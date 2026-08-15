@@ -88,8 +88,11 @@ Left open deliberately; the answers belong in the code that settles them.
    explorer holds every connection as a row with its objects underneath, because the tree
    already has indentation, selection, scrolling and hit targets — and at 60 columns a second
    bar costs a row that the grid needs more.
-2. **Where the page size lives.** A global setting, or per profile? BigQuery will want a
-   different answer from PostgreSQL, which is an argument for the profile.
+2. ~~**Where the page size lives.**~~ A global setting, in `config.toml`. Per profile is a
+   guess at a difference nobody has felt yet: what makes a page too big is the screen and the
+   link, both of which are the same whichever database is on the other end. BigQuery may
+   still want its own answer — it can have one when its cost model says so, and moving a
+   setting down into the profile is a smaller change than taking one back out.
 3. **What happens when a connection drops.** Reconnecting silently is friendly right up until
    it reconnects to production; M1 has to at least decide whether the status goes back to
    `Connecting` or to `Failed`.

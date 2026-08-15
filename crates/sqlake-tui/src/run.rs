@@ -344,6 +344,7 @@ mod tests {
     use sqlake_app::store::Drivers;
     use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeRef, TableRef};
+    use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, mock_summary};
 
     use super::*;
@@ -352,6 +353,7 @@ mod tests {
         Store::spawn(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
         )
     }
 
@@ -866,6 +868,7 @@ mod tests {
                 ..Behaviour::instant()
             }))),
             Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
         );
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(mock_summary("mock").id));
