@@ -148,6 +148,19 @@ One history, one place to look when something unexpected happened to the data.
 changes that. The connection view exposes an id, a name, a driver kind and a status — never a
 host, a user or anything derived from a credential.
 
+### 3.6 An `Action`'s parameters are only as bounded as the caller
+
+The TUI cannot construct most bad actions: a column index comes from the grid it drew, a
+`TableRef` from a node the tree loaded. A socket has neither, so every `Action` field it can
+set becomes an input the store has to bound itself.
+
+`SortPreview` is the worked example, and it is half done. M2/T1 added the capability check —
+a connection that cannot order a preview is refused rather than left to the driver — but the
+column index is still whatever arrived. Out of range, the driver rejects it, `preview.sort`
+keeps it, and `preview_table`'s retry re-issues the same doomed request for as long as the
+preview exists. The rule is that the store validates what a front-end used to make
+unrepresentable, and A1 cannot land without a sweep of `Action` for the rest of it.
+
 ---
 
 ## 4. Asynchrony

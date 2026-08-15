@@ -520,21 +520,15 @@ impl Runtime {
         // Without this, a preview whose connection has already died goes to
         // `Loading` below and stays there for ever: `fetch_page` returns
         // before sending anything, so no reply ever arrives to un-stick it.
-        if self.session(conn_id).is_none() {
+        let Some(session) = self.session(conn_id) else {
             return;
-        }
+        };
         // The driver would answer `Unsupported`, which reports as a failed
         // preview: the rows on screen replaced by an error, for a gesture the
         // front-end should not have offered. A front-end that reads
         // `Capabilities` never gets here; one that does not — an agent sending
         // actions straight in — is stopped here rather than at the driver.
-        if !self
-            .conns
-            .iter()
-            .find(|c| c.id == conn_id)
-            .and_then(|c| c.capabilities)
-            .is_some_and(|c| c.sortable_preview)
-        {
+        if !session.capabilities().sortable_preview {
             tracing::warn!(%table, "sort: this connection cannot order a preview");
             return;
         }
@@ -942,8 +936,12 @@ mod tests {
     }
 
     fn store_paging(behaviour: Behaviour, page_size: u32) -> Store {
+        store_of(MockDriver::new(behaviour), page_size)
+    }
+
+    fn store_of(driver: MockDriver, page_size: u32) -> Store {
         Store::spawn(
-            Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
+            Drivers::new().with(Arc::new(driver)),
             Arc::new(MockProfiles::default()),
             page_size,
         )
@@ -1417,11 +1415,8 @@ mod tests {
         // read `Capabilities` — the agent surface. Passed through, the driver
         // answers `Unsupported`, and the preview reports a failure for
         // something nobody could have asked for.
-        let store = Store::spawn(
-            Drivers::new().with(Arc::new(
-                MockDriver::new(Behaviour::instant()).with_capabilities(NO_SORT),
-            )),
-            Arc::new(MockProfiles::default()),
+        let store = store_of(
+            MockDriver::new(Behaviour::instant()).with_capabilities(NO_SORT),
             PageRequest::DEFAULT_LIMIT,
         );
         let (store, mut rx, conn) = connected(store).await;

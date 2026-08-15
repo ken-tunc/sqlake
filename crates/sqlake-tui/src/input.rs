@@ -293,10 +293,11 @@ impl InputContext<'_> {
 
     /// The same relation, but only where its driver will order a preview.
     ///
-    /// The header stays where it is and the click is simply not read: a column
-    /// that cannot be sorted is still the thing to widen and still the label
-    /// for what is under it, so removing the target would take the drag with
-    /// it, and greying the row out would say the data is unavailable.
+    /// The header keeps its hit target and the click is simply not read.
+    /// Dropping the target would let the click fall through to the pane
+    /// beneath and focus the grid, which reads as a header that was never a
+    /// target; greying it out would say the data is unavailable rather than
+    /// the ordering.
     fn sortable_preview(&self) -> Option<(ConnId, TableRef)> {
         let (conn, table) = self.active_preview()?;
         self.snapshot
