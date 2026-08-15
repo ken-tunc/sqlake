@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
-use sqlake_config::Config;
+use sqlake_config::{Config, Settings};
 use sqlake_core::id::ProfileId;
 use sqlake_core::profile::Profiles;
 use sqlake_driver_mock::{MockDriver, MockProfiles};
@@ -80,12 +80,12 @@ fn main() -> Result<()> {
     // input that the terminal is now echoing.
     install_panic_hook(!args.no_mouse);
 
-    let profiles = profiles(&args)?;
+    let (profiles, settings) = configuration(&args)?;
     let opening = opening(&profiles, &args)?;
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let store = runtime.block_on(async {
-        let store = Store::spawn(drivers(), profiles);
+        let store = Store::spawn(drivers(), profiles, settings.page_size);
         for id in opening {
             store.dispatch(Action::Connect(id));
         }
@@ -127,15 +127,16 @@ fn drivers() -> Drivers {
         .with(Arc::new(PgDriver::new()))
 }
 
-fn profiles(args: &Args) -> Result<Arc<dyn Profiles>> {
+fn configuration(args: &Args) -> Result<(Arc<dyn Profiles>, Settings)> {
     if args.mock {
-        return Ok(Arc::new(MockProfiles::default()));
+        return Ok((Arc::new(MockProfiles::default()), Settings::default()));
     }
     // Reading it here rather than inside the store means a broken file is a
     // message on a terminal that still works, instead of an error raised into
     // a client that has already taken the screen over.
     let config = Config::load().context("reading the configuration")?;
-    Ok(Arc::new(config))
+    let settings = config.settings;
+    Ok((Arc::new(config), settings))
 }
 
 /// Which profiles to open at startup.

@@ -68,8 +68,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// `page_size` comes from the configuration rather than from a constant
+    /// here: how many rows are worth waiting for depends on the database and
+    /// the link to it, which is something only the person using it knows.
     #[must_use]
-    pub fn spawn(drivers: Drivers, profiles: Arc<dyn Profiles>) -> Self {
+    pub fn spawn(drivers: Drivers, profiles: Arc<dyn Profiles>, page_size: u32) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(Snapshot::default()));
@@ -81,6 +84,7 @@ impl Store {
             // its own questions — not a thing to do silently on every frame.
             profile_list: Arc::new(profiles.list()),
             profiles,
+            page_size,
             events: event_tx,
             conns: Vec::new(),
             tabs: Vec::new(),
@@ -212,6 +216,7 @@ struct Runtime {
     drivers: Drivers,
     profiles: Arc<dyn Profiles>,
     profile_list: Arc<Vec<ProfileSummary>>,
+    page_size: u32,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     tabs: Vec<Tab>,
@@ -489,18 +494,19 @@ impl Runtime {
 
         let id = TabId::new(self.next_tab);
         self.next_tab += 1;
+        let page = PageRequest::first_of(self.page_size);
         self.tabs.push(Tab {
             id,
             conn: conn_id,
             table: table.clone(),
             sort: None,
-            page: PageRequest::first(),
+            page,
             pending: None,
             data: LoadState::Loading,
             loaded_rows: 0,
         });
         self.active_tab = Some(id);
-        self.fetch_page(id, PageRequest::first(), false);
+        self.fetch_page(id, page, false);
     }
 
     fn sort_preview(&mut self, tab_id: TabId, column: usize) {
@@ -515,10 +521,10 @@ impl Runtime {
         };
         let sort = Sort::new(column, dir);
         tab.sort = Some(sort);
-        // A new ordering invalidates every page already fetched.
-        let page = PageRequest::first().with_sort(Some(sort));
         tab.data = LoadState::Loading;
         tab.loaded_rows = 0;
+        // A new ordering invalidates every page already fetched.
+        let page = PageRequest::first_of(self.page_size).with_sort(Some(sort));
         self.fetch_page(tab_id, page, false);
     }
 
@@ -882,9 +888,14 @@ mod tests {
     use crate::tree::NodeState;
 
     fn store(behaviour: Behaviour) -> Store {
+        store_paging(behaviour, PageRequest::DEFAULT_LIMIT)
+    }
+
+    fn store_paging(behaviour: Behaviour, page_size: u32) -> Store {
         Store::spawn(
             Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
+            page_size,
         )
     }
 
@@ -964,6 +975,7 @@ mod tests {
         let store = Store::spawn(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::new(["replica", "staging"])),
+            PageRequest::DEFAULT_LIMIT,
         );
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(pid("replica")));
@@ -1005,6 +1017,7 @@ mod tests {
         let store = Store::spawn(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::new(["replica", "staging"])),
+            PageRequest::DEFAULT_LIMIT,
         );
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(pid("replica")));
@@ -1127,6 +1140,7 @@ mod tests {
         let store = Store::spawn(
             Drivers::new(),
             Arc::new(UnservedProfile(DriverKind::Postgres)),
+            PageRequest::DEFAULT_LIMIT,
         );
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(pid("unserved")));
@@ -1456,6 +1470,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_configured_page_size_is_what_a_page_is() {
+        // `page_size` was parsed and validated by `sqlake-config` and read by
+        // nothing, so every page was the built-in size whatever the file said
+        // — a setting the client appears to honour and does not.
+        let store = store_paging(Behaviour::instant(), 25);
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "big"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let tab = snap.active_tab.unwrap();
+        assert_eq!(rows_of(&snap, tab), 25);
+
+        // Sorting starts the relation again, and starting again is also a page.
+        store.dispatch(Action::SortPreview { tab, column: 0 });
+        let snap = until(&mut rx, |s| {
+            s.tab(tab)
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.sort.is_some() && p.data.ready().is_some())
+        })
+        .await;
+        assert_eq!(rows_of(&snap, tab), 25);
+
+        // And the page after it starts where this one stopped, rather than at
+        // the built-in size: an offset that moves by more than the page leaves
+        // a gap no scroll can reach.
+        store.dispatch(Action::LoadMore { tab });
+        let snap = until(&mut rx, |s| {
+            s.tab(tab)
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.loaded_rows == 50)
+        })
+        .await;
+        let grid = snap
+            .tab(tab)
+            .and_then(TabView::preview)
+            .and_then(|p| p.data.ready())
+            .expect("a loaded page");
+        assert_eq!(grid.row_count(), 50);
+        for row in 0..grid.row_count() {
+            assert_eq!(
+                grid.value(row, 0),
+                Some(&Value::Int(row as i64)),
+                "row {row} is not contiguous"
+            );
+        }
+    }
+
+    fn rows_of(snap: &Snapshot, tab: TabId) -> usize {
+        snap.tab(tab)
+            .and_then(TabView::preview)
+            .and_then(|p| p.data.ready())
+            .expect("a loaded page")
+            .row_count()
+    }
+
+    #[tokio::test]
     async fn closing_a_tab_selects_its_neighbour() {
         let (store, mut rx, conn) = connected_store().await;
         for name in ["users", "empty"] {
@@ -1506,6 +1590,7 @@ mod tests {
         let store = Store::spawn(
             Drivers::new(),
             Arc::new(UnservedProfile(DriverKind::BigQuery)),
+            PageRequest::DEFAULT_LIMIT,
         );
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(pid("unserved")));
