@@ -8,10 +8,10 @@
 //!
 //! `Intent` and `ViewCmd` deliberately live in `sqlake-tui` rather than here.
 //! Only [`action::Action`] crosses the boundary, so no UI vocabulary — panes,
-//! splits, scroll, tabs, toasts — reaches this crate. Which previews a screen
-//! has open, in what order, and which one has focus is exactly that kind of
-//! state: [`snapshot::PreviewView`] is addressed by connection and table, not
-//! by a number this crate hands out.
+//! splits, scroll, tabs, toasts — reaches this crate. A
+//! [`snapshot::PreviewView`] is therefore addressed by connection and table
+//! rather than by a tab number: which of them a screen has open, and which it
+//! is looking at, is that screen's own business.
 
 pub mod action;
 pub mod error;

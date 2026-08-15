@@ -2,11 +2,7 @@
 //!
 //! Published on a watch channel and cloned freely, so every heavy field sits
 //! behind an `Arc`. Nothing here describes appearance: scroll offsets, column
-//! widths, selection and focus belong to `UiState` in the TUI crate — and
-//! nothing here describes a screen at all: which previews a front-end has
-//! open, in what order, and which one it is looking at is that front-end's
-//! own bookkeeping, not a fact about the data. A preview is addressed by the
-//! connection and table it belongs to, not by a number this crate hands out.
+//! widths, selection and focus belong to `UiState` in the TUI crate.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -86,12 +82,6 @@ impl ConnectionView {
 }
 
 /// A relation's data, as far as it has been fetched.
-///
-/// Addressed by `(conn, table)`, not by an id this crate mints: two
-/// front-ends asking for the same relation on the same connection are asking
-/// for the same thing, and neither owns "the" view onto it. Which of these a
-/// screen has open, their order, and which has focus belongs to the
-/// front-end.
 #[derive(Debug, Clone)]
 pub struct PreviewView {
     pub conn: ConnId,
@@ -102,12 +92,10 @@ pub struct PreviewView {
     pub data: LoadState<Arc<PagedResult>>,
     /// A page that failed to extend `data`, without disturbing it.
     ///
-    /// Set instead of turning `data` into `Failed`: the rows already on
-    /// screen are still good, and replacing them with an error panel would
-    /// both lose them and leave the next request starting from the wrong
-    /// offset. Cleared by the next request that reaches this preview, success
-    /// or failure — a front-end that wants a fleeting notice can watch for the
-    /// text changing; that decision belongs to it, not to this crate.
+    /// Set instead of turning `data` into `Failed`: the rows already fetched
+    /// are still good, and replacing them with an error would lose them *and*
+    /// leave the next request starting from the wrong offset. Cleared by the
+    /// next request that reaches this preview.
     pub last_error: Option<String>,
 }
 

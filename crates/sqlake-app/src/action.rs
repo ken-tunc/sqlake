@@ -7,11 +7,8 @@
 //! Everything here either touches data or performs I/O. Scrolling, selection,
 //! column widths and split positions are *not* actions: they are handled inside
 //! the render loop, because routing them through an async task adds a round
-//! trip to every wheel tick. Nor is which of these previews a screen currently
-//! has open, in what order, or which one has focus — that is the front-end's
-//! own bookkeeping, addressed here by connection and table rather than by a
-//! tab number, so a second front-end asking for the same relation is asking
-//! for the same thing rather than a tab it does not have.
+//! trip to every wheel tick. Nor is which of these a screen has open — see
+//! the crate doc.
 
 use std::fmt;
 

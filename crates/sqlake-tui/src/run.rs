@@ -271,8 +271,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         matches!(ui.hover, Some(Target::Splitter(_))),
     );
 
-    // Owned rather than borrowed: `ui.grid_mut` below needs `&mut ui`, and
-    // this is the tab it is about, not the tab bar's own list.
+    // Owned, because `ui.grid_mut` below needs `&mut ui`.
     let active = ui
         .active_tab
         .and_then(|id| ui.tabs.iter().find(|t| t.id == id))

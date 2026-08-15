@@ -241,9 +241,8 @@ pub struct InputContext<'a> {
     /// only thing that makes them equivalent: without it every key press would
     /// sort and resize column zero whatever the user had selected.
     pub grid_column: Option<usize>,
-    /// This screen's own open tabs — `UiState`'s, not the store's. Which
-    /// relation a tab points at is what turns a click into `PreviewTable`,
-    /// `SortPreview` or `LoadMore`; the store has no idea tabs exist.
+    /// Which relation a tab points at is what turns a click on a header into
+    /// a `SortPreview` for the right table.
     pub tabs: &'a [OpenTab],
     pub active_tab: Option<TabId>,
     pub toasts: &'a [Toast],
@@ -471,11 +470,9 @@ fn activate_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
     }
 }
 
-/// Always emits both: `ViewCmd::OpenTab` decides for itself whether that
-/// means raising an existing tab or minting one, and `Action::PreviewTable`
-/// is what makes a tab raised from `Failed` retry — `store::preview_table`
-/// treats a request for an already-loaded relation as a no-op, so asking
-/// again costs nothing when there was already something to show.
+/// Both, unconditionally: `PreviewTable` is what makes a tab raised from
+/// `Failed` retry, and the store treats it as a no-op when the relation is
+/// already loaded — so there is nothing to decide between here.
 fn open_or_focus_tab(conn: ConnId, table: TableRef) -> Vec<Intent> {
     vec![
         ViewCmd::OpenTab {
@@ -490,14 +487,10 @@ fn open_or_focus_tab(conn: ConnId, table: TableRef) -> Vec<Intent> {
 /// Closing a tab. If it was the last one open on this relation, the store's
 /// own cache of it — and any page still in flight for it — goes too.
 ///
-/// Two tabs on the same `(conn, table)` cannot happen through
-/// `ViewCmd::OpenTab` today — it raises the existing one instead of minting a
-/// second (`ui.rs`'s `OpenTab` doc comment states this as an invariant) — so
-/// `still_open` is always `false` on the only path that reaches this function
-/// now. Checked anyway rather than assumed: the day something else pushes a
-/// second tab onto the same relation — split panes, say — this is what stops
-/// the first one's close from pulling the second one's data out from under
-/// it.
+/// `still_open` is always false today, because [`OpenTab`] never mints a
+/// second tab on one relation. Checked rather than assumed: the day something
+/// does — split panes, say — this is what stops one tab's close from pulling
+/// the other's data out from under it.
 fn close_tab(id: TabId, ctx: &InputContext<'_>) -> Vec<Intent> {
     let Some(closing) = ctx.tabs.iter().find(|t| t.id == id) else {
         return Vec::new();
@@ -741,8 +734,7 @@ mod tests {
 
     // ── fixtures ───────────────────────────────────────────────────────────
 
-    /// A snapshot, and the tabs and toasts a screen showing it might have —
-    /// the two are independent inputs now, not one borrowed from the other.
+    /// A snapshot, and the tabs and toasts a screen showing it might have.
     struct Fixture {
         snapshot: Snapshot,
         conn: ConnId,
@@ -1260,11 +1252,8 @@ mod tests {
             table: TableRef::new(["public", "users"]),
         });
 
-        // `on_mouse` is pure — it does not remove anything from `f.tabs` — so
-        // the first close is checked against a context still holding both,
-        // and the second against one rebuilt to reflect the first actually
-        // having happened, the way `ui.apply(ViewCmd::CloseTab(..))` would
-        // leave it.
+        // `on_mouse` removes nothing itself, so the context is rebuilt
+        // between the two closes the way `ui.apply` would leave it.
         assert_eq!(
             on_mouse(
                 Target::TabClose(TabId::new(1)),
