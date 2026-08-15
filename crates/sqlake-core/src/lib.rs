@@ -21,7 +21,8 @@ pub use id::{ConnId, ProfileId, TabId};
 pub use ident::{Ident, QuotedIdent};
 pub use node::{NodeKind, NodeRef, RelationKind, TableRef, TreeNode};
 pub use profile::{
-    Params, PostgresParams, ProfileError, ProfileSummary, Profiles, ResolvedProfile, SslMode,
+    Params, PostgresParams, ProfileColor, ProfileError, ProfileSummary, Profiles, ResolvedProfile,
+    SslMode,
 };
 pub use result::{Column, PageRequest, ResultSet, Row, Sort, SortDir};
 pub use secret::Secret;

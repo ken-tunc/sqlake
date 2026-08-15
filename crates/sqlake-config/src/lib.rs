@@ -28,8 +28,6 @@ pub mod settings;
 pub use bytes::ByteSize;
 pub use error::{ConfigError, ConfigResult};
 pub use load::Config;
-pub use profile::{
-    BigQueryAuth, BigQueryConfig, DriverConfig, PostgresConfig, Profile, ProfileColor, SecretRef,
-};
+pub use profile::{BigQueryAuth, BigQueryConfig, DriverConfig, PostgresConfig, Profile, SecretRef};
 pub use resolve::{KEYRING_SERVICE, Keyring, OsKeyring, resolve, resolve_with};
 pub use settings::Settings;

@@ -13,8 +13,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
-use sqlake_app::tree::{NodeState, TreeView, VisibleNode};
+use sqlake_app::snapshot::{ConnStatus, Snapshot};
+#[cfg(test)]
+use sqlake_app::tree::TreeView;
+use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::node::RelationKind;
+use sqlake_core::profile::ProfileColor;
 
 use crate::chrome;
 use crate::grid::{display_width, sanitise};
@@ -36,20 +40,20 @@ pub fn render(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
     area: Rect,
-    view: &TreeView,
+    snapshot: &Snapshot,
     ui: &TreeUi,
-    empty: &str,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let view = &snapshot.explorer;
     if view.is_empty() {
         // Wrapped, because the explorer is twelve columns wide at the smallest
         // size this client draws at, and a sentence that says why the pane is
         // empty is longer than that. Truncated, it would be one more thing
         // that says nothing.
         frame.render_widget(
-            Paragraph::new(empty)
+            Paragraph::new(waiting_for(snapshot))
                 .wrap(Wrap { trim: true })
                 .style(Style::new().fg(Color::DarkGray)),
             area,
@@ -73,7 +77,28 @@ pub fn render(
         };
         let y = rows_area.y + u16::try_from(line).unwrap_or(u16::MAX);
         let row = Rect::new(rows_area.x, y, rows_area.width, 1);
-        render_row(frame, hits, row, node, index, ui.selected == Some(index));
+        // A connection's own row is the one the profile colours, and the only
+        // one whose label is not an object's name.
+        let colour = node
+            .node_ref
+            .path
+            .is_empty()
+            .then(|| {
+                snapshot
+                    .connection(node.conn)
+                    .and_then(|c| c.color)
+                    .map(colour_of)
+            })
+            .flatten();
+        render_row(
+            frame,
+            hits,
+            row,
+            node,
+            index,
+            ui.selected == Some(index),
+            colour,
+        );
     }
 
     if bar {
@@ -88,6 +113,7 @@ fn render_row(
     node: &VisibleNode,
     index: usize,
     selected: bool,
+    colour: Option<Color>,
 ) {
     hits.push(row, Z_CONTENT, Target::TreeRow { index });
 
@@ -136,7 +162,7 @@ fn render_row(
     let room = row.width.saturating_sub(used);
     spans.push(Span::styled(
         chrome::fit(&label, room),
-        base.fg(label_colour(&node.state)),
+        base.fg(colour.unwrap_or_else(|| label_colour(&node.state))),
     ));
 
     if let NodeState::Failed(message) = &node.state {
@@ -178,6 +204,33 @@ const fn icon(kind: Option<RelationKind>) -> &'static str {
     }
 }
 
+/// What the explorer says when it has nothing to draw.
+///
+/// "Nothing connected" is only true when there is something to connect to, and
+/// a fresh install has no config file at all: one of those is fixed by pressing
+/// a key and the other is not.
+fn waiting_for(snapshot: &Snapshot) -> &'static str {
+    match snapshot.connections.first().map(|c| &c.status) {
+        // A handshake can take the whole of a driver's deadline, and `c`
+        // during one opens a *second* connection rather than hurrying the
+        // first along.
+        Some(ConnStatus::Connecting) => " connecting… ",
+        _ if snapshot.profiles.is_empty() => " no connections configured — write connections.toml ",
+        _ => " nothing connected — press c ",
+    }
+}
+
+const fn colour_of(colour: ProfileColor) -> Color {
+    match colour {
+        ProfileColor::Red => Color::Red,
+        ProfileColor::Yellow => Color::Yellow,
+        ProfileColor::Green => Color::Green,
+        ProfileColor::Blue => Color::Blue,
+        ProfileColor::Magenta => Color::Magenta,
+        ProfileColor::Cyan => Color::Cyan,
+    }
+}
+
 const fn label_colour(state: &NodeState) -> Color {
     match state {
         NodeState::Failed(_) => Color::Red,
@@ -188,9 +241,6 @@ const fn label_colour(state: &NodeState) -> Color {
 
 #[cfg(test)]
 mod tests {
-    /// Any placeholder: these tests are about rows, not about it.
-    const EMPTY: &str = " nothing connected ";
-
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -198,9 +248,11 @@ mod tests {
     use sqlake_core::node::{NodeKind, NodeRef};
 
     use super::*;
+    use sqlake_driver_mock::mock_summary;
 
     fn node(depth: u16, label: &str, state: NodeState) -> VisibleNode {
         VisibleNode {
+            conn: sqlake_core::id::ConnId::new(),
             depth,
             label: label.into(),
             node_ref: NodeRef::new(NodeKind::Namespace, [label]),
@@ -231,10 +283,27 @@ mod tests {
     }
 
     fn draw_buffer(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (Buffer, HitMap) {
+        let snapshot = Snapshot {
+            explorer: std::sync::Arc::new(view.clone()),
+            ..Snapshot::default()
+        };
+        draw_buffer_of(&snapshot, ui, w, h)
+    }
+
+    fn draw_snapshot(snapshot: &Snapshot, ui: &TreeUi, w: u16, h: u16) -> (String, HitMap) {
+        let (buffer, hits) = draw_buffer_of(snapshot, ui, w, h);
+        let text = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_owned())
+            .collect();
+        (text, hits)
+    }
+
+    fn draw_buffer_of(snapshot: &Snapshot, ui: &TreeUi, w: u16, h: u16) -> (Buffer, HitMap) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), view, ui, EMPTY))
+            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), snapshot, ui))
             .unwrap();
         (terminal.backend().buffer().clone(), hits)
     }
@@ -360,9 +429,60 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_tree_says_why_it_is_empty() {
+    fn an_empty_tree_says_which_kind_of_empty_it_is() {
+        // Two different problems that look identical on screen: nothing to
+        // connect to, and nothing connected yet. Only one is fixed by pressing
+        // a key.
         let (text, _) = draw(&TreeView::default(), &TreeUi::default(), 30, 3);
+        assert!(text.contains("no connections configured"), "{text:?}");
+
+        let configured = Snapshot {
+            profiles: std::sync::Arc::new(vec![mock_summary("mock")]),
+            ..Snapshot::default()
+        };
+        let (text, _) = draw_snapshot(&configured, &TreeUi::default(), 30, 3);
         assert!(text.contains("nothing connected"), "{text:?}");
+    }
+
+    #[test]
+    fn a_profiles_colour_marks_its_connection_and_nothing_below_it() {
+        // The point of the colour is that production does not look like a
+        // scratch database. Colouring the objects too would make every row in
+        // the pane red, which marks nothing at all.
+        let conn = sqlake_core::id::ConnId::new();
+        let root = VisibleNode {
+            conn,
+            depth: 0,
+            label: "prod".into(),
+            node_ref: NodeRef::root(),
+            relation_kind: None,
+            state: NodeState::Expanded,
+        };
+        let child = VisibleNode {
+            conn,
+            depth: 1,
+            ..node(1, "public", NodeState::Collapsed)
+        };
+        let snapshot = Snapshot {
+            explorer: std::sync::Arc::new(TreeView {
+                nodes: vec![root, child],
+            }),
+            connections: vec![sqlake_app::snapshot::ConnectionView {
+                id: conn,
+                profile: mock_summary("prod").id,
+                name: "prod".into(),
+                color: Some(ProfileColor::Red),
+                kind: sqlake_core::capability::DriverKind::Mock,
+                status: ConnStatus::Ready,
+                capabilities: None,
+            }],
+            ..Snapshot::default()
+        };
+
+        let (buffer, _) = draw_buffer_of(&snapshot, &TreeUi::default(), 20, 3);
+        let is_red = |y: u16| (0..20).any(|x| buffer[(x, y)].style().fg == Some(Color::Red));
+        assert!(is_red(0), "the connection's own row");
+        assert!(!is_red(1), "an object below it");
     }
 
     #[test]

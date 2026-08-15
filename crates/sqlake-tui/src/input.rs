@@ -230,7 +230,8 @@ pub struct InputContext<'a> {
     pub snapshot: &'a Snapshot,
     pub focus: PaneId,
     pub modal_open: bool,
-    /// The connection the explorer is showing.
+    /// The connection the selected row belongs to, for the operations that
+    /// are about a connection rather than about a node.
     pub connection: Option<ConnId>,
     pub tree_selection: Option<usize>,
     /// The column of the selected grid cell. The keyboard equivalents of
@@ -267,8 +268,7 @@ impl InputContext<'_> {
     }
 
     fn node(&self, index: usize) -> Option<&VisibleNode> {
-        let conn = self.connection?;
-        self.snapshot.tree(conn)?.get(index)
+        self.snapshot.explorer.get(index)
     }
 
     fn active_tab(&self) -> Option<TabId> {
@@ -429,9 +429,10 @@ fn activate_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
     let Some(node) = ctx.node(index) else {
         return Vec::new();
     };
-    let Some(conn) = ctx.connection else {
-        return Vec::new();
-    };
+    // The row's own connection, not the first one. With several open, the
+    // difference is between opening the table under the cursor and opening a
+    // table of the same name somewhere else.
+    let conn = node.conn;
     match node.node_ref.as_table() {
         Some(table) => vec![Action::PreviewTable { conn, table }.into()],
         None => vec![
@@ -451,9 +452,7 @@ fn toggle_node(index: usize, ctx: &InputContext<'_>, collapse_only: bool) -> Vec
     let Some(node) = ctx.node(index) else {
         return Vec::new();
     };
-    let Some(conn) = ctx.connection else {
-        return Vec::new();
-    };
+    let conn = node.conn;
     if !node.state.is_toggleable() {
         return Vec::new();
     }
@@ -675,31 +674,29 @@ mod tests {
     fn snapshot() -> Snapshot {
         let conn = ConnId::new();
         let tab = TabId::new(1);
-        let mut trees = std::collections::HashMap::new();
-        trees.insert(
-            conn,
-            Arc::new(TreeView {
-                nodes: vec![
-                    VisibleNode {
-                        depth: 0,
-                        label: "public".into(),
-                        node_ref: NodeRef::new(NodeKind::Namespace, ["public"]),
-                        relation_kind: None,
-                        // Expanded, because the row below it is its child. A
-                        // collapsed node listing a child is a state the store
-                        // cannot produce.
-                        state: NodeState::Expanded,
-                    },
-                    VisibleNode {
-                        depth: 1,
-                        label: "users".into(),
-                        node_ref: NodeRef::new(NodeKind::Relation, ["public", "users"]),
-                        relation_kind: Some(RelationKind::Table),
-                        state: NodeState::Leaf,
-                    },
-                ],
-            }),
-        );
+        let explorer = Arc::new(TreeView {
+            nodes: vec![
+                VisibleNode {
+                    conn,
+                    depth: 0,
+                    label: "public".into(),
+                    node_ref: NodeRef::new(NodeKind::Namespace, ["public"]),
+                    relation_kind: None,
+                    // Expanded, because the row below it is its child. A
+                    // collapsed node listing a child is a state the store
+                    // cannot produce.
+                    state: NodeState::Expanded,
+                },
+                VisibleNode {
+                    conn,
+                    depth: 1,
+                    label: "users".into(),
+                    node_ref: NodeRef::new(NodeKind::Relation, ["public", "users"]),
+                    relation_kind: Some(RelationKind::Table),
+                    state: NodeState::Leaf,
+                },
+            ],
+        });
 
         Snapshot {
             rev: 1,
@@ -708,11 +705,12 @@ mod tests {
                 id: conn,
                 profile: mock_summary("mock").id,
                 name: "mock".into(),
+                color: None,
                 kind: DriverKind::Mock,
                 status: ConnStatus::Ready,
                 capabilities: None,
             }],
-            trees,
+            explorer,
             tabs: vec![
                 TabView {
                     id: tab,
@@ -763,6 +761,40 @@ mod tests {
             tree_selection: Some(0),
             grid_column: Some(2),
         }
+    }
+
+    #[test]
+    fn a_row_acts_on_its_own_connection() {
+        // With two connections in the explorer, the row under the cursor is
+        // the only thing that says which database is meant — and both have a
+        // `public.users`, so picking the first connection instead would open
+        // the wrong table and look right doing it.
+        let second = ConnId::new();
+        let mut snap = snapshot();
+        let rows = Arc::get_mut(&mut snap.explorer).expect("sole owner");
+        rows.nodes.push(VisibleNode {
+            conn: second,
+            depth: 1,
+            label: "users".into(),
+            node_ref: NodeRef::new(NodeKind::Relation, ["public", "users"]),
+            relation_kind: Some(RelationKind::Table),
+            state: NodeState::Leaf,
+        });
+        let last = rows.nodes.len() - 1;
+
+        let mut context = ctx(&snap, PaneId::Explorer);
+        // The first connection stays selected in the context, which is what
+        // the previous version of this code would have used.
+        context.tree_selection = Some(last);
+
+        let out = on_key(press(KeyCode::Enter), &context);
+        assert_eq!(
+            out,
+            [Intent::App(Action::PreviewTable {
+                conn: second,
+                table: TableRef::new(["public", "users"]),
+            })]
+        );
     }
 
     fn press(code: KeyCode) -> KeyEvent {

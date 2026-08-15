@@ -38,6 +38,7 @@ impl Profiles for Config {
                 id: profile.id.clone(),
                 name: profile.name.clone(),
                 kind: profile.kind(),
+                color: profile.color,
             })
             .collect()
     }

@@ -197,7 +197,6 @@ fn wrapped_rows(text: &str, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use sqlake_driver_mock::mock_summary;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -212,9 +211,9 @@ mod tests {
     fn snapshot(items: Vec<(Severity, &str)>) -> Snapshot {
         Snapshot {
             rev: 1,
+            explorer: std::sync::Arc::new(sqlake_app::tree::TreeView::default()),
             profiles: Arc::new(vec![mock_summary("mock")]),
             connections: Vec::new(),
-            trees: HashMap::new(),
             tabs: Vec::new(),
             active_tab: None,
             busy: Vec::new(),

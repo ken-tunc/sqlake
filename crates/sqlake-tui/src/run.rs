@@ -25,7 +25,6 @@ use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
 use sqlake_app::snapshot::{ConnStatus, Snapshot, TabContent};
 use sqlake_app::store::Store;
-use sqlake_app::tree::TreeView;
 use tokio::sync::watch;
 
 use crate::chrome;
@@ -55,7 +54,6 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
     // before the loop starts, so a connection that failed while the terminal
     // was being taken over is already in this one — and a failure produces no
     // further snapshot to be caught by the arm below.
-    raise_connection_failure(&snapshot, &mut ui);
     let mut hits = HitMap::new();
     let mut dirty = true;
 
@@ -94,7 +92,7 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                 }
                 snapshot = snapshots.borrow_and_update().clone();
                 raise_connection_failure(&snapshot, &mut ui);
-                dirty = true;
+                            dirty = true;
             }
         }
 
@@ -129,23 +127,15 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
     }
 }
 
-/// A connection dispatched before the terminal was taken over can already have
-/// failed by the time the loop starts, and a failed connect publishes nothing
-/// afterwards — so waiting for the next snapshot would mean waiting for one
-/// that never comes.
-fn initial_ui(snapshot: &Snapshot) -> UiState {
-    let mut ui = UiState::new();
-    raise_connection_failure(snapshot, &mut ui);
-    ui
-}
-
-/// A toast is right for something that went wrong beside work that is still
-/// going; a connection that never opened leaves nothing to do at all, and a
-/// message that fades on its own leaves the user with an empty explorer and no
-/// account of why. It is the same reason a failed node reports on the node.
+/// The reason a connection failed, in the one place it fits.
 ///
-/// Shown once per failure: the dialog is dismissed, not re-raised by the next
-/// unrelated snapshot.
+/// The row in the explorer says which connection is broken and keeps saying
+/// it, but the pane is twenty-six columns wide at the sizes this client draws
+/// at, so "could not connect: password authentication failed for user…" is cut
+/// to about four words. The row is the state; this is the reason.
+///
+/// Shown once per failure: dismissed, not re-raised by the next unrelated
+/// snapshot.
 fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
     // Skipping the ones already reported before looking at the status: a single
     // remembered id would let the first failure hide every later one, because
@@ -168,22 +158,14 @@ fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
     ));
 }
 
-/// What the explorer says when it has nothing to show.
-///
-/// "Nothing connected" is only true when there is something to connect to. A
-/// fresh install has no config file at all, and a pane that says nothing
-/// leaves the user pressing keys at a client that cannot do anything yet.
-///
-/// The first connection is the one whose tree this pane draws, so its status is
-/// what the message has to be about: a handshake can take the whole of the
-/// driver's deadline, and `c` during one opens a *second* connection to the
-/// same profile rather than hurrying the first along.
-fn waiting_for(snapshot: &Snapshot) -> &'static str {
-    match snapshot.connections.first().map(|c| &c.status) {
-        Some(ConnStatus::Connecting) => " connecting… ",
-        _ if snapshot.profiles.is_empty() => " no connections configured — write connections.toml ",
-        _ => " nothing connected — press c ",
-    }
+/// A connection dispatched before the terminal was taken over can already have
+/// failed by the time the loop starts, and a failed connect publishes nothing
+/// afterwards — so waiting for the next snapshot would mean waiting for one
+/// that never comes.
+fn initial_ui(snapshot: &Snapshot) -> UiState {
+    let mut ui = UiState::new();
+    raise_connection_failure(snapshot, &mut ui);
+    ui
 }
 
 /// Translate one event, collecting its intents. Returns whether the screen has
@@ -242,7 +224,14 @@ fn context<'a>(ui: &UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         snapshot,
         focus: ui.focus,
         modal_open: ui.modal.is_some(),
-        connection: snapshot.connections.first().map(|c| c.id),
+        // The selected row's connection, falling back to the first: with
+        // several open, `D` has to disconnect the one being looked at.
+        connection: ui
+            .tree
+            .selected
+            .and_then(|i| snapshot.explorer.get(i))
+            .map(|node| node.conn)
+            .or_else(|| snapshot.connections.first().map(|c| c.id)),
         tree_selection: ui.tree.selected,
         grid_column: snapshot
             .active_tab
@@ -270,15 +259,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         ui.focus == PaneId::Explorer,
     );
     ui.set_viewport(PaneId::Explorer, explorer);
-    // An empty view is drawn rather than skipped: with no connection there is
-    // no tree at all, and a blank pane says nothing about why.
-    let empty = TreeView::default();
-    let view = snapshot
-        .connections
-        .first()
-        .and_then(|c| snapshot.tree(c.id))
-        .unwrap_or(&empty);
-    tree::render(frame, hits, explorer, view, &ui.tree, waiting_for(snapshot));
+    tree::render(frame, hits, explorer, snapshot, &ui.tree);
 
     chrome::splitter(
         frame,
@@ -359,7 +340,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, MouseEventKind};
     use ratatui::layout::Position;
     use sqlake_app::action::Action;
-    use sqlake_app::snapshot::{ConnectionView, TabView};
+    use sqlake_app::snapshot::{ConnStatus, ConnectionView, TabView};
     use sqlake_app::store::Drivers;
     use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeRef, TableRef};
@@ -415,6 +396,7 @@ mod tests {
                 id: ConnId::new(),
                 profile: summary.id.clone(),
                 name: summary.name.clone(),
+                color: None,
                 kind: summary.kind,
                 status: ConnStatus::Connecting,
                 capabilities: None,
@@ -840,7 +822,7 @@ mod tests {
             conn,
             node: NodeRef::new(sqlake_core::node::NodeKind::Namespace, ["public"]),
         });
-        until(&mut rx, |s| s.tree(conn).is_some_and(|t| t.len() > 3)).await;
+        until(&mut rx, |s| s.tree(conn).count() > 3).await;
         let snap = rx.borrow_and_update().clone();
 
         let mut ui = UiState::new();
@@ -875,7 +857,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_connection_is_raised_as_a_dialog() {
+    async fn a_failed_connection_shows_on_its_row_and_says_why_in_a_dialog() {
+        // The row is the state and stays; the dialog is the reason, which does
+        // not fit in a pane twenty-six columns wide.
         let store = Store::spawn(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
                 connect_fails: true,
@@ -893,33 +877,28 @@ mod tests {
         .await;
         let snap = rx.borrow_and_update().clone();
 
-        // Through `initial_ui`, which is the path the first frame takes. A
+        // Through `initial_ui`, which is the path the first frame takes: a
         // connect dispatched before the terminal was taken over can already
-        // have failed, and a failed connect publishes nothing afterwards — so
-        // raising it only on the next snapshot means never.
+        // have failed, and a failed connect publishes nothing afterwards.
         let mut ui = initial_ui(&snap);
-        // A toast fades; an explorer that will never fill needs the reason to
-        // stay on screen until it is read.
-        assert!(ui.modal.is_some());
+        assert!(ui.modal.is_some(), "the reason has nowhere else to fit");
+
+        // The row says which connection is broken and is cut long before the
+        // reason is readable, which is why the dialog is still here: it is
+        // where the message fits.
+        let (rows, _) = render(&snap, &mut ui, 100, 30);
+        let screen = rows.join("\n");
+        assert!(screen.contains("! mock"), "{screen}");
+        // A fragment, because the dialog wraps its body: the sentence is on
+        // screen but not on one line of it.
+        assert!(
+            screen.contains("refused"),
+            "the dialog is where the reason fits: {screen}"
+        );
 
         // Dismissed once, not raised again by the next unrelated snapshot.
         ui.modal = None;
         raise_connection_failure(&snap, &mut ui);
         assert!(ui.modal.is_none(), "the dialog came back on its own");
-
-        // A second connection failing is a second thing to report. Remembering
-        // only one id leaves it silent, because the first failure stays in the
-        // list and is what the search keeps finding.
-        store.dispatch(Action::Connect(mock_summary("mock").id));
-        until(&mut rx, |s| {
-            s.connections.len() == 2
-                && s.connections
-                    .iter()
-                    .all(|c| matches!(c.status, ConnStatus::Failed(_)))
-        })
-        .await;
-        let snap = rx.borrow_and_update().clone();
-        raise_connection_failure(&snap, &mut ui);
-        assert!(ui.modal.is_some(), "the second failure went unreported");
     }
 }

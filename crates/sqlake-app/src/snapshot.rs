@@ -4,19 +4,18 @@
 //! behind an `Arc`. Nothing here describes appearance: scroll offsets, column
 //! widths, selection and focus belong to `UiState` in the TUI crate.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::{NodeRef, TableRef};
-use sqlake_core::profile::ProfileSummary;
+use sqlake_core::profile::{ProfileColor, ProfileSummary};
 use sqlake_core::result::Sort;
 
 use crate::action::{BusyId, ToastId};
 use crate::pages::PagedResult;
-use crate::tree::TreeView;
+use crate::tree::{TreeView, VisibleNode};
 
 /// Something that is fetched asynchronously.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +64,9 @@ pub struct ConnectionView {
     /// The profile this connection came from.
     pub profile: ProfileId,
     pub name: String,
+    /// The profile's colour, so a production connection does not look like a
+    /// scratch one.
+    pub color: Option<ProfileColor>,
     pub kind: DriverKind,
     pub status: ConnStatus,
     /// Known once the connection is open. Until then the UI has nothing to
@@ -162,7 +164,10 @@ pub struct Snapshot {
     /// this is the same `Arc` in every snapshot until a reload exists.
     pub profiles: Arc<Vec<ProfileSummary>>,
     pub connections: Vec<ConnectionView>,
-    pub trees: HashMap<ConnId, Arc<TreeView>>,
+    /// Every connection and its tree, in one flat list: a connection is a
+    /// row like any other, and its objects are rows underneath it. Drawing is
+    /// still a slice and an index — there is simply more than one root now.
+    pub explorer: Arc<TreeView>,
     pub tabs: Vec<TabView>,
     pub active_tab: Option<TabId>,
     pub busy: Vec<BusyItem>,
@@ -176,9 +181,12 @@ impl Snapshot {
         self.connections.iter().find(|c| c.id == id)
     }
 
-    #[must_use]
-    pub fn tree(&self, id: ConnId) -> Option<&TreeView> {
-        self.trees.get(&id).map(Arc::as_ref)
+    /// The rows belonging to one connection, without its own row.
+    pub fn tree(&self, id: ConnId) -> impl Iterator<Item = &VisibleNode> {
+        self.explorer
+            .nodes
+            .iter()
+            .filter(move |node| node.conn == id && !node.node_ref.path.is_empty())
     }
 
     #[must_use]
@@ -206,6 +214,7 @@ mod tests {
             id: ConnId::new(),
             profile: ProfileId::parse("mock").expect("a usable id"),
             name: "mock".into(),
+            color: None,
             kind: DriverKind::Mock,
             status,
             capabilities: None,
@@ -226,7 +235,7 @@ mod tests {
         let s = Snapshot::default();
         assert!(s.connection(ConnId::new()).is_none());
         assert!(s.tab(TabId::new(1)).is_none());
-        assert!(s.tree(ConnId::new()).is_none());
+        assert_eq!(s.tree(ConnId::new()).count(), 0);
     }
 
     #[test]
