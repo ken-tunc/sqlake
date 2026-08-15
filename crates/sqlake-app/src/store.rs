@@ -201,9 +201,7 @@ struct PendingPage {
     append: bool,
 }
 
-/// A relation's data, addressed by the connection and table it belongs to —
-/// not by an id this crate mints. Which of these a screen has open, their
-/// order, and which has focus is the front-end's own bookkeeping.
+/// A relation's data, and the request still out for more of it.
 #[derive(Debug)]
 struct Preview {
     conn: ConnId,
@@ -340,12 +338,11 @@ impl Runtime {
         // The summary answers both questions a connection needs before its
         // secret has been read: what to call it, and which driver it wants.
         //
-        // Unreachable from the interactive client, which only ever names a
-        // profile it already listed: a caller that can send an arbitrary id
-        // — the agent surface, eventually — sent one that does not exist, and
-        // there is no connection to attach the reason to. Logged rather than
-        // surfaced, the same as any other malformed request in this file
-        // (`SelectTab` on an unknown id was the precedent).
+        // A name nothing listed is only reachable from a caller that can send
+        // an arbitrary id — the agent surface, eventually. Logged rather than
+        // surfaced: there is no connection yet to attach the reason to, and
+        // inventing a row for a profile that does not exist would misreport
+        // what was asked for.
         let Some(summary) = self.profile_list.iter().find(|p| &p.id == profile).cloned() else {
             tracing::warn!(%profile, "connect: no such profile");
             return;
@@ -354,11 +351,9 @@ impl Runtime {
         let driver = match self.drivers.get(summary.kind) {
             Ok(d) => d,
             Err(err) => {
-                // Unlike the lookup above, this one is real: a profile can
-                // legitimately name a driver this build has not shipped yet.
-                // A connection row is where every other connection failure
-                // shows up, so this one gets one too rather than a message
-                // with nowhere to be dismissed from.
+                // Unlike the lookup above, a profile can legitimately name a
+                // driver this build has not shipped yet — so it gets a row,
+                // where every other connection failure already shows up.
                 self.conns.push(Conn {
                     id: ConnId::new(),
                     expanded: true,
@@ -493,11 +488,10 @@ impl Runtime {
         // it again every time a front-end asks.
         let page_size = self.page_size;
         if let Some(existing) = self.preview_mut(conn_id, &table) {
-            // A preview whose page failed holds no rows, and `LoadMore`
-            // refuses to extend rows that are not there — so without this,
-            // asking for the relation again would find a dead entry with no
-            // way back to the table. Its ordering is kept: a front-end
-            // already showing the sort arrow should not have it ignored.
+            // `LoadMore` refuses to extend rows that are not there, so
+            // asking again is the only retry a failed preview has. The
+            // ordering is kept: a front-end drawing the sort arrow should
+            // not have it ignored.
             if existing.data.error().is_some() {
                 let page = PageRequest::first_of(page_size).with_sort(existing.sort);
                 existing.page = page;
@@ -571,10 +565,8 @@ impl Runtime {
     }
 
     fn forget_preview(&mut self, conn_id: ConnId, table: &TableRef) {
-        // A page in flight for this preview has no front-end waiting on it
-        // anymore, so its busy row would otherwise stay on screen — "loading
-        // …" for something nobody is looking at — until the reply arrives
-        // and `previewed` finds nothing left to apply it to.
+        // Otherwise the busy row outlives its reader: "loading …" for
+        // something nobody is looking at, until a reply nothing wants lands.
         if let Some(busy) = self
             .preview_mut(conn_id, table)
             .and_then(|p| p.pending.as_ref())

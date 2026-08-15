@@ -397,9 +397,9 @@ driver in M2, so that "the driver behaves" means the same thing for all three.
 
 | # | Content | Done when |
 | --- | --- | --- |
-| **M0 — Foundation** ✅ | workspace, domain types, staged types, `UseCase` trait, store, render loop, `TerminalGuard`, `HitMap` and one input pipeline, base widgets, mock driver | Done. `crates/` and `git log` are the record |
-| **M1 — Connection management** ✅ | `sqlake-config`, `Profile → ResolvedProfile`, keyring, PostgreSQL driver, driver conformance suite, every connection in the explorer | Done. `crates/` and `git log` are the record |
-| **M2** | Table list (feature 2) | Lazy tree expansion for pg and bq, filter search. A second driver also gives `Capabilities` a second answer, which the mock alone cannot |
+| **M0 — Foundation** ✅ | — | Done. `crates/` and `git log` are the record |
+| **M1 — Connection management** ✅ | — | Done. `crates/` and `git log` are the record |
+| **M2** | Table list (feature 2) — [design-m2.md](design-m2.md) | Lazy tree expansion for pg and bq, filter search. A second driver also gives `Capabilities` a second answer, which the mock alone cannot |
 | **M3** | Table preview (feature 3) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
 | **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
 | **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |

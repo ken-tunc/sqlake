@@ -85,11 +85,8 @@ pub enum ViewCmd {
 
     DismissModal,
 
-    /// A relation now has a tab open for it, focused. Reusing one already
-    /// open is `SelectTab`, not this — which of a screen's tabs a table
-    /// belongs to is exactly the kind of state that lives here rather than
-    /// in the store: two front-ends asking for the same table are asking for
-    /// the same data, not fighting over one tab.
+    /// A relation now has a tab open for it, focused — raising the existing
+    /// one if there is already a tab on that relation.
     OpenTab {
         conn: ConnId,
         table: TableRef,
@@ -173,9 +170,8 @@ impl IntentKind {
                 ViewCmd::MoveSplit { .. } => Self::MoveSplit,
                 ViewCmd::EvenSplit(_) => Self::EvenSplit,
                 ViewCmd::DismissModal => Self::DismissModal,
-                // Always produced alongside `Action::PreviewTable`, not on
-                // its own: the two are one user capability, "open a
-                // relation", not two.
+                // Paired with `Action::PreviewTable`: one capability,
+                // "open a relation", not two.
                 ViewCmd::OpenTab { .. } => Self::PreviewTable,
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
@@ -188,9 +184,7 @@ impl IntentKind {
                 Action::PreviewTable { .. } => Self::PreviewTable,
                 Action::SortPreview { .. } => Self::SortPreview,
                 Action::LoadMore { .. } => Self::LoadMore,
-                // Always produced alongside `ViewCmd::CloseTab`, when it is
-                // the tab's last reference: the two are one capability,
-                // "close this tab", not two.
+                // Paired with `ViewCmd::CloseTab`: one capability.
                 Action::ForgetPreview { .. } => Self::CloseTab,
                 Action::Cancel(_) => Self::Cancel,
                 Action::Quit => Self::Quit,

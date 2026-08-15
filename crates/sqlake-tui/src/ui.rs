@@ -11,12 +11,9 @@
 //! the same as [`crate::hit::HitMap`] — an event is always answered against the
 //! layout that produced the pixels it was aimed at.
 //!
-//! Which of the store's previews this screen has open, in what order, and
-//! which has focus lives here for the same reason: `Snapshot` holds the data
-//! a preview is, addressed by connection and table, and this crate decides
-//! what to call a tab of it. [`Toast`] is the same kind of thing one layer
-//! further out — a note this screen chose to show, not a fact the store
-//! recorded.
+//! [`OpenTab`] and [`Toast`] are here for the same reason: the store holds the
+//! data a preview is, and this screen decides what to call a tab of it and
+//! which failures are worth a passing note.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,10 +33,9 @@ use crate::intent::ViewCmd;
 
 /// A tab this screen has open, pointing at one connection's relation.
 ///
-/// Minted here, not by the store: two front-ends asking for the same
-/// `(conn, table)` are asking for the same data, not fighting over a tab
-/// number. At most one of these exists per `(conn, table)` — opening a
-/// relation already open selects it instead (see `input::open_or_focus_tab`).
+/// At most one per `(conn, table)`: opening a relation already open selects
+/// that tab rather than minting a second. `close_tab` in `input` depends on
+/// this to know when the store's copy can go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTab {
     pub id: TabId,
@@ -54,10 +50,8 @@ pub enum Severity {
     Error,
 }
 
-/// A transient notice. Purely this screen's own: the application layer
-/// returns failures the ordinary way, and deciding "show this briefly and let
-/// it go" rather than "attach it to the row it is about" is a rendering
-/// choice, not a fact about the data.
+/// A transient notice. "Show this briefly and let it go" rather than "attach
+/// it to the row it is about" is a rendering choice, not a fact about the data.
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub id: ToastId,
@@ -160,11 +154,8 @@ pub struct UiState {
     next_tab: u32,
     pub toasts: Vec<Toast>,
     next_toast: u64,
-    /// The text of the last error raised as a toast for each preview, so a
-    /// snapshot that repeats the same failure does not raise it again — only
-    /// a *new* one does. Keyed by `(conn, table)` rather than carried on the
-    /// toast itself: the preview it is about may have several replies land
-    /// before anyone reads the first notice.
+    /// The last error already raised for each preview, so that a redraw does
+    /// not raise it again — only a *new* message does.
     reported_preview_errors: HashMap<(ConnId, TableRef), String>,
     grids: HashMap<TabId, GridUi>,
     /// `None` until the splitter is moved, so the default follows the terminal
@@ -237,16 +228,13 @@ impl UiState {
     /// Turn a new `last_error` on one of this screen's open previews into a
     /// toast.
     ///
-    /// Skips ones already raised, the same way `run::raise_connection_failure`
-    /// skips connections already reported — remembering only the newest
-    /// message would let a second preview's failure hide behind the first
-    /// one still in the map, because that is what a plain lookup keeps
-    /// finding. Clearing the record on success means the *same* message
-    /// raised again later — a second timeout, say — is treated as new rather
-    /// than silently swallowed.
+    /// Recorded per preview rather than as one "last message raised": with a
+    /// single slot, a second preview's failure hides behind the first one
+    /// still sitting in it. Clearing on success is what keeps the *same*
+    /// message failing again later — a second timeout, say — from being
+    /// swallowed as a duplicate.
     pub fn raise_preview_errors(&mut self, snapshot: &Snapshot) {
-        // Collected before mutating: `push_toast` needs `&mut self`, and
-        // `self.tabs` is what decides which previews are even in view.
+        // Collected before mutating: `push_toast` needs `&mut self`.
         let keys: Vec<(ConnId, TableRef)> = self
             .tabs
             .iter()
@@ -273,13 +261,9 @@ impl UiState {
 
     /// A closed connection takes its tabs with it.
     ///
-    /// `Disconnect` drops the connection's previews on the store side, but
-    /// nothing else tells this crate to let go of the tabs pointing at them —
-    /// left alone, a tab survives its own connection: switching to it shows a
-    /// blank pane forever, since there is no preview left to fetch and no
-    /// session left to fetch it with. A connection that vanished from the
-    /// snapshot entirely is treated the same as one marked `Closed`, though
-    /// nothing in this codebase currently removes a connection outright.
+    /// `Disconnect` drops the connection's previews, and a tab left pointing
+    /// at one shows a blank pane for ever: nothing to fetch, and no session
+    /// left to fetch it with.
     pub fn close_disconnected_tabs(&mut self, snapshot: &Snapshot) {
         let closed: Vec<TabId> = self
             .tabs
@@ -523,11 +507,10 @@ impl UiState {
         first
     }
 
-    /// The rows behind the active tab, if it points at a preview the
-    /// snapshot actually has. The two can disagree for one frame: a tab just
-    /// opened has nothing in the snapshot yet, and a preview a connection's
-    /// `Disconnect` just dropped still has a tab pointing at it until
-    /// `ViewCmd::CloseTab` catches up.
+    /// The rows behind the active tab.
+    ///
+    /// `None` covers a real frame: a tab opened this tick has nothing in the
+    /// snapshot until the store answers.
     fn rows_of<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
         let tab = self.active_tab?;
         let open = self.tabs.iter().find(|t| t.id == tab)?;
