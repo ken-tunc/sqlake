@@ -291,6 +291,21 @@ impl InputContext<'_> {
             .map(|t| (t.conn, t.table.clone()))
     }
 
+    /// The same relation, but only where its driver will order a preview.
+    ///
+    /// The header stays where it is and the click is simply not read: a column
+    /// that cannot be sorted is still the thing to widen and still the label
+    /// for what is under it, so removing the target would take the drag with
+    /// it, and greying the row out would say the data is unavailable.
+    fn sortable_preview(&self) -> Option<(ConnId, TableRef)> {
+        let (conn, table) = self.active_preview()?;
+        self.snapshot
+            .connection(conn)?
+            .capabilities?
+            .sortable_preview
+            .then_some((conn, table))
+    }
+
     /// The context a keystroke is read in. A modal takes the keyboard over
     /// entirely, which is why `Esc` can mean two different things without
     /// being ambiguous.
@@ -340,7 +355,7 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
             ViewCmd::SelectCell { row, col }.into(),
         ],
         (Target::GridHeader { col }, Gesture::Click) => ctx
-            .active_preview()
+            .sortable_preview()
             .map(|(conn, table)| {
                 vec![
                     Action::SortPreview {
@@ -655,7 +670,7 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|i| activate_node(i, ctx))
             .unwrap_or_default(),
         IntentKind::SortPreview => ctx
-            .active_preview()
+            .sortable_preview()
             .map(|(conn, table)| {
                 vec![
                     Action::SortPreview {
@@ -716,7 +731,7 @@ fn neighbouring_tab(ctx: &InputContext<'_>, backwards: bool) -> Option<TabId> {
 
 #[cfg(test)]
 mod tests {
-    use sqlake_driver_mock::mock_summary;
+    use sqlake_driver_mock::{CAPABILITIES, NO_SORT, mock_summary};
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -725,7 +740,7 @@ mod tests {
         BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewView,
     };
     use sqlake_app::tree::{NodeState, TreeView, VisibleNode};
-    use sqlake_core::capability::DriverKind;
+    use sqlake_core::capability::{Capabilities, DriverKind};
     use sqlake_core::node::{NodeKind, NodeRef, RelationKind, TableRef};
 
     use super::*;
@@ -743,6 +758,14 @@ mod tests {
     }
 
     impl Fixture {
+        /// What every connection in the fixture claims it can do.
+        fn advertising(mut self, capabilities: Capabilities) -> Self {
+            for conn in &mut self.snapshot.connections {
+                conn.capabilities = Some(capabilities);
+            }
+            self
+        }
+
         fn ctx(&self, focus: PaneId) -> InputContext<'_> {
             InputContext {
                 active_tab: Some(self.tabs[0].id),
@@ -817,7 +840,7 @@ mod tests {
                 color: None,
                 kind: DriverKind::Mock,
                 status: ConnStatus::Ready,
-                capabilities: None,
+                capabilities: Some(CAPABILITIES),
             }],
             explorer,
             previews: tabs
@@ -1135,6 +1158,28 @@ mod tests {
         assert_eq!(
             on_key(press(KeyCode::Char('>')), &c),
             [Intent::View(ViewCmd::ResizeColumn { col: 2, delta: 1 })]
+        );
+    }
+
+    #[test]
+    fn a_driver_that_cannot_sort_is_never_asked_to() {
+        // Both halves. Gating only the click would leave `s` sending an action
+        // the store drops, and a key that quietly does nothing is the harder of
+        // the two to notice.
+        let f = fixture().advertising(NO_SORT);
+        let c = f.ctx(PaneId::Grid);
+        assert!(on_mouse(Target::GridHeader { col: 2 }, Gesture::Click, &c).is_empty());
+        assert!(on_key(press(KeyCode::Char('s')), &c).is_empty());
+
+        // The column is still the one to widen, though: what the capability
+        // takes away is the ordering, not the header.
+        assert_eq!(
+            on_mouse(
+                Target::GridColEdge { col: 2 },
+                Gesture::DragBy { dx: 3, dy: 0 },
+                &c
+            ),
+            [Intent::View(ViewCmd::ResizeColumn { col: 2, delta: 3 })]
         );
     }
 

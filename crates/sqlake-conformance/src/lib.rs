@@ -9,7 +9,8 @@
 //! The cases below are deliberately about *shape* rather than content. What a
 //! table is called and what is in it differ per driver; that `children` stops
 //! where `Capabilities` says it stops, that a page is never longer than it was
-//! asked for, and that sorting reverses the rows are the same everywhere.
+//! asked for, and that sorting does what `Capabilities` claims it does are the
+//! same everywhere.
 //!
 //! The last one is the reason this exists at all: a whole task's worth of SQL
 //! shipped with a parameter bound as the wrong type, and every test in the
@@ -57,8 +58,8 @@ pub async fn run(subject: &Subject) {
     tree_stops_where_capabilities_say(&*session, capabilities, kind).await;
     let relation = relation_is_reachable_by_walking(&*session, subject, kind).await;
     a_page_is_never_longer_than_it_was_asked_for(&*session, &relation, kind).await;
-    paging_moves_the_window(&*session, &relation, kind).await;
-    sorting_reverses_the_rows(&*session, &relation, kind).await;
+    paging_moves_the_window(&*session, &relation, capabilities, kind).await;
+    sorting_does_what_is_claimed(&*session, &relation, capabilities, kind).await;
     a_page_past_the_end_still_has_columns(&*session, &relation, kind).await;
     a_relation_that_is_not_there_is_an_error(&*session, subject, kind).await;
 
@@ -167,8 +168,19 @@ async fn a_page_is_never_longer_than_it_was_asked_for(
 ///
 /// Getting `OFFSET` wrong is invisible in a single page and shows up as a grid
 /// that scrolls for ever through the same rows.
-async fn paging_moves_the_window(session: &dyn Session, relation: &TableRef, kind: &str) {
-    let sorted = |offset| page_of(2, offset).with_sort(Some(Sort::new(0, SortDir::Asc)));
+async fn paging_moves_the_window(
+    session: &dyn Session,
+    relation: &TableRef,
+    capabilities: Capabilities,
+    kind: &str,
+) {
+    // Ordered where that is allowed, so the two pages differ by construction
+    // rather than by luck. Where it is not, the driver's own page order is all
+    // there is to hold them apart.
+    let sort = capabilities
+        .sortable_preview
+        .then(|| Sort::new(0, SortDir::Asc));
+    let sorted = |offset| page_of(2, offset).with_sort(sort);
     let first = fetch(session, relation, &sorted(0), kind).await;
     let second = fetch(session, relation, &sorted(2), kind).await;
 
@@ -179,6 +191,42 @@ async fn paging_moves_the_window(session: &dyn Session, relation: &TableRef, kin
     assert_ne!(
         first.rows, second.rows,
         "{kind}: the second page is the first page again"
+    );
+}
+
+/// Whichever of the two things a driver claims about sorting, it does.
+///
+/// A driver that cannot sort is not excused from the case, it answers the other
+/// half of it. Skipping instead would leave `sortable_preview: false` asserting
+/// nothing at all — and that is the state a driver drifts into when the flag is
+/// set to get a test off its back.
+async fn sorting_does_what_is_claimed(
+    session: &dyn Session,
+    relation: &TableRef,
+    capabilities: Capabilities,
+    kind: &str,
+) {
+    if capabilities.sortable_preview {
+        sorting_reverses_the_rows(session, relation, kind).await;
+    } else {
+        sorting_is_refused(session, relation, kind).await;
+    }
+}
+
+async fn sorting_is_refused(session: &dyn Session, relation: &TableRef, kind: &str) {
+    let request = page_of(4, 0).with_sort(Some(Sort::new(0, SortDir::Asc)));
+    let err = session
+        .preview(relation, &request)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{kind}: a sort it does not claim came back with rows"));
+
+    // `Unsupported` and nothing else: the others all mean the request was
+    // reasonable and something went wrong, and a caller acting on that would
+    // retry a sort that can never work.
+    assert!(
+        matches!(err, DriverError::Unsupported(_)),
+        "{kind}: refusing a sort reported as something retryable: {err}"
     );
 }
 

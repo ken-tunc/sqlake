@@ -48,6 +48,7 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     // Every preview is a `SELECT`, so previewing is querying. BigQuery is the
     // driver where this is true the other way round.
     free_preview: false,
+    sortable_preview: true,
     quote_style: QuoteStyle::DoubleQuote,
 };
 

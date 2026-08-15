@@ -45,7 +45,10 @@ ascending reversed. BigQuery cannot honour both that and `free_preview`: `tabled
 not billed and cannot sort, and sorting means `SELECT … ORDER BY`, which is billed and — by
 design.md §4.2 — needs an `ApprovedQuery` that does not exist until M4. So the pair
 `(free_preview, sortable_preview)` is what a driver answers, the TUI stops offering a sort it
-cannot deliver, and the suite runs the reversal case only where it is claimed.
+cannot deliver, and the suite asserts whichever half is claimed: reversal where sorting is
+offered, a refusal where it is not. A driver that quietly returned its own order instead
+would be indistinguishable from one that had sorted, so refusing is part of the capability
+rather than the absence of it.
 
 The alternative was to let BigQuery quietly fall back to a billed query when a sort arrives.
 That turns a click on a column header into a scan of the whole table — the exact accident

@@ -139,7 +139,15 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     streaming: false,
     cost_estimate: false,
     free_preview: true,
+    sortable_preview: true,
     quote_style: QuoteStyle::DoubleQuote,
+};
+
+/// The pair BigQuery will answer, before there is a BigQuery driver to answer
+/// it: a preview that costs nothing and cannot be ordered.
+pub const NO_SORT: Capabilities = Capabilities {
+    sortable_preview: false,
+    ..CAPABILITIES
 };
 
 /// How the mock should misbehave.
@@ -434,6 +442,11 @@ impl Session for MockSession {
         }
 
         if let Some(sort) = req.sort {
+            if !self.capabilities.sortable_preview {
+                return Err(DriverError::Unsupported(format!(
+                    "mock: previewing {table} cannot be ordered"
+                )));
+            }
             // A real engine answers "no such column" rather than returning the
             // rows in storage order and calling them sorted.
             if sort.column >= fixture.columns.len() {
@@ -687,6 +700,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_configuration_that_cannot_sort_refuses_rather_than_ignores() {
+        let driver = MockDriver::new(Behaviour::instant()).with_capabilities(NO_SORT);
+        let s = driver.connect(&mock_profile("mock")).await.unwrap();
+        let table = TableRef::new(["public", "users"]);
+        let req = PageRequest {
+            offset: 0,
+            limit: 10,
+            sort: Some(Sort::new(0, SortDir::Asc)),
+        };
+        let err = s.preview(&table, &req).await.unwrap_err();
+        assert!(matches!(err, DriverError::Unsupported(_)), "{err:?}");
+
+        // And the same page without one is still served: what it cannot do is
+        // order the rows, not read them.
+        let rs = s.preview(&table, &PageRequest::first()).await.unwrap();
+        assert!(rs.row_count() > 0);
     }
 
     #[tokio::test]

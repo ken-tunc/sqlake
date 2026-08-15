@@ -68,6 +68,11 @@ pub trait Session: Send + Sync + std::fmt::Debug {
 
     /// Drivers whose [`Capabilities::free_preview`] is true must not issue a
     /// query here — that is the whole point of the flag.
+    ///
+    /// One whose [`Capabilities::sortable_preview`] is false must answer a
+    /// `req` carrying a sort with [`DriverError::Unsupported`], not with the
+    /// rows in its own order: a page that ignored the sort is indistinguishable
+    /// from one that honoured it, and the caller would draw an arrow over it.
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet>;
 
     async fn close(self: Box<Self>);
