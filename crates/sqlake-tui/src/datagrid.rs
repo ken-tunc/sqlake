@@ -14,7 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use sqlake_app::snapshot::{LoadState, PreviewTab};
-use sqlake_core::result::Sort;
+use sqlake_core::result::{Sort, SortDir};
 
 use crate::chrome;
 use crate::grid::{Align, CellKind, RenderedGrid};
@@ -117,6 +117,14 @@ fn visible_columns(area: Rect, grid: &RenderedGrid, ui: &GridUi) -> Vec<(usize, 
     out
 }
 
+/// The glyph drawn in a sorted column's header.
+const fn arrow(dir: SortDir) -> &'static str {
+    match dir {
+        SortDir::Asc => "▲",
+        SortDir::Desc => "▼",
+    }
+}
+
 fn header(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
@@ -133,7 +141,7 @@ fn header(
             continue;
         };
         let sorted = sort.filter(|s| s.column == index);
-        let marker = sorted.map_or("", |s| s.dir.arrow());
+        let marker = sorted.map_or("", |s| arrow(s.dir));
 
         let rect = Rect::new(x, area.y, width, 1);
         hits.push(rect, Z_CONTENT, Target::GridHeader { col: index });
@@ -281,7 +289,7 @@ mod tests {
     use ratatui::layout::Position;
     use sqlake_app::PagedResult;
     use sqlake_core::node::TableRef;
-    use sqlake_core::result::{Column, ResultSet, Row, SortDir};
+    use sqlake_core::result::{Column, ResultSet, Row};
     use sqlake_core::value::Value;
 
     use super::*;

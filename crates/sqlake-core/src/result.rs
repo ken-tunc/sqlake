@@ -101,15 +101,6 @@ impl SortDir {
             Self::Desc => Self::Asc,
         }
     }
-
-    /// The arrow drawn in a column header.
-    #[must_use]
-    pub const fn arrow(self) -> &'static str {
-        match self {
-            Self::Asc => "▲",
-            Self::Desc => "▼",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

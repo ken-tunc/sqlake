@@ -195,8 +195,12 @@ fn init_logging(level: &str) -> Result<tracing_appender::non_blocking::WorkerGua
         .build(&dir)
         .with_context(|| format!("opening the log file in {}", dir.display()))?;
     let (writer, guard) = tracing_appender::non_blocking(file);
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("sqlake={level},sqlake_app={level}")));
+    // A bare level, not one directive per crate: the list of crates that log
+    // is not this function's to keep in sync, and naming only `sqlake` and
+    // `sqlake_app` once left `sqlake_driver_postgres`'s only warning — the one
+    // on a connection ending — writing to a file nobody without `RUST_LOG` set
+    // would ever see it in.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
