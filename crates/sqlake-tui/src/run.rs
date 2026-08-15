@@ -92,6 +92,7 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                 snapshot = snapshots.borrow_and_update().clone();
                 raise_connection_failure(&snapshot, &mut ui);
                 ui.raise_preview_errors(&snapshot);
+                ui.close_disconnected_tabs(&snapshot);
                 dirty = true;
             }
         }
@@ -166,6 +167,7 @@ fn initial_ui(snapshot: &Snapshot) -> UiState {
     let mut ui = UiState::new();
     raise_connection_failure(snapshot, &mut ui);
     ui.raise_preview_errors(snapshot);
+    ui.close_disconnected_tabs(snapshot);
     ui
 }
 
@@ -729,6 +731,39 @@ mod tests {
         // Sorting and resizing act on the selected column, so the context has
         // to carry it or every key press means column zero.
         assert_eq!(context(&ui, &snap).grid_column, Some(3));
+    }
+
+    #[tokio::test]
+    async fn disconnecting_closes_the_tabs_it_had_open() {
+        // The store drops the connection's previews on `Disconnect`, but
+        // nothing tells this crate to let go of the tabs pointing at them —
+        // left alone, a tab survives its own connection with no preview left
+        // to show and no session left to fetch one with.
+        let (store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let table = sqlake_core::node::TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let mut snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.apply(crate::intent::ViewCmd::OpenTab { conn, table }, &snap);
+        assert_eq!(ui.tabs.len(), 1);
+
+        store.dispatch(Action::Disconnect(conn));
+        until(&mut rx, |s| s.connections[0].status == ConnStatus::Closed).await;
+        snap = rx.borrow_and_update().clone();
+
+        ui.close_disconnected_tabs(&snap);
+        assert!(ui.tabs.is_empty(), "a tab outlived its own connection");
     }
 
     // ── screens ────────────────────────────────────────────────────────────

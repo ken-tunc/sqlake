@@ -111,13 +111,6 @@ pub struct PreviewView {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Severity {
-    Info,
-    Warning,
-    Error,
-}
-
 /// What a busy item is waiting for.
 ///
 /// Cancelling abandons a reply that will now never arrive, so something has to

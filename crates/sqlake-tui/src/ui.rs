@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
-use sqlake_app::snapshot::Snapshot;
+use sqlake_app::snapshot::{ConnStatus, Snapshot};
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_core::id::{ConnId, TabId};
@@ -268,6 +268,31 @@ impl UiState {
                 }
                 Some(_) => {}
             }
+        }
+    }
+
+    /// A closed connection takes its tabs with it.
+    ///
+    /// `Disconnect` drops the connection's previews on the store side, but
+    /// nothing else tells this crate to let go of the tabs pointing at them —
+    /// left alone, a tab survives its own connection: switching to it shows a
+    /// blank pane forever, since there is no preview left to fetch and no
+    /// session left to fetch it with. A connection that vanished from the
+    /// snapshot entirely is treated the same as one marked `Closed`, though
+    /// nothing in this codebase currently removes a connection outright.
+    pub fn close_disconnected_tabs(&mut self, snapshot: &Snapshot) {
+        let closed: Vec<TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| {
+                snapshot
+                    .connection(t.conn)
+                    .is_none_or(|c| c.status == ConnStatus::Closed)
+            })
+            .map(|t| t.id)
+            .collect();
+        for id in closed {
+            self.apply(ViewCmd::CloseTab(id), snapshot);
         }
     }
 
@@ -999,5 +1024,27 @@ mod tests {
         snap.previews[0].last_error = Some("timed out".to_owned());
         ui.raise_preview_errors(&snap);
         assert_eq!(ui.toasts.len(), 2);
+    }
+
+    #[test]
+    fn a_closed_connection_takes_its_tabs_with_it() {
+        // Otherwise the tab outlives the connection it points at: its
+        // preview is gone from the store along with the session, so
+        // switching to it would show a blank pane for ever.
+        let (mut snap, mut ui) = setup(0, 0, 0);
+        assert_eq!(ui.tabs.len(), 1);
+
+        snap.connections[0].status = ConnStatus::Closed;
+        ui.close_disconnected_tabs(&snap);
+        assert!(ui.tabs.is_empty(), "the tab outlived its own connection");
+        assert_eq!(ui.active_tab, None);
+    }
+
+    #[test]
+    fn a_tab_is_untouched_while_its_connection_is_still_open() {
+        let (snap, mut ui) = setup(0, 0, 0);
+        let before = ui.tabs.len();
+        ui.close_disconnected_tabs(&snap);
+        assert_eq!(before, ui.tabs.len(), "a live connection's tab was closed");
     }
 }

@@ -26,9 +26,7 @@ pub use action::{Action, BusyId};
 pub use error::{AppError, AppResult};
 pub use pages::PagedResult;
 pub use session::SessionHandle;
-pub use snapshot::{
-    BusyItem, ConnStatus, ConnectionView, LoadState, PreviewView, Severity, Snapshot,
-};
+pub use snapshot::{BusyItem, ConnStatus, ConnectionView, LoadState, PreviewView, Snapshot};
 pub use store::{Drivers, Store};
 pub use tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 pub use usecase::UseCase;

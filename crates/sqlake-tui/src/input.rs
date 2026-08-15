@@ -489,6 +489,15 @@ fn open_or_focus_tab(conn: ConnId, table: TableRef) -> Vec<Intent> {
 
 /// Closing a tab. If it was the last one open on this relation, the store's
 /// own cache of it — and any page still in flight for it — goes too.
+///
+/// Two tabs on the same `(conn, table)` cannot happen through
+/// `ViewCmd::OpenTab` today — it raises the existing one instead of minting a
+/// second (`ui.rs`'s `OpenTab` doc comment states this as an invariant) — so
+/// `still_open` is always `false` on the only path that reaches this function
+/// now. Checked anyway rather than assumed: the day something else pushes a
+/// second tab onto the same relation — split panes, say — this is what stops
+/// the first one's close from pulling the second one's data out from under
+/// it.
 fn close_tab(id: TabId, ctx: &InputContext<'_>) -> Vec<Intent> {
     let Some(closing) = ctx.tabs.iter().find(|t| t.id == id) else {
         return Vec::new();
@@ -930,8 +939,19 @@ mod tests {
         let c = f.ctx(PaneId::Explorer);
 
         let out = on_mouse(Target::TreeRow { index: 1 }, Gesture::DoubleClick, &c);
-        assert!(matches!(out[0], Intent::View(ViewCmd::OpenTab { .. })));
-        assert!(matches!(out[1], Intent::App(Action::PreviewTable { .. })));
+        assert_eq!(
+            out,
+            [
+                Intent::View(ViewCmd::OpenTab {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+                Intent::App(Action::PreviewTable {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ]
+        );
 
         let out = on_mouse(Target::TreeRow { index: 0 }, Gesture::DoubleClick, &c);
         assert!(matches!(out[0], Intent::App(Action::ToggleNode { .. })));
@@ -1227,6 +1247,49 @@ mod tests {
     }
 
     #[test]
+    fn closing_one_of_two_tabs_on_the_same_relation_keeps_the_data() {
+        // `ViewCmd::OpenTab` never produces this today — it raises the
+        // existing tab instead of minting a second one on the same
+        // `(conn, table)` — but `close_tab` checks anyway, so this pins the
+        // behaviour down independently of that invariant holding forever.
+        let mut f = fixture();
+        let twin = TabId::new(99);
+        f.tabs.push(OpenTab {
+            id: twin,
+            conn: f.conn,
+            table: TableRef::new(["public", "users"]),
+        });
+
+        // `on_mouse` is pure — it does not remove anything from `f.tabs` — so
+        // the first close is checked against a context still holding both,
+        // and the second against one rebuilt to reflect the first actually
+        // having happened, the way `ui.apply(ViewCmd::CloseTab(..))` would
+        // leave it.
+        assert_eq!(
+            on_mouse(
+                Target::TabClose(TabId::new(1)),
+                Gesture::Click,
+                &f.ctx(PaneId::Grid)
+            ),
+            [Intent::View(ViewCmd::CloseTab(TabId::new(1)))],
+            "the twin is still showing the same relation"
+        );
+
+        f.tabs.retain(|t| t.id != TabId::new(1));
+        assert_eq!(
+            on_mouse(Target::TabClose(twin), Gesture::Click, &f.ctx(PaneId::Grid)),
+            [
+                Intent::View(ViewCmd::CloseTab(twin)),
+                Intent::App(Action::ForgetPreview {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ],
+            "the twin was the last one left"
+        );
+    }
+
+    #[test]
     fn switching_tabs_with_nothing_active_lands_on_the_first_one() {
         // The active tab was just closed. Stepping from an assumed index 0
         // would skip the tab the user is looking at.
@@ -1261,8 +1324,19 @@ mod tests {
         let mut c = f.ctx(PaneId::Explorer);
         c.tree_selection = Some(1);
         let out = on_key(press(KeyCode::Enter), &c);
-        assert!(matches!(out[0], Intent::View(ViewCmd::OpenTab { .. })));
-        assert!(matches!(out[1], Intent::App(Action::PreviewTable { .. })));
+        assert_eq!(
+            out,
+            [
+                Intent::View(ViewCmd::OpenTab {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+                Intent::App(Action::PreviewTable {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ]
+        );
     }
 
     #[test]
