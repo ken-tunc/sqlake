@@ -520,7 +520,16 @@ impl Runtime {
         // Without this, a preview whose connection has already died goes to
         // `Loading` below and stays there for ever: `fetch_page` returns
         // before sending anything, so no reply ever arrives to un-stick it.
-        if self.session(conn_id).is_none() {
+        let Some(session) = self.session(conn_id) else {
+            return;
+        };
+        // The driver would answer `Unsupported`, which reports as a failed
+        // preview: the rows on screen replaced by an error, for a gesture the
+        // front-end should not have offered. A front-end that reads
+        // `Capabilities` never gets here; one that does not — an agent sending
+        // actions straight in — is stopped here rather than at the driver.
+        if !session.capabilities().sortable_preview {
+            tracing::warn!(%table, "sort: this connection cannot order a preview");
             return;
         }
         let Some(preview) = self.preview_mut(conn_id, &table) else {
@@ -916,7 +925,7 @@ impl Runtime {
 mod tests {
     use sqlake_core::node::NodeKind;
     use sqlake_core::value::Value;
-    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
+    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, NO_SORT};
     use tokio::sync::watch::Receiver;
 
     use super::*;
@@ -927,8 +936,12 @@ mod tests {
     }
 
     fn store_paging(behaviour: Behaviour, page_size: u32) -> Store {
+        store_of(MockDriver::new(behaviour), page_size)
+    }
+
+    fn store_of(driver: MockDriver, page_size: u32) -> Store {
         Store::spawn(
-            Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
+            Drivers::new().with(Arc::new(driver)),
             Arc::new(MockProfiles::default()),
             page_size,
         )
@@ -983,7 +996,10 @@ mod tests {
     }
 
     async fn connected_store() -> (Store, Receiver<Arc<Snapshot>>, ConnId) {
-        let store = store(Behaviour::instant());
+        connected(store(Behaviour::instant())).await
+    }
+
+    async fn connected(store: Store) -> (Store, Receiver<Arc<Snapshot>>, ConnId) {
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect(pid("mock")));
         let snap = until(&mut rx, |s| {
@@ -1391,6 +1407,51 @@ mod tests {
                 .row_count(),
             50
         );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_cannot_order_a_preview_is_never_asked_to() {
+        // The TUI hides the gesture, so this is about the caller that does not
+        // read `Capabilities` — the agent surface. Passed through, the driver
+        // answers `Unsupported`, and the preview reports a failure for
+        // something nobody could have asked for.
+        let store = store_of(
+            MockDriver::new(Behaviour::instant()).with_capabilities(NO_SORT),
+            PageRequest::DEFAULT_LIMIT,
+        );
+        let (store, mut rx, conn) = connected(store).await;
+        let table = TableRef::new(["public", "big"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.loaded_rows == 200)
+        })
+        .await;
+
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 0,
+        });
+        // The append is what proves the sort was dropped rather than merely
+        // slow: had it gone through, `data` would be `Loading` and `LoadMore`
+        // would refuse to extend it, so this would time out instead.
+        store.dispatch(Action::LoadMore {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.loaded_rows >= 400)
+        })
+        .await;
+
+        let preview = preview_of(&snap, conn, &table);
+        assert!(preview.sort.is_none(), "an ordering nothing can serve");
+        assert!(preview.data.error().is_none(), "{:?}", preview.data);
     }
 
     #[tokio::test]

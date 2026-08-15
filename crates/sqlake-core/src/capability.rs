@@ -66,6 +66,12 @@ pub struct Capabilities {
     pub cost_estimate: bool,
     /// Previewing a table is free, so it need not go through a query.
     pub free_preview: bool,
+    /// A preview can be ordered by a column.
+    ///
+    /// Separate from [`Capabilities::free_preview`] because BigQuery answers
+    /// the two differently: `tabledata.list` is not billed and cannot sort,
+    /// and sorting means `SELECT … ORDER BY`, which is billed.
+    pub sortable_preview: bool,
     pub quote_style: QuoteStyle,
 }
 
@@ -105,6 +111,7 @@ mod tests {
         streaming: true,
         cost_estimate: true,
         free_preview: false,
+        sortable_preview: true,
         quote_style: QuoteStyle::DoubleQuote,
     };
 
@@ -123,6 +130,7 @@ mod tests {
         streaming: true,
         cost_estimate: true,
         free_preview: true,
+        sortable_preview: false,
         quote_style: QuoteStyle::Backtick,
     };
 
