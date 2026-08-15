@@ -302,20 +302,9 @@ masking lives in exactly one function and never reaches the log.
 
 ### 10.1 PostgreSQL
 
-- `tokio-postgres` with `tokio-postgres-rustls`; `sslmode` maps onto the rustls configuration.
 - Hold **two connections: one for queries, one for metadata**, so that expanding the tree is
   never blocked behind a long-running query. Both sit behind one `Session`.
-- Cancellation uses `client.cancel_token()`. On connect, set `application_name = 'sqlake'`,
-  a `statement_timeout`, and — when the profile is read-only —
-  `SET default_transaction_read_only = on`.
-- Read metadata from `pg_catalog` directly (`pg_class`, `pg_attribute`, `pg_index`,
-  `pg_constraint`, `pg_trigger`, `pg_description`) rather than `information_schema`: faster
-  and more informative.
-- **Type decoding.** Receive through a `RawValue: FromSql` whose `accepts()` always returns
-  true, holding `(Type, Vec<u8>)`. Decode the ~40 known OIDs strictly and route everything
-  else to `Value::Opaque`. Extension and user-defined types then cannot crash the client.
-- Preview issues `SELECT * FROM "sch"."tbl" ORDER BY … LIMIT n OFFSET m`. Identifiers can only
-  be assembled through `QuotedIdent`.
+- Cancellation uses `client.cancel_token()`; connect also sets a `statement_timeout`.
 - Show the `EXPLAIN` row estimate first; run an exact `COUNT(*)` only on explicit request.
 
 ### 10.2 BigQuery
@@ -397,10 +386,10 @@ CREATE TABLE templates (
 
 ## 13. Testing
 
-The testing rules that apply to every commit are in [CLAUDE.md](../CLAUDE.md). The part still
-to build is the shared **driver conformance suite** in `tests/`: one set of cases run against
-PostgreSQL via `testcontainers`, against BigQuery via an emulator, and against the mock, so
-that "the driver behaves" means the same thing for all three.
+The testing rules that apply to every commit are in [CLAUDE.md](../CLAUDE.md). `sqlake-conformance`
+holds the shared **driver conformance suite**: one set of cases, run against the mock and, via
+`testcontainers`, against PostgreSQL. BigQuery's leg, against an emulator, arrives with the
+driver in M2, so that "the driver behaves" means the same thing for all three.
 
 ---
 
@@ -448,10 +437,10 @@ Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 �
 
 ## 16. Dependencies
 
-The UI layer depends on **`ratatui` and `crossterm`, and nothing else**. The data grid, tree,
-modals, scrollbar handling and focus are written here, because each has requirements specific
-to this project and each is a few hundred lines at most. `rat-ftable` is the fallback if the
-grid cannot be made fast enough.
+The UI layer reaches for **no other widget crate**: the data grid, tree, modals, scrollbar
+handling and focus are written here, on top of `ratatui` and `crossterm`, because each has
+requirements specific to this project and each is a few hundred lines at most. `rat-ftable`
+is the fallback if the grid cannot be made fast enough.
 
 The workspace `Cargo.toml` is the record of what is in use. What is not there yet, with the
 choice already made:

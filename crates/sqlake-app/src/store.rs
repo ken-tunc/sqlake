@@ -6,8 +6,8 @@
 //!
 //! The store never awaits a use case inline. Every call is spawned, and its
 //! result comes back as an internal `Event`. Awaiting inline would let one slow
-//! expansion block every other action — the same failure the PostgreSQL driver
-//! avoids by holding a separate metadata connection.
+//! expansion block every other action on every connection, not only the one it
+//! is slow on.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -530,6 +530,15 @@ impl Runtime {
     }
 
     fn sort_preview(&mut self, tab_id: TabId, column: usize) {
+        let Some(conn) = self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.conn) else {
+            return;
+        };
+        // Without this, a tab whose connection has already died goes to
+        // `Loading` below and stays there for ever: `fetch_page` returns
+        // before sending anything, so no reply ever arrives to un-stick it.
+        if self.session(conn).is_none() {
+            return;
+        }
         let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };
@@ -607,6 +616,18 @@ impl Runtime {
 
     fn close_tab(&mut self, id: TabId) {
         let position = self.tabs.iter().position(|t| t.id == id);
+        // Otherwise a page in flight for this tab keeps its busy row on
+        // screen — "loading …" for a tab that is no longer there — until the
+        // reply arrives and `previewed` finds nothing left to apply it to.
+        if let Some(busy) = self
+            .tabs
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.pending.as_ref())
+            .map(|p| p.busy)
+        {
+            self.drop_task(busy);
+        }
         self.tabs.retain(|t| t.id != id);
         if self.active_tab == Some(id) {
             // Select the neighbour, which is what every tabbed UI does.
@@ -1764,6 +1785,40 @@ mod tests {
         store.dispatch(Action::CloseTab(first));
         let snap = until(&mut rx, |s| s.tabs.len() == 1).await;
         assert_eq!(snap.active_tab, Some(snap.tabs[0].id));
+    }
+
+    #[tokio::test]
+    async fn closing_a_tab_drops_its_own_page_in_flight() {
+        // Otherwise the busy row for a page nobody is waiting on anymore stays
+        // on screen until the slow reply eventually arrives — "loading …" for
+        // a tab that closed a while ago.
+        let store = store(Behaviour {
+            latency: std::time::Duration::from_millis(1),
+            slow_nodes: vec![vec!["public".to_owned(), "users".to_owned()]],
+            slow_latency: std::time::Duration::from_secs(30),
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "users"]),
+        });
+        let snap = until(&mut rx, Snapshot::is_busy).await;
+        let tab = snap.active_tab.unwrap();
+
+        store.dispatch(Action::CloseTab(tab));
+        let snap = until(&mut rx, |s| s.tabs.is_empty()).await;
+        assert!(
+            snap.busy.is_empty(),
+            "the closed tab's page is still loading"
+        );
     }
 
     #[tokio::test]
