@@ -8,7 +8,9 @@
 //! on the way out, so a PostGIS geometry or somebody's enum shows up as text
 //! rather than as an error where a table used to be — see [`value`].
 
+pub mod catalog;
 pub mod config;
+pub mod preview;
 pub mod tls;
 pub mod value;
 
@@ -116,7 +118,11 @@ impl Driver for PgDriver {
                 ))
             })??;
 
-        Ok(Box::new(PgSession { client }))
+        // Asked once, here, because every later answer depends on it: the
+        // tree's top node is this database, and a relation from another one
+        // cannot be read over this connection at all.
+        let database = current_database(&client).await?;
+        Ok(Box::new(PgSession { client, database }))
     }
 }
 
@@ -170,25 +176,15 @@ where
 /// reason off [`Error::source`](std::error::Error::source), so `to_string`
 /// alone throws away every word worth reading.
 fn connect_failed(err: tokio_postgres::Error) -> DriverError {
-    use std::error::Error as _;
-    use std::fmt::Write as _;
-
-    let mut message = err.to_string();
-    let mut cause = err.source();
-    while let Some(next) = cause {
-        let _ = write!(message, ": {next}");
-        cause = next.source();
-    }
-    DriverError::Connect(message)
+    DriverError::Connect(describe(&err))
 }
 
 #[derive(Debug)]
 pub struct PgSession {
-    #[allow(
-        dead_code,
-        reason = "the catalogue queries that use it arrive in the next task"
-    )]
     client: Client,
+    /// The database this connection is attached to. PostgreSQL has no
+    /// cross-database queries, so this is a fact about the whole session.
+    database: String,
 }
 
 #[async_trait]
@@ -197,12 +193,12 @@ impl Session for PgSession {
         CAPABILITIES
     }
 
-    async fn children(&self, _of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
-        Err(unimplemented_yet("walking the object tree"))
+    async fn children(&self, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
+        catalog::children(&self.client, &self.database, of).await
     }
 
-    async fn preview(&self, _table: &TableRef, _req: &PageRequest) -> DriverResult<ResultSet> {
-        Err(unimplemented_yet("previewing a relation"))
+    async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
+        preview::preview(&self.client, &self.database, table, req).await
     }
 
     async fn close(self: Box<Self>) {
@@ -213,13 +209,31 @@ impl Session for PgSession {
     }
 }
 
-/// The half of this driver that T5 fills in.
+/// [`catalog::CURRENT_DATABASE`], as its own step.
+async fn current_database(client: &Client) -> DriverResult<String> {
+    client
+        .query_one(catalog::CURRENT_DATABASE, &[])
+        .await
+        .and_then(|row| row.try_get(0))
+        .map_err(|err| DriverError::Connect(describe(&err)))
+}
+
+/// Everything a `tokio_postgres::Error` knows, on one line.
 ///
-/// A named error rather than a `todo!()`: this driver is reachable from the
-/// binary the moment it is registered, and a panic in a spawned task is a
-/// worse answer than a row that says what is missing.
-fn unimplemented_yet(what: &str) -> DriverError {
-    DriverError::Unsupported(format!("{what} is not implemented yet"))
+/// Its own `Display` prints the category — "db error", "error connecting to
+/// server" — and hangs the reason off `source()`, so `to_string` alone throws
+/// away every word worth reading.
+pub(crate) fn describe(err: &tokio_postgres::Error) -> String {
+    use std::error::Error as _;
+    use std::fmt::Write as _;
+
+    let mut message = err.to_string();
+    let mut cause = err.source();
+    while let Some(next) = cause {
+        let _ = write!(message, ": {next}");
+        cause = next.source();
+    }
+    message
 }
 
 #[cfg(test)]
