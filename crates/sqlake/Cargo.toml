@@ -16,6 +16,7 @@ clap.workspace = true
 sqlake-app.workspace = true
 sqlake-config.workspace = true
 sqlake-core.workspace = true
+sqlake-driver-bigquery.workspace = true
 sqlake-driver-mock.workspace = true
 sqlake-driver-postgres.workspace = true
 sqlake-tui.workspace = true

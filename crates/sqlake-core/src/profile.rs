@@ -7,11 +7,10 @@
 //! — putting it in `sqlake-config` would make every driver depend on a
 //! decision about TOML.
 //!
-//! [`Params`] gains a variant when a driver gains an implementation. BigQuery
-//! arrives in M2; declaring it now would be a shape guessed months before
-//! anything constructs one.
+//! [`Params`] gains a variant when a driver gains an implementation.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -109,6 +108,7 @@ impl ResolvedProfile {
     pub const fn kind(&self) -> DriverKind {
         match self.params {
             Params::Postgres(_) => DriverKind::Postgres,
+            Params::BigQuery(_) => DriverKind::BigQuery,
             Params::Mock => DriverKind::Mock,
         }
     }
@@ -117,6 +117,7 @@ impl ResolvedProfile {
 #[derive(Debug, Clone)]
 pub enum Params {
     Postgres(PostgresParams),
+    BigQuery(BigQueryParams),
     /// The in-memory driver, which has nothing to connect to. It still arrives
     /// as a profile, because the path a mock connection takes has to be the
     /// path a real one takes or it is not testing it.
@@ -133,6 +134,32 @@ pub struct PostgresParams {
     /// `None` means the server is expected to want no password: a Unix socket,
     /// `.pgpass`, or trust.
     pub password: Option<Secret>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BigQueryParams {
+    pub project: String,
+    /// `None` leaves it to the driver to infer from the dataset.
+    pub location: Option<String>,
+    pub auth: BigQueryAuth,
+    /// The ceiling a query is refused above, carried from the profile so that
+    /// the limit belongs to the connection rather than to whoever runs the
+    /// query.
+    pub max_bytes_billed: Option<u64>,
+}
+
+/// Where the driver gets a token.
+///
+/// No [`Secret`] anywhere: both variants name a place credentials live rather
+/// than carrying one, so a `ResolvedProfile` for BigQuery has nothing to mask
+/// and nothing to zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BigQueryAuth {
+    /// Application default credentials — `gcloud auth application-default`,
+    /// `GOOGLE_APPLICATION_CREDENTIALS`, or the metadata server.
+    Adc,
+    /// An absolute path to a service-account key file.
+    ServiceAccount(PathBuf),
 }
 
 /// libpq's `sslmode`, with libpq's meanings.
