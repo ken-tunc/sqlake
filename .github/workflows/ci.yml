@@ -29,8 +29,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # `SQLAKE_REQUIRE_DOCKER` turns "no container runtime" from a skip into
+      # a failure. The driver conformance suite is the only test that talks to
+      # a real server, so a CI run that quietly skipped it would prove nothing
+      # about the driver at all.
       - name: Test
         run: cargo test --workspace
+        env:
+          SQLAKE_REQUIRE_DOCKER: 1
 
       # Intra-doc links are the part of a doc comment that can actually break,
       # and nothing else in this job looks at them.

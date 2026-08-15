@@ -25,6 +25,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+sqlake-conformance.workspace = true
 sqlake-driver-mock.workspace = true
 rust_decimal.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt"] }
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread"] }
