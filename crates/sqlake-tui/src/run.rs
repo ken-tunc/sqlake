@@ -23,7 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
-use sqlake_app::snapshot::{ConnStatus, Snapshot, TabContent};
+use sqlake_app::snapshot::{ConnStatus, Snapshot};
 use sqlake_app::store::Store;
 use tokio::sync::watch;
 
@@ -59,7 +59,6 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
 
     loop {
         if dirty {
-            ui.retain_tabs(&snapshot);
             // Cleared rather than replaced: one entry per visible cell adds up
             // to hundreds, and growing a fresh `Vec` for them every frame is a
             // cost with nothing to show for it.
@@ -92,7 +91,9 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                 }
                 snapshot = snapshots.borrow_and_update().clone();
                 raise_connection_failure(&snapshot, &mut ui);
-                            dirty = true;
+                ui.raise_preview_errors(&snapshot);
+                ui.close_disconnected_tabs(&snapshot);
+                dirty = true;
             }
         }
 
@@ -165,6 +166,8 @@ fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
 fn initial_ui(snapshot: &Snapshot) -> UiState {
     let mut ui = UiState::new();
     raise_connection_failure(snapshot, &mut ui);
+    ui.raise_preview_errors(snapshot);
+    ui.close_disconnected_tabs(snapshot);
     ui
 }
 
@@ -219,7 +222,7 @@ fn from_event(
     }
 }
 
-fn context<'a>(ui: &UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
+fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
     InputContext {
         snapshot,
         focus: ui.focus,
@@ -233,10 +236,10 @@ fn context<'a>(ui: &UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
             .map(|node| node.conn)
             .or_else(|| snapshot.connections.first().map(|c| c.id)),
         tree_selection: ui.tree.selected,
-        grid_column: snapshot
-            .active_tab
-            .and_then(|tab| ui.grid(tab))
-            .map(|g| g.col),
+        grid_column: ui.active_tab.and_then(|tab| ui.grid(tab)).map(|g| g.col),
+        tabs: &ui.tabs,
+        active_tab: ui.active_tab,
+        toasts: &ui.toasts,
     }
 }
 
@@ -248,7 +251,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     }
 
     let frames = chrome::layout(area, ui);
-    chrome::tab_bar(frame, hits, frames.tab_bar, snapshot);
+    chrome::tab_bar(frame, hits, frames.tab_bar, ui);
 
     let explorer = chrome::pane(
         frame,
@@ -268,9 +271,16 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         matches!(ui.hover, Some(Target::Splitter(_))),
     );
 
-    let title = snapshot
-        .active()
-        .map_or_else(|| "Preview".to_owned(), |t| t.title.clone());
+    // Owned rather than borrowed: `ui.grid_mut` below needs `&mut ui`, and
+    // this is the tab it is about, not the tab bar's own list.
+    let active = ui
+        .active_tab
+        .and_then(|id| ui.tabs.iter().find(|t| t.id == id))
+        .map(|t| (t.id, t.conn, t.table.clone()));
+    let title = active.as_ref().map_or_else(
+        || "Preview".to_owned(),
+        |(_, _, table)| table.name().to_owned(),
+    );
     let grid = chrome::pane(
         frame,
         hits,
@@ -283,9 +293,9 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     // column, and a viewport measured without them makes `ScrollToEnd` stop a
     // row short of the end.
     ui.set_viewport(PaneId::Grid, datagrid::body_area(grid));
-    if let Some(tab) = snapshot.active() {
-        let id = tab.id;
-        let TabContent::Preview(preview) = &tab.content;
+    if let Some((id, conn, table)) = active
+        && let Some(preview) = snapshot.preview(conn, &table)
+    {
         datagrid::render(frame, hits, grid, preview, ui.grid_mut(id));
     }
 
@@ -293,7 +303,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
 
     // Toasts first so a dialog covers them: a message drawn over the thing
     // waiting for an answer hides the answer.
-    overlay::toasts(frame, hits, body_of(frames), snapshot);
+    overlay::toasts(frame, hits, body_of(frames), &ui.toasts);
     if let Some(dialog) = ui.modal.clone() {
         overlay::modal(frame, hits, area, &dialog);
     }
@@ -340,7 +350,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, MouseEventKind};
     use ratatui::layout::Position;
     use sqlake_app::action::Action;
-    use sqlake_app::snapshot::{ConnStatus, ConnectionView, TabView};
+    use sqlake_app::snapshot::{ConnStatus, ConnectionView};
     use sqlake_app::store::Drivers;
     use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeRef, TableRef};
@@ -651,17 +661,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_dialog_covers_the_toasts_rather_than_the_other_way_round() {
-        let (_store, mut snap) = connected().await;
-        let mut owned = (*snap).clone();
-        owned.toasts.push(sqlake_app::snapshot::Toast {
-            id: sqlake_app::action::ToastId::new(1),
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        ui.toasts.push(crate::ui::Toast {
+            id: crate::hit::ToastId::new(1),
             text: "something happened".into(),
-            severity: sqlake_app::snapshot::Severity::Error,
+            severity: crate::ui::Severity::Error,
             created_at: Instant::now(),
         });
-        snap = Arc::new(owned);
-
-        let mut ui = UiState::new();
         ui.modal = Some(overlay::Modal::error("Failed", "could not connect"));
         let (_, hits) = render(&snap, &mut ui, 100, 30);
 
@@ -696,19 +703,67 @@ mod tests {
     async fn the_input_context_follows_the_selected_cell() {
         let (store, snap) = connected().await;
         let mut ui = UiState::new();
+        let conn = snap.connections[0].id;
+        let table = sqlake_core::node::TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
-            conn: snap.connections[0].id,
-            table: sqlake_core::node::TableRef::new(["public", "users"]),
+            conn,
+            table: table.clone(),
         });
         let mut rx = store.subscribe();
-        until(&mut rx, |s| s.active().is_some()).await;
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
         let snap = rx.borrow_and_update().clone();
 
+        // What the input layer would have applied alongside the action: the
+        // tab this test then selects a cell in.
+        ui.apply(
+            crate::intent::ViewCmd::OpenTab {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
         render(&snap, &mut ui, 100, 30);
         ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 3 }, &snap);
         // Sorting and resizing act on the selected column, so the context has
         // to carry it or every key press means column zero.
         assert_eq!(context(&ui, &snap).grid_column, Some(3));
+    }
+
+    #[tokio::test]
+    async fn disconnecting_closes_the_tabs_it_had_open() {
+        // The store drops the connection's previews on `Disconnect`, but
+        // nothing tells this crate to let go of the tabs pointing at them —
+        // left alone, a tab survives its own connection with no preview left
+        // to show and no session left to fetch one with.
+        let (store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let table = sqlake_core::node::TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let mut snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.apply(crate::intent::ViewCmd::OpenTab { conn, table }, &snap);
+        assert_eq!(ui.tabs.len(), 1);
+
+        store.dispatch(Action::Disconnect(conn));
+        until(&mut rx, |s| s.connections[0].status == ConnStatus::Closed).await;
+        snap = rx.borrow_and_update().clone();
+
+        ui.close_disconnected_tabs(&snap);
+        assert!(ui.tabs.is_empty(), "a tab outlived its own connection");
     }
 
     // ── screens ────────────────────────────────────────────────────────────
@@ -794,13 +849,13 @@ mod tests {
         let (store, _) = connected().await;
         let mut rx = store.subscribe();
         let conn = rx.borrow_and_update().connections[0].id;
+        let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
-            table: TableRef::new(["public", "users"]),
+            table: table.clone(),
         });
         until(&mut rx, |s| {
-            s.active()
-                .and_then(TabView::preview)
+            s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
         .await;
@@ -808,6 +863,14 @@ mod tests {
 
         let mut ui = UiState::new();
         ui.focus = PaneId::Grid;
+        // What the input layer would have applied alongside the action.
+        ui.apply(
+            crate::intent::ViewCmd::OpenTab {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
         // Drawn first, the way the loop does it: an intent applied before any
         // frame exists is measured against a viewport of zero.
         let _ = render(&snap, &mut ui, 100, 30);

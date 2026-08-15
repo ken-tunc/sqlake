@@ -11,8 +11,10 @@
 //! meaningful claim.
 
 use sqlake_app::action::Action;
+use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::node::TableRef;
 
-use crate::hit::{PaneId, SplitId};
+use crate::hit::{PaneId, SplitId, ToastId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
@@ -34,7 +36,7 @@ impl From<Action> for Intent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewCmd {
     FocusPane(PaneId),
     FocusNextPane,
@@ -82,6 +84,20 @@ pub enum ViewCmd {
     EvenSplit(SplitId),
 
     DismissModal,
+
+    /// A relation now has a tab open for it, focused. Reusing one already
+    /// open is `SelectTab`, not this — which of a screen's tabs a table
+    /// belongs to is exactly the kind of state that lives here rather than
+    /// in the store: two front-ends asking for the same table are asking for
+    /// the same data, not fighting over one tab.
+    OpenTab {
+        conn: ConnId,
+        table: TableRef,
+    },
+    SelectTab(TabId),
+    CloseTab(TabId),
+
+    DismissToast(ToastId),
 }
 
 /// Generates the kind enum and its complete list from one place, so the two
@@ -157,6 +173,13 @@ impl IntentKind {
                 ViewCmd::MoveSplit { .. } => Self::MoveSplit,
                 ViewCmd::EvenSplit(_) => Self::EvenSplit,
                 ViewCmd::DismissModal => Self::DismissModal,
+                // Always produced alongside `Action::PreviewTable`, not on
+                // its own: the two are one user capability, "open a
+                // relation", not two.
+                ViewCmd::OpenTab { .. } => Self::PreviewTable,
+                ViewCmd::SelectTab(_) => Self::SelectTab,
+                ViewCmd::CloseTab(_) => Self::CloseTab,
+                ViewCmd::DismissToast(_) => Self::DismissToast,
             },
             Intent::App(action) => match action {
                 Action::Connect(_) => Self::Connect,
@@ -165,10 +188,11 @@ impl IntentKind {
                 Action::PreviewTable { .. } => Self::PreviewTable,
                 Action::SortPreview { .. } => Self::SortPreview,
                 Action::LoadMore { .. } => Self::LoadMore,
-                Action::SelectTab(_) => Self::SelectTab,
-                Action::CloseTab(_) => Self::CloseTab,
+                // Always produced alongside `ViewCmd::CloseTab`, when it is
+                // the tab's last reference: the two are one capability,
+                // "close this tab", not two.
+                Action::ForgetPreview { .. } => Self::CloseTab,
                 Action::Cancel(_) => Self::Cancel,
-                Action::DismissToast(_) => Self::DismissToast,
                 Action::Quit => Self::Quit,
             },
         }

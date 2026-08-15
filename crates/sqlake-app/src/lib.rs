@@ -8,7 +8,10 @@
 //!
 //! `Intent` and `ViewCmd` deliberately live in `sqlake-tui` rather than here.
 //! Only [`action::Action`] crosses the boundary, so no UI vocabulary — panes,
-//! splits, scroll — reaches this crate.
+//! splits, scroll, tabs, toasts — reaches this crate. Which previews a screen
+//! has open, in what order, and which one has focus is exactly that kind of
+//! state: [`snapshot::PreviewView`] is addressed by connection and table, not
+//! by a number this crate hands out.
 
 pub mod action;
 pub mod error;
@@ -19,14 +22,11 @@ pub mod store;
 pub mod tree;
 pub mod usecase;
 
-pub use action::{Action, BusyId, ToastId};
+pub use action::{Action, BusyId};
 pub use error::{AppError, AppResult};
 pub use pages::PagedResult;
 pub use session::SessionHandle;
-pub use snapshot::{
-    BusyItem, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity, Snapshot, TabContent,
-    TabView, Toast,
-};
+pub use snapshot::{BusyItem, ConnStatus, ConnectionView, LoadState, PreviewView, Snapshot};
 pub use store::{Drivers, Store};
 pub use tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 pub use usecase::UseCase;

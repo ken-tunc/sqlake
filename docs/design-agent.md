@@ -247,6 +247,14 @@ shared between them.
 That decision would have been easy to get wrong by default. Making it in M2, before anything
 depends on the shape, is most of the reason to pull A1 forward at all.
 
+`Snapshot` needed the same correction one level up, and now has it: `tabs`, `active_tab` and
+`Toast` — `sqlake-tui`'s vocabulary, not `sqlake-app`'s — moved out before this document was
+built on top of them. A page is addressed by `(ConnId, TableRef)`, fetched and cached in
+`sqlake-app`, reachable by whoever asks for it again; which of those a screen has open, their
+order, and which has focus is `sqlake-tui`'s own `UiState`. `api snapshot` (§2.2) now serialises
+a `Snapshot` with nothing on it that only makes sense in front of a human — the wire type still
+has to exist for `Instant` and `Arc`, but it is no longer also deciding what to leave out.
+
 ## 8. Open questions
 
 1. **Session naming and discovery.** herdr uses `--session <name>` with a default session. Is

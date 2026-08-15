@@ -12,10 +12,12 @@ use sqlake_app::action::Action;
 use sqlake_app::snapshot::{ConnStatus, Snapshot};
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, ProfileId, TabId};
+use sqlake_core::node::TableRef;
 
 use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
 use crate::intent::{Context, Intent, IntentKind, ViewCmd};
 use crate::mouse::Gesture;
+use crate::ui::{OpenTab, Toast};
 
 /// Rows moved by one wheel notch. Three is the common terminal convention.
 const WHEEL_LINES: i32 = 3;
@@ -239,6 +241,12 @@ pub struct InputContext<'a> {
     /// only thing that makes them equivalent: without it every key press would
     /// sort and resize column zero whatever the user had selected.
     pub grid_column: Option<usize>,
+    /// This screen's own open tabs — `UiState`'s, not the store's. Which
+    /// relation a tab points at is what turns a click into `PreviewTable`,
+    /// `SortPreview` or `LoadMore`; the store has no idea tabs exist.
+    pub tabs: &'a [OpenTab],
+    pub active_tab: Option<TabId>,
+    pub toasts: &'a [Toast],
 }
 
 impl InputContext<'_> {
@@ -272,7 +280,16 @@ impl InputContext<'_> {
     }
 
     fn active_tab(&self) -> Option<TabId> {
-        self.snapshot.active_tab
+        self.active_tab
+    }
+
+    /// The relation the active tab points at, if any.
+    fn active_preview(&self) -> Option<(ConnId, TableRef)> {
+        let id = self.active_tab?;
+        self.tabs
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| (t.conn, t.table.clone()))
     }
 
     /// The context a keystroke is read in. A modal takes the keyboard over
@@ -324,8 +341,17 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
             ViewCmd::SelectCell { row, col }.into(),
         ],
         (Target::GridHeader { col }, Gesture::Click) => ctx
-            .active_tab()
-            .map(|tab| vec![Action::SortPreview { tab, column: col }.into()])
+            .active_preview()
+            .map(|(conn, table)| {
+                vec![
+                    Action::SortPreview {
+                        conn,
+                        table,
+                        column: col,
+                    }
+                    .into(),
+                ]
+            })
             .unwrap_or_default(),
         (Target::GridColEdge { col }, Gesture::DragBy { dx, .. }) => {
             vec![ViewCmd::ResizeColumn { col, delta: dx }.into()]
@@ -395,11 +421,11 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
         }
         (Target::Splitter(split), Gesture::DoubleClick) => vec![ViewCmd::EvenSplit(split).into()],
 
-        (Target::Tab(id), Gesture::Click) => vec![Action::SelectTab(id).into()],
+        (Target::Tab(id), Gesture::Click) => vec![ViewCmd::SelectTab(id).into()],
         (Target::TabClose(id), Gesture::Click)
         // Middle-click is the second way to close a tab, and the one that does
         // not require hitting a one-cell `×`.
-        | (Target::Tab(id), Gesture::MiddleClick) => vec![Action::CloseTab(id).into()],
+        | (Target::Tab(id), Gesture::MiddleClick) => close_tab(id, ctx),
 
         (Target::Button(ButtonId::Cancel(busy)), Gesture::Click) => {
             vec![Action::Cancel(busy).into()]
@@ -407,7 +433,7 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
         (Target::Button(ButtonId::DismissModal), Gesture::Click) => {
             vec![ViewCmd::DismissModal.into()]
         }
-        (Target::Toast(id), Gesture::Click) => vec![Action::DismissToast(id).into()],
+        (Target::Toast(id), Gesture::Click) => vec![ViewCmd::DismissToast(id).into()],
         (Target::Backdrop, Gesture::Click) => vec![ViewCmd::DismissModal.into()],
 
         // Presses, releases and hover carry no action of their own; they exist
@@ -434,7 +460,7 @@ fn activate_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
     // table of the same name somewhere else.
     let conn = node.conn;
     match node.node_ref.as_table() {
-        Some(table) => vec![Action::PreviewTable { conn, table }.into()],
+        Some(table) => open_or_focus_tab(conn, table),
         None => vec![
             Action::ToggleNode {
                 conn,
@@ -443,6 +469,49 @@ fn activate_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
             .into(),
         ],
     }
+}
+
+/// Always emits both: `ViewCmd::OpenTab` decides for itself whether that
+/// means raising an existing tab or minting one, and `Action::PreviewTable`
+/// is what makes a tab raised from `Failed` retry — `store::preview_table`
+/// treats a request for an already-loaded relation as a no-op, so asking
+/// again costs nothing when there was already something to show.
+fn open_or_focus_tab(conn: ConnId, table: TableRef) -> Vec<Intent> {
+    vec![
+        ViewCmd::OpenTab {
+            conn,
+            table: table.clone(),
+        }
+        .into(),
+        Action::PreviewTable { conn, table }.into(),
+    ]
+}
+
+/// Closing a tab. If it was the last one open on this relation, the store's
+/// own cache of it — and any page still in flight for it — goes too.
+///
+/// Two tabs on the same `(conn, table)` cannot happen through
+/// `ViewCmd::OpenTab` today — it raises the existing one instead of minting a
+/// second (`ui.rs`'s `OpenTab` doc comment states this as an invariant) — so
+/// `still_open` is always `false` on the only path that reaches this function
+/// now. Checked anyway rather than assumed: the day something else pushes a
+/// second tab onto the same relation — split panes, say — this is what stops
+/// the first one's close from pulling the second one's data out from under
+/// it.
+fn close_tab(id: TabId, ctx: &InputContext<'_>) -> Vec<Intent> {
+    let Some(closing) = ctx.tabs.iter().find(|t| t.id == id) else {
+        return Vec::new();
+    };
+    let (conn, table) = (closing.conn, closing.table.clone());
+    let mut intents = vec![ViewCmd::CloseTab(id).into()];
+    let still_open = ctx
+        .tabs
+        .iter()
+        .any(|t| t.id != id && t.conn == conn && t.table == table);
+    if !still_open {
+        intents.push(Action::ForgetPreview { conn, table }.into());
+    }
+    intents
 }
 
 /// `collapse_only` is set for `Left`, which must never open a subtree: a key
@@ -593,11 +662,12 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|i| activate_node(i, ctx))
             .unwrap_or_default(),
         IntentKind::SortPreview => ctx
-            .active_tab()
-            .map(|tab| {
+            .active_preview()
+            .map(|(conn, table)| {
                 vec![
                     Action::SortPreview {
-                        tab,
+                        conn,
+                        table,
                         column: ctx.grid_column.unwrap_or(0),
                     }
                     .into(),
@@ -605,15 +675,15 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             })
             .unwrap_or_default(),
         IntentKind::LoadMore => ctx
-            .active_tab()
-            .map(|tab| vec![Action::LoadMore { tab }.into()])
+            .active_preview()
+            .map(|(conn, table)| vec![Action::LoadMore { conn, table }.into()])
             .unwrap_or_default(),
         IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
-            .map(|tab| vec![Action::SelectTab(tab).into()])
+            .map(|tab| vec![ViewCmd::SelectTab(tab).into()])
             .unwrap_or_default(),
         IntentKind::CloseTab => ctx
             .active_tab()
-            .map(|tab| vec![Action::CloseTab(tab).into()])
+            .map(|tab| close_tab(tab, ctx))
             .unwrap_or_default(),
         IntentKind::Cancel => ctx
             .snapshot
@@ -622,17 +692,16 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|b| vec![Action::Cancel(b.id).into()])
             .unwrap_or_default(),
         IntentKind::DismissToast => ctx
-            .snapshot
             .toasts
             .first()
-            .map(|t| vec![Action::DismissToast(t.id).into()])
+            .map(|t| vec![ViewCmd::DismissToast(t.id).into()])
             .unwrap_or_default(),
         IntentKind::Quit => vec![Action::Quit.into()],
     }
 }
 
 fn neighbouring_tab(ctx: &InputContext<'_>, backwards: bool) -> Option<TabId> {
-    let tabs = &ctx.snapshot.tabs;
+    let tabs = ctx.tabs;
     if tabs.is_empty() {
         return None;
     }
@@ -658,22 +727,57 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use sqlake_app::action::{BusyId, ToastId};
+    use sqlake_app::action::BusyId;
     use sqlake_app::snapshot::{
-        BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewTab, Severity,
-        TabContent, TabView, Toast,
+        BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewView,
     };
     use sqlake_app::tree::{NodeState, TreeView, VisibleNode};
     use sqlake_core::capability::DriverKind;
     use sqlake_core::node::{NodeKind, NodeRef, RelationKind, TableRef};
 
     use super::*;
+    use crate::hit::ToastId;
+    use crate::ui::Severity;
 
     // ── fixtures ───────────────────────────────────────────────────────────
 
-    fn snapshot() -> Snapshot {
+    /// A snapshot, and the tabs and toasts a screen showing it might have —
+    /// the two are independent inputs now, not one borrowed from the other.
+    struct Fixture {
+        snapshot: Snapshot,
+        conn: ConnId,
+        tabs: Vec<OpenTab>,
+        toasts: Vec<Toast>,
+    }
+
+    impl Fixture {
+        fn ctx(&self, focus: PaneId) -> InputContext<'_> {
+            InputContext {
+                active_tab: Some(self.tabs[0].id),
+                ..self.ctx_no_active_tab(focus)
+            }
+        }
+
+        /// The active tab just closed, so nothing is active — the state
+        /// `switching_tabs_with_nothing_active_lands_on_the_first_one` exists
+        /// to cover.
+        fn ctx_no_active_tab(&self, focus: PaneId) -> InputContext<'_> {
+            InputContext {
+                snapshot: &self.snapshot,
+                focus,
+                modal_open: false,
+                connection: self.snapshot.connections.first().map(|c| c.id),
+                tree_selection: Some(0),
+                grid_column: Some(2),
+                tabs: &self.tabs,
+                active_tab: None,
+                toasts: &self.toasts,
+            }
+        }
+    }
+
+    fn fixture() -> Fixture {
         let conn = ConnId::new();
-        let tab = TabId::new(1);
         let explorer = Arc::new(TreeView {
             nodes: vec![
                 VisibleNode {
@@ -698,7 +802,20 @@ mod tests {
             ],
         });
 
-        Snapshot {
+        let tabs = vec![
+            OpenTab {
+                id: TabId::new(1),
+                conn,
+                table: TableRef::new(["public", "users"]),
+            },
+            OpenTab {
+                id: TabId::new(2),
+                conn,
+                table: TableRef::new(["public", "empty"]),
+            },
+        ];
+
+        let snapshot = Snapshot {
             rev: 1,
             profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![ConnectionView {
@@ -711,55 +828,41 @@ mod tests {
                 capabilities: None,
             }],
             explorer,
-            tabs: vec![
-                TabView {
-                    id: tab,
-                    conn,
-                    title: "users".into(),
-                    content: TabContent::Preview(PreviewTab {
-                        table: TableRef::new(["public", "users"]),
-                        sort: None,
-                        loaded_rows: 0,
-                        data: LoadState::Idle,
-                    }),
-                },
-                TabView {
-                    id: TabId::new(2),
-                    conn,
-                    title: "empty".into(),
-                    content: TabContent::Preview(PreviewTab {
-                        table: TableRef::new(["public", "empty"]),
-                        sort: None,
-                        loaded_rows: 0,
-                        data: LoadState::Idle,
-                    }),
-                },
-            ],
-            active_tab: Some(tab),
+            previews: tabs
+                .iter()
+                .map(|t| PreviewView {
+                    conn: t.conn,
+                    table: t.table.clone(),
+                    sort: None,
+                    loaded_rows: 0,
+                    data: LoadState::Idle,
+                    last_error: None,
+                })
+                .collect(),
             busy: vec![BusyItem {
                 id: BusyId::new(1),
-                owner: BusyOwner::Tab(tab),
+                owner: BusyOwner::Preview {
+                    conn,
+                    table: TableRef::new(["public", "users"]),
+                },
                 label: "loading".into(),
                 started_at: std::time::Instant::now(),
             }],
-            toasts: vec![Toast {
-                id: ToastId::new(1),
-                text: "oops".into(),
-                severity: Severity::Error,
-                created_at: std::time::Instant::now(),
-            }],
             should_quit: false,
-        }
-    }
+        };
 
-    fn ctx<'a>(snapshot: &'a Snapshot, focus: PaneId) -> InputContext<'a> {
-        InputContext {
+        let toasts = vec![Toast {
+            id: ToastId::new(1),
+            text: "oops".into(),
+            severity: Severity::Error,
+            created_at: std::time::Instant::now(),
+        }];
+
+        Fixture {
             snapshot,
-            focus,
-            modal_open: false,
-            connection: snapshot.connections.first().map(|c| c.id),
-            tree_selection: Some(0),
-            grid_column: Some(2),
+            conn,
+            tabs,
+            toasts,
         }
     }
 
@@ -770,8 +873,8 @@ mod tests {
         // `public.users`, so picking the first connection instead would open
         // the wrong table and look right doing it.
         let second = ConnId::new();
-        let mut snap = snapshot();
-        let rows = Arc::get_mut(&mut snap.explorer).expect("sole owner");
+        let mut f = fixture();
+        let rows = Arc::get_mut(&mut f.snapshot.explorer).expect("sole owner");
         rows.nodes.push(VisibleNode {
             conn: second,
             depth: 1,
@@ -782,7 +885,7 @@ mod tests {
         });
         let last = rows.nodes.len() - 1;
 
-        let mut context = ctx(&snap, PaneId::Explorer);
+        let mut context = f.ctx(PaneId::Explorer);
         // The first connection stays selected in the context, which is what
         // the previous version of this code would have used.
         context.tree_selection = Some(last);
@@ -790,10 +893,16 @@ mod tests {
         let out = on_key(press(KeyCode::Enter), &context);
         assert_eq!(
             out,
-            [Intent::App(Action::PreviewTable {
-                conn: second,
-                table: TableRef::new(["public", "users"]),
-            })]
+            [
+                Intent::View(ViewCmd::OpenTab {
+                    conn: second,
+                    table: TableRef::new(["public", "users"]),
+                }),
+                Intent::App(Action::PreviewTable {
+                    conn: second,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ]
         );
     }
 
@@ -809,11 +918,11 @@ mod tests {
 
     #[test]
     fn clicking_a_tree_row_focuses_the_explorer_and_selects_it() {
-        let snap = snapshot();
+        let f = fixture();
         let out = on_mouse(
             Target::TreeRow { index: 1 },
             Gesture::Click,
-            &ctx(&snap, PaneId::Grid),
+            &f.ctx(PaneId::Grid),
         );
         assert_eq!(
             out,
@@ -826,11 +935,23 @@ mod tests {
 
     #[test]
     fn double_clicking_a_relation_opens_it_and_a_branch_expands() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Explorer);
+        let f = fixture();
+        let c = f.ctx(PaneId::Explorer);
 
         let out = on_mouse(Target::TreeRow { index: 1 }, Gesture::DoubleClick, &c);
-        assert!(matches!(out[0], Intent::App(Action::PreviewTable { .. })));
+        assert_eq!(
+            out,
+            [
+                Intent::View(ViewCmd::OpenTab {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+                Intent::App(Action::PreviewTable {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ]
+        );
 
         let out = on_mouse(Target::TreeRow { index: 0 }, Gesture::DoubleClick, &c);
         assert!(matches!(out[0], Intent::App(Action::ToggleNode { .. })));
@@ -838,8 +959,8 @@ mod tests {
 
     #[test]
     fn the_toggle_glyph_never_expands_a_leaf() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Explorer);
+        let f = fixture();
+        let c = f.ctx(PaneId::Explorer);
         assert!(on_mouse(Target::TreeToggle { index: 1 }, Gesture::Click, &c).is_empty());
         assert!(!on_mouse(Target::TreeToggle { index: 0 }, Gesture::Click, &c).is_empty());
     }
@@ -847,16 +968,16 @@ mod tests {
     #[test]
     fn a_click_on_a_row_that_no_longer_exists_does_nothing() {
         // The hit map is one frame old, so an index can outlive its row.
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Explorer);
+        let f = fixture();
+        let c = f.ctx(PaneId::Explorer);
         assert!(on_mouse(Target::TreeRow { index: 99 }, Gesture::DoubleClick, &c).is_empty());
         assert!(on_mouse(Target::TreeToggle { index: 99 }, Gesture::Click, &c).is_empty());
     }
 
     #[test]
     fn the_wheel_scrolls_the_pane_it_is_over_not_the_focused_one() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_mouse(Target::TreeRow { index: 0 }, Gesture::Scroll(-1), &c),
             [Intent::View(ViewCmd::ScrollBy {
@@ -868,11 +989,11 @@ mod tests {
 
     #[test]
     fn dragging_a_column_edge_resizes_that_column() {
-        let snap = snapshot();
+        let f = fixture();
         let out = on_mouse(
             Target::GridColEdge { col: 4 },
             Gesture::DragBy { dx: -3, dy: 0 },
-            &ctx(&snap, PaneId::Grid),
+            &f.ctx(PaneId::Grid),
         );
         assert_eq!(
             out,
@@ -882,8 +1003,8 @@ mod tests {
 
     #[test]
     fn clicking_the_track_pages_towards_the_click() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         let before = on_mouse(
             Target::Scrollbar {
                 pane: PaneId::Grid,
@@ -918,17 +1039,17 @@ mod tests {
 
     #[test]
     fn the_backdrop_dismisses_the_modal_rather_than_reaching_behind_it() {
-        let snap = snapshot();
+        let f = fixture();
         assert_eq!(
-            on_mouse(Target::Backdrop, Gesture::Click, &ctx(&snap, PaneId::Grid)),
+            on_mouse(Target::Backdrop, Gesture::Click, &f.ctx(PaneId::Grid)),
             [Intent::View(ViewCmd::DismissModal)]
         );
     }
 
     #[test]
     fn presses_and_hover_carry_no_action() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Explorer);
+        let f = fixture();
+        let c = f.ctx(PaneId::Explorer);
         for gesture in [
             Gesture::Down,
             Gesture::Up,
@@ -946,16 +1067,16 @@ mod tests {
 
     #[test]
     fn scrolling_applies_to_the_focused_pane() {
-        let snap = snapshot();
+        let f = fixture();
         assert_eq!(
-            on_key(press(KeyCode::Char('j')), &ctx(&snap, PaneId::Grid)),
+            on_key(press(KeyCode::Char('j')), &f.ctx(PaneId::Grid)),
             [Intent::View(ViewCmd::ScrollBy {
                 pane: PaneId::Grid,
                 delta: 1
             })]
         );
         assert_eq!(
-            on_key(press(KeyCode::Char('k')), &ctx(&snap, PaneId::StatusBar)),
+            on_key(press(KeyCode::Char('k')), &f.ctx(PaneId::StatusBar)),
             [Intent::View(ViewCmd::ScrollBy {
                 pane: PaneId::StatusBar,
                 delta: -1
@@ -966,24 +1087,24 @@ mod tests {
     #[test]
     fn a_pane_binding_beats_the_global_one_for_the_same_key() {
         // Down scrolls globally, but in the explorer it moves the selection.
-        let snap = snapshot();
+        let f = fixture();
         assert_eq!(
-            on_key(press(KeyCode::Down), &ctx(&snap, PaneId::Explorer)),
+            on_key(press(KeyCode::Down), &f.ctx(PaneId::Explorer)),
             [Intent::View(ViewCmd::MoveTreeSelection(1))]
         );
         assert!(matches!(
-            on_key(press(KeyCode::Down), &ctx(&snap, PaneId::Grid))[0],
+            on_key(press(KeyCode::Down), &f.ctx(PaneId::Grid))[0],
             Intent::View(ViewCmd::ScrollBy { .. })
         ));
     }
 
     #[test]
     fn escape_means_different_things_in_different_contexts() {
-        let snap = snapshot();
-        let mut c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
         assert!(matches!(
             on_key(press(KeyCode::Esc), &c)[0],
-            Intent::App(Action::DismissToast(_))
+            Intent::View(ViewCmd::DismissToast(_))
         ));
 
         c.modal_open = true;
@@ -995,8 +1116,8 @@ mod tests {
 
     #[test]
     fn a_modal_takes_the_keyboard_over_entirely() {
-        let snap = snapshot();
-        let mut c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
         c.modal_open = true;
         // `s` sorts in the grid, but the grid is not what has the keyboard.
         assert!(on_key(press(KeyCode::Char('s')), &c).is_empty());
@@ -1009,12 +1130,13 @@ mod tests {
     fn sorting_and_resizing_act_on_the_selected_column() {
         // The mouse can sort any header and resize any edge. Bound to column
         // zero, the keys would only look like the same capability.
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_key(press(KeyCode::Char('s')), &c),
             [Intent::App(Action::SortPreview {
-                tab: TabId::new(1),
+                conn: f.conn,
+                table: TableRef::new(["public", "users"]),
                 column: 2
             })]
         );
@@ -1026,8 +1148,8 @@ mod tests {
 
     #[test]
     fn shift_tab_moves_focus_the_other_way() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_key(press(KeyCode::Tab), &c),
             [Intent::View(ViewCmd::FocusNextPane)]
@@ -1044,9 +1166,9 @@ mod tests {
 
     #[test]
     fn left_closes_a_node_but_never_opens_one() {
-        let snap = snapshot();
-        let mut c = ctx(&snap, PaneId::Explorer);
-        let conn = snap.connections[0].id;
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        let conn = f.snapshot.connections[0].id;
         let public = NodeRef::new(NodeKind::Namespace, ["public"]);
 
         // Row 0 is expanded, so Left collapses it.
@@ -1071,8 +1193,8 @@ mod tests {
 
     #[test]
     fn the_cell_cursor_moves_on_both_axes() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
 
         // A click selects any cell, so the keyboard has to reach any cell too.
         // Both directions are `GridSelection`, so the coverage sweep cannot
@@ -1090,8 +1212,8 @@ mod tests {
     fn the_arrows_still_move_the_view_not_the_selection() {
         // Lower case and the arrows scroll; upper case selects. Breaking that
         // symmetry is how `Left` ends up meaning two things.
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_key(press(KeyCode::Right), &c),
             [Intent::View(ViewCmd::ScrollXBy { delta: 1 })]
@@ -1102,17 +1224,68 @@ mod tests {
     fn a_middle_click_closes_the_tab_it_lands_on() {
         // The second way to close a tab, and the one that does not require
         // hitting a one-cell `×`.
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         let tab = TabId::new(2);
+        // Tab 2 ("empty") is the only tab open on that relation, so closing
+        // it also tells the store to forget the cached preview.
         assert_eq!(
             on_mouse(Target::Tab(tab), Gesture::MiddleClick, &c),
-            [Intent::App(Action::CloseTab(tab))]
+            [
+                Intent::View(ViewCmd::CloseTab(tab)),
+                Intent::App(Action::ForgetPreview {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "empty"]),
+                }),
+            ]
         );
         // A left click still selects rather than closes.
         assert_eq!(
             on_mouse(Target::Tab(tab), Gesture::Click, &c),
-            [Intent::App(Action::SelectTab(tab))]
+            [Intent::View(ViewCmd::SelectTab(tab))]
+        );
+    }
+
+    #[test]
+    fn closing_one_of_two_tabs_on_the_same_relation_keeps_the_data() {
+        // `ViewCmd::OpenTab` never produces this today — it raises the
+        // existing tab instead of minting a second one on the same
+        // `(conn, table)` — but `close_tab` checks anyway, so this pins the
+        // behaviour down independently of that invariant holding forever.
+        let mut f = fixture();
+        let twin = TabId::new(99);
+        f.tabs.push(OpenTab {
+            id: twin,
+            conn: f.conn,
+            table: TableRef::new(["public", "users"]),
+        });
+
+        // `on_mouse` is pure — it does not remove anything from `f.tabs` — so
+        // the first close is checked against a context still holding both,
+        // and the second against one rebuilt to reflect the first actually
+        // having happened, the way `ui.apply(ViewCmd::CloseTab(..))` would
+        // leave it.
+        assert_eq!(
+            on_mouse(
+                Target::TabClose(TabId::new(1)),
+                Gesture::Click,
+                &f.ctx(PaneId::Grid)
+            ),
+            [Intent::View(ViewCmd::CloseTab(TabId::new(1)))],
+            "the twin is still showing the same relation"
+        );
+
+        f.tabs.retain(|t| t.id != TabId::new(1));
+        assert_eq!(
+            on_mouse(Target::TabClose(twin), Gesture::Click, &f.ctx(PaneId::Grid)),
+            [
+                Intent::View(ViewCmd::CloseTab(twin)),
+                Intent::App(Action::ForgetPreview {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ],
+            "the twin was the last one left"
         );
     }
 
@@ -1120,23 +1293,22 @@ mod tests {
     fn switching_tabs_with_nothing_active_lands_on_the_first_one() {
         // The active tab was just closed. Stepping from an assumed index 0
         // would skip the tab the user is looking at.
-        let mut snap = snapshot();
-        snap.active_tab = None;
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx_no_active_tab(PaneId::Grid);
         assert_eq!(
             on_key(press(KeyCode::Char(']')), &c),
-            [Intent::App(Action::SelectTab(TabId::new(1)))]
+            [Intent::View(ViewCmd::SelectTab(TabId::new(1)))]
         );
         assert_eq!(
             on_key(press(KeyCode::Char('[')), &c),
-            [Intent::App(Action::SelectTab(TabId::new(1)))]
+            [Intent::View(ViewCmd::SelectTab(TabId::new(1)))]
         );
     }
 
     #[test]
     fn the_wheel_works_over_the_empty_part_of_a_pane() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_mouse(Target::Pane(PaneId::Explorer), Gesture::Scroll(1), &c),
             [Intent::View(ViewCmd::ScrollBy {
@@ -1148,43 +1320,53 @@ mod tests {
 
     #[test]
     fn enter_opens_the_selected_relation() {
-        let snap = snapshot();
-        let mut c = ctx(&snap, PaneId::Explorer);
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
         c.tree_selection = Some(1);
-        assert!(matches!(
-            on_key(press(KeyCode::Enter), &c)[0],
-            Intent::App(Action::PreviewTable { .. })
-        ));
+        let out = on_key(press(KeyCode::Enter), &c);
+        assert_eq!(
+            out,
+            [
+                Intent::View(ViewCmd::OpenTab {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+                Intent::App(Action::PreviewTable {
+                    conn: f.conn,
+                    table: TableRef::new(["public", "users"]),
+                }),
+            ]
+        );
     }
 
     #[test]
     fn tab_switching_wraps_in_both_directions() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_key(press(KeyCode::Char(']')), &c),
-            [Intent::App(Action::SelectTab(TabId::new(2)))]
+            [Intent::View(ViewCmd::SelectTab(TabId::new(2)))]
         );
         assert_eq!(
             on_key(press(KeyCode::Char('[')), &c),
-            [Intent::App(Action::SelectTab(TabId::new(2)))],
+            [Intent::View(ViewCmd::SelectTab(TabId::new(2)))],
             "from the first tab, backwards wraps to the last"
         );
     }
 
     #[test]
     fn cancel_targets_what_is_actually_running() {
-        let snap = snapshot();
+        let f = fixture();
         assert_eq!(
-            on_key(press_ctrl(KeyCode::Char('g')), &ctx(&snap, PaneId::Grid)),
+            on_key(press_ctrl(KeyCode::Char('g')), &f.ctx(PaneId::Grid)),
             [Intent::App(Action::Cancel(BusyId::new(1)))]
         );
     }
 
     #[test]
     fn quit_is_bound_twice_for_the_two_habits() {
-        let snap = snapshot();
-        let c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
         assert_eq!(
             on_key(press(KeyCode::Char('q')), &c),
             [Intent::App(Action::Quit)]
@@ -1199,16 +1381,16 @@ mod tests {
     fn key_releases_are_ignored() {
         // Windows terminals report them, and acting on both would double every
         // keystroke.
-        let snap = snapshot();
+        let f = fixture();
         let mut event = press(KeyCode::Char('q'));
         event.kind = KeyEventKind::Release;
-        assert!(on_key(event, &ctx(&snap, PaneId::Grid)).is_empty());
+        assert!(on_key(event, &f.ctx(PaneId::Grid)).is_empty());
     }
 
     #[test]
     fn an_unbound_key_does_nothing() {
-        let snap = snapshot();
-        assert!(on_key(press(KeyCode::Char('~')), &ctx(&snap, PaneId::Grid)).is_empty());
+        let f = fixture();
+        assert!(on_key(press(KeyCode::Char('~')), &f.ctx(PaneId::Grid)).is_empty());
     }
 
     #[test]
@@ -1221,6 +1403,9 @@ mod tests {
             connection: None,
             tree_selection: None,
             grid_column: None,
+            tabs: &[],
+            active_tab: None,
+            toasts: &[],
         };
         for code in [
             KeyCode::Char('s'),
@@ -1235,12 +1420,12 @@ mod tests {
 
     #[test]
     fn connecting_walks_the_profiles_and_can_reopen_a_closed_one() {
-        let mut snap = snapshot();
-        snap.profiles = Arc::new(vec![mock_summary("replica"), mock_summary("staging")]);
-        snap.connections[0].profile = mock_summary("replica").id;
+        let mut f = fixture();
+        f.snapshot.profiles = Arc::new(vec![mock_summary("replica"), mock_summary("staging")]);
+        f.snapshot.connections[0].profile = mock_summary("replica").id;
 
         // `replica` is open, so `c` reaches for the one that is not.
-        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
         assert_eq!(
             out,
             [Intent::App(Action::Connect(mock_summary("staging").id))]
@@ -1249,8 +1434,8 @@ mod tests {
         // Still opening counts as open. Otherwise a second press while the
         // first connection is still on its way opens a duplicate of it rather
         // than moving on to the profile that has nothing.
-        snap.connections[0].status = ConnStatus::Connecting;
-        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        f.snapshot.connections[0].status = ConnStatus::Connecting;
+        let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
         assert_eq!(
             out,
             [Intent::App(Action::Connect(mock_summary("staging").id))]
@@ -1259,8 +1444,8 @@ mod tests {
         // Closing a connection leaves its row behind, and a row is not a
         // connection: `c` has to be able to open `replica` again rather than
         // skipping past it for ever.
-        snap.connections[0].status = ConnStatus::Closed;
-        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        f.snapshot.connections[0].status = ConnStatus::Closed;
+        let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
         assert_eq!(
             out,
             [Intent::App(Action::Connect(mock_summary("replica").id))]
@@ -1268,9 +1453,9 @@ mod tests {
 
         // The same profile twice is a second window onto one database, so the
         // key never goes dead once everything is open.
-        snap.connections[0].status = ConnStatus::Ready;
-        snap.profiles = Arc::new(vec![mock_summary("replica")]);
-        let out = on_key(press(KeyCode::Char('c')), &ctx(&snap, PaneId::Explorer));
+        f.snapshot.connections[0].status = ConnStatus::Ready;
+        f.snapshot.profiles = Arc::new(vec![mock_summary("replica")]);
+        let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
         assert_eq!(
             out,
             [Intent::App(Action::Connect(mock_summary("replica").id))]
@@ -1348,11 +1533,11 @@ mod tests {
     fn every_capability_reachable_with_the_mouse_has_a_key_binding() {
         // This is the mechanical form of "nothing is mouse-only". The reverse
         // is deliberately not required: keyboard-only capabilities are fine.
-        let snap = snapshot();
+        let f = fixture();
         let mut contexts = Vec::new();
         for focus in [PaneId::Explorer, PaneId::Grid] {
             for selection in [Some(0), Some(1)] {
-                let mut c = ctx(&snap, focus);
+                let mut c = f.ctx(focus);
                 c.tree_selection = selection;
                 contexts.push(c);
             }
@@ -1386,7 +1571,7 @@ mod tests {
     }
 
     /// Every focus, selection and modal state a keystroke can be read in.
-    fn every_context(snap: &Snapshot) -> Vec<InputContext<'_>> {
+    fn every_context(f: &Fixture) -> Vec<InputContext<'_>> {
         let mut out = Vec::new();
         for focus in [
             PaneId::TabBar,
@@ -1396,7 +1581,7 @@ mod tests {
         ] {
             for selection in [None, Some(0), Some(1)] {
                 for modal_open in [false, true] {
-                    let mut c = ctx(snap, focus);
+                    let mut c = f.ctx(focus);
                     c.tree_selection = selection;
                     c.modal_open = modal_open;
                     out.push(c);
@@ -1412,8 +1597,8 @@ mod tests {
         // the set of kinds the map *names*. On its own that is satisfiable by a
         // binding that names a kind and produces nothing — a key that is listed
         // in the help and does not work. This closes that half.
-        let snap = snapshot();
-        let contexts = every_context(&snap);
+        let f = fixture();
+        let contexts = every_context(&f);
 
         for binding in KEYMAP {
             for combo in binding.keys {
@@ -1436,8 +1621,8 @@ mod tests {
         // "A modal takes the keyboard over" is a claim about every key, not
         // just the ones belonging to a pane: `q` behind a dialog must answer
         // the dialog or do nothing, never quit.
-        let snap = snapshot();
-        let mut c = ctx(&snap, PaneId::Grid);
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
         c.modal_open = true;
 
         for binding in KEYMAP {
