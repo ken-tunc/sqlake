@@ -36,7 +36,6 @@ use crate::usecase::{
     PreviewTable, PreviewTableInput, PreviewTableOutput, UseCase,
 };
 
-/// The drivers this process can open connections with.
 #[derive(Debug, Default, Clone)]
 pub struct Drivers {
     map: HashMap<DriverKind, Arc<dyn Driver>>,
@@ -62,7 +61,6 @@ impl Drivers {
     }
 }
 
-/// A handle to the store task.
 #[derive(Debug, Clone)]
 pub struct Store {
     actions: mpsc::UnboundedSender<Action>,
@@ -164,7 +162,6 @@ struct Conn {
     view: Arc<TreeView>,
 }
 
-/// Shown on whatever was waiting for a reply that was abandoned.
 const CANCELLED: &str = "cancelled";
 
 /// A page request that has gone out and not yet come back.
@@ -202,7 +199,6 @@ struct Runtime {
     tabs: Vec<Tab>,
     active_tab: Option<TabId>,
     busy: Vec<BusyItem>,
-    /// Lets [`Action::Cancel`] stop waiting for a result.
     tasks: HashMap<BusyId, AbortHandle>,
     toasts: Vec<Toast>,
     next_tab: u32,
@@ -276,7 +272,6 @@ impl Runtime {
         });
     }
 
-    /// Spawn a use case and remember how to abandon it.
     fn spawn_task<F>(&mut self, busy: BusyId, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -555,8 +550,6 @@ impl Runtime {
         }
     }
 
-    /// Abandon a task and stop showing it.
-    ///
     /// This does not stop work already running inside the driver: real
     /// cancellation is a driver capability and arrives with `CancelHandle` in
     /// M4.
@@ -583,8 +576,6 @@ impl Runtime {
         }
     }
 
-    /// Put `owner` back into a state that can be retried, after a reply that
-    /// will never arrive.
     fn abandon(&mut self, owner: &BusyOwner, reason: &str) {
         match owner {
             BusyOwner::Connection(id) => {

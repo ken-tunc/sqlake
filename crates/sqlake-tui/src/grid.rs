@@ -50,9 +50,7 @@ pub enum CellKind {
     Null,
     Number,
     Text,
-    /// JSON, arrays and structs: shown collapsed, opened in a detail view.
     Complex,
-    /// A type the driver could not decode.
     Opaque,
 }
 
@@ -77,8 +75,6 @@ pub struct RenderedColumn {
     pub align: Align,
 }
 
-/// Rows prepared for display.
-///
 /// Cheap to build and cheap to hold: the rows stay behind the `Arc` they
 /// arrived in, and only the column widths are computed up front.
 #[derive(Debug, Clone)]

@@ -33,7 +33,6 @@ pub const HIERARCHY: &[HierarchyLevel] = &[
     HierarchyLevel::new(NodeKind::Relation, "table"),
 ];
 
-/// What PostgreSQL can do, as the UI needs to know it.
 pub const CAPABILITIES: Capabilities = Capabilities {
     hierarchy: HIERARCHY,
     indexes: true,
@@ -54,7 +53,6 @@ pub const CAPABILITIES: Capabilities = Capabilities {
 
 #[derive(Debug)]
 pub struct PgDriver {
-    /// The longest a connection attempt may take, over everything.
     deadline: std::time::Duration,
 }
 
@@ -72,8 +70,6 @@ impl PgDriver {
         }
     }
 
-    /// A driver that gives up sooner.
-    ///
     /// Exists because the interesting case — a host that accepts the
     /// connection and then says nothing — is only observable by waiting, and
     /// waiting [`config::DEADLINE`] to find that out is not a test anyone runs
@@ -209,7 +205,6 @@ impl Session for PgSession {
     }
 }
 
-/// [`catalog::CURRENT_DATABASE`], as its own step.
 async fn current_database(client: &Client) -> DriverResult<String> {
     client
         .query_one(catalog::CURRENT_DATABASE, &[])

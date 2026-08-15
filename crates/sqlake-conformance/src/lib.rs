@@ -235,7 +235,6 @@ async fn a_page_past_the_end_still_has_columns(
     );
 }
 
-/// Naming something that is not there fails, and does so as an error.
 async fn a_relation_that_is_not_there_is_an_error(
     session: &dyn Session,
     subject: &Subject,

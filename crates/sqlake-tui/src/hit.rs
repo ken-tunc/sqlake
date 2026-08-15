@@ -44,7 +44,6 @@ pub enum SplitId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScrollPart {
-    /// The draggable thumb.
     Thumb,
     /// The track above the thumb: page up.
     TrackBefore,

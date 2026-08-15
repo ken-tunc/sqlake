@@ -16,7 +16,6 @@ use sqlake_core::value::Value;
 use time::{Date, Duration, PrimitiveDateTime, Time};
 use tokio_postgres::types::{FromSql, Type};
 
-/// A column value exactly as it came off the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawValue {
     ty: Type,
@@ -45,8 +44,6 @@ impl RawValue {
         decode(&self.ty, bytes).unwrap_or_else(|| self.opaque(bytes))
     }
 
-    /// What a value looks like when the driver has no idea what it is.
-    ///
     /// Many unknown types — enums, domains over text, `citext`, `ltree`, XML —
     /// send their text form as their binary form, so trying UTF-8 first
     /// displays them correctly by accident. Everything else is shown the way

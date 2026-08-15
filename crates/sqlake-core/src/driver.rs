@@ -46,16 +46,12 @@ impl DriverError {
     }
 }
 
-/// Creates sessions. One instance per driver kind, shared by every profile of
-/// that kind.
 #[async_trait]
 pub trait Driver: Send + Sync + std::fmt::Debug {
     fn kind(&self) -> DriverKind;
 
     fn capabilities(&self) -> Capabilities;
 
-    /// Open a connection with the parameters of one profile.
-    ///
     /// A driver is per *kind*, not per connection: one `Arc<dyn Driver>`
     /// serves every PostgreSQL profile there is, and what distinguishes two
     /// live connections is the [`ResolvedProfile`] each was opened with.
@@ -68,11 +64,8 @@ pub trait Driver: Send + Sync + std::fmt::Debug {
 pub trait Session: Send + Sync + std::fmt::Debug {
     fn capabilities(&self) -> Capabilities;
 
-    /// Expand one node of the object tree. Called lazily, one level at a time.
     async fn children(&self, of: &NodeRef) -> DriverResult<Vec<TreeNode>>;
 
-    /// A page of a relation's contents.
-    ///
     /// Drivers whose [`Capabilities::free_preview`] is true must not issue a
     /// query here — that is the whole point of the flag.
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet>;
