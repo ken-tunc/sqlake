@@ -71,6 +71,11 @@ impl Store {
     /// `page_size` comes from the configuration rather than from a constant
     /// here: how many rows are worth waiting for depends on the database and
     /// the link to it, which is something only the person using it knows.
+    ///
+    /// Zero is taken as one. `sqlake-config` refuses it, but that validation is
+    /// a crate away and not on the path a second front-end takes: a page of no
+    /// rows leaves an offset that `next_page` never advances, so the relation
+    /// could never be read and nothing on screen would say why.
     #[must_use]
     pub fn spawn(drivers: Drivers, profiles: Arc<dyn Profiles>, page_size: u32) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
@@ -84,7 +89,7 @@ impl Store {
             // its own questions — not a thing to do silently on every frame.
             profile_list: Arc::new(profiles.list()),
             profiles,
-            page_size,
+            page_size: page_size.max(1),
             events: event_tx,
             conns: Vec::new(),
             tabs: Vec::new(),
@@ -488,7 +493,22 @@ impl Runtime {
             .iter()
             .find(|t| t.conn == conn_id && t.table == table)
         {
-            self.active_tab = Some(existing.id);
+            let (id, sort) = (existing.id, existing.sort);
+            self.active_tab = Some(id);
+            // A tab whose page failed holds no rows, and `LoadMore` refuses to
+            // extend rows that are not there — so without this, opening the
+            // relation again would raise a dead tab and the only way back to
+            // the table would be closing it first. Its ordering is kept: the
+            // header is already showing the arrow.
+            if existing.data.error().is_some() {
+                let page = PageRequest::first_of(self.page_size).with_sort(sort);
+                if let Some(tab) = self.tab_mut(id) {
+                    tab.page = page;
+                    tab.data = LoadState::Loading;
+                    tab.loaded_rows = 0;
+                }
+                self.fetch_page(id, page, false);
+            }
             return;
         }
 
@@ -537,6 +557,14 @@ impl Runtime {
         // `LoadMore`s both went out, the first reply was dropped as stale, and
         // the rows it carried could never be asked for again.
         if tab.pending.is_some() {
+            return;
+        }
+        // And there has to be something to extend. After a failed page `page`
+        // still names the page that failed, so the next offset steps over it —
+        // and `previewed` has nothing to append to, so it would install that
+        // reply as the whole relation: the second page shown as the first, with
+        // nothing to say the rows before it are missing.
+        if tab.data.ready().is_none() {
             return;
         }
         let next = tab.page.next_page();
@@ -1220,6 +1248,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_a_relation_whose_page_failed_asks_again() {
+        // Reuse and failure meet here: the tab is raised rather than opened
+        // twice, and a raised tab holding an error has nothing to raise. Since
+        // `LoadMore` will not extend rows that are not there, opening the
+        // relation is the only retry there is — without this, the tab is dead
+        // until it is closed.
+        let store = store(Behaviour {
+            flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 1)],
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.error().is_some())
+        })
+        .await;
+        let tab = snap.active_tab.unwrap();
+
+        store.dispatch(Action::PreviewTable { conn, table });
+        let snap = until(&mut rx, |s| {
+            s.tab(tab)
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+
+        assert_eq!(snap.tabs.len(), 1, "the retry opened a second tab");
+        assert_eq!(rows_of(&snap, tab), 50);
+    }
+
+    #[tokio::test]
     async fn a_failing_preview_marks_the_tab_not_the_whole_app() {
         let store = store(Behaviour {
             failing_nodes: vec![vec!["analytics".to_owned(), "broken".to_owned()]],
@@ -1377,6 +1449,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_more_on_a_page_that_failed_asks_for_nothing() {
+        // Fails once, so a second request would succeed and be believed. The
+        // tab is still on the page that failed, so the next offset steps over
+        // it: rows 201-400 would arrive with nothing to append them to and be
+        // shown as the whole relation, the first 200 missing without a word.
+        let store = store(Behaviour {
+            flaky_nodes: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new(["public", "big"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.error().is_some())
+        })
+        .await;
+        let tab = snap.active_tab.unwrap();
+
+        store.dispatch(Action::LoadMore { tab });
+        // Actions are handled in order, so a snapshot that has seen the quit
+        // has seen the `LoadMore` — and nothing is loading because of it.
+        store.dispatch(Action::Quit);
+        let snap = until(&mut rx, |s| s.should_quit).await;
+
+        assert!(snap.busy.is_empty(), "a page went out anyway");
+        let preview = snap.tab(tab).and_then(TabView::preview).unwrap();
+        assert!(preview.data.error().is_some(), "still the failed page");
+        assert_eq!(preview.loaded_rows, 0);
+    }
+
+    #[tokio::test]
     async fn cancelling_an_expansion_leaves_the_node_retryable() {
         let store = store(Behaviour {
             latency: std::time::Duration::from_millis(1),
@@ -1529,6 +1643,102 @@ mod tests {
                 "row {row} is not contiguous"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_retry_keeps_the_ordering_the_header_is_showing() {
+        // Sorting a tab whose page failed leaves the arrow drawn and no rows
+        // under it. If the retry asked for the relation unordered, the header
+        // would be describing an order the rows do not have — the arrow is the
+        // only thing telling the user what they are looking at.
+        let store = store(Behaviour {
+            flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 3)],
+            ..Behaviour::instant()
+        });
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+        let conn = snap.connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.error().is_some())
+        })
+        .await;
+        let tab = snap.active_tab.unwrap();
+
+        // Twice, because the first toggle is ascending and the fixture is
+        // already in that order: only descending can tell the two apart.
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            store.dispatch(Action::SortPreview { tab, column: 0 });
+            until(&mut rx, |s| {
+                s.busy.is_empty() && sort_of(s, tab) == Some(dir)
+            })
+            .await;
+        }
+
+        store.dispatch(Action::PreviewTable { conn, table });
+        let snap = until(&mut rx, |s| {
+            s.tab(tab)
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+
+        let grid = snap
+            .tab(tab)
+            .and_then(TabView::preview)
+            .and_then(|p| p.data.ready())
+            .expect("a loaded page");
+        assert_eq!(sort_of(&snap, tab), Some(SortDir::Desc));
+        assert_eq!(
+            grid.value(0, 0),
+            Some(&Value::Int(50)),
+            "the retry ignored the arrow the header is showing"
+        );
+    }
+
+    fn sort_of(snap: &Snapshot, tab: TabId) -> Option<SortDir> {
+        snap.tab(tab)
+            .and_then(TabView::preview)
+            .and_then(|p| p.sort)
+            .map(|s| s.dir)
+    }
+
+    #[tokio::test]
+    async fn a_page_size_of_zero_still_reads_the_relation() {
+        // `sqlake-config` refuses it, and that refusal is a crate away from
+        // here: a second front-end spawning the store with zero would get a
+        // page of no rows and an offset `next_page` never advances, which is a
+        // relation that cannot be read and does not say so.
+        let store = store_paging(Behaviour::instant(), 0);
+        let mut rx = store.subscribe();
+        store.dispatch(Action::Connect(pid("mock")));
+        let snap = until(&mut rx, |s| {
+            s.connections.first().is_some_and(ConnectionView::is_ready)
+        })
+        .await;
+
+        store.dispatch(Action::PreviewTable {
+            conn: snap.connections[0].id,
+            table: TableRef::new(["public", "users"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.active()
+                .and_then(TabView::preview)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        assert_eq!(rows_of(&snap, snap.active_tab.unwrap()), 1);
     }
 
     fn rows_of(snap: &Snapshot, tab: TabId) -> usize {
