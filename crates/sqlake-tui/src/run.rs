@@ -177,11 +177,16 @@ fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
 /// "Nothing connected" is only true when there is something to connect to. A
 /// fresh install has no config file at all, and a pane that says nothing
 /// leaves the user pressing keys at a client that cannot do anything yet.
+///
+/// The first connection is the one whose tree this pane draws, so its status is
+/// what the message has to be about: a handshake can take the whole of the
+/// driver's deadline, and `c` during one opens a *second* connection to the
+/// same profile rather than hurrying the first along.
 fn waiting_for(snapshot: &Snapshot) -> &'static str {
-    if snapshot.profiles.is_empty() {
-        " no connections configured — write connections.toml "
-    } else {
-        " nothing connected — press c "
+    match snapshot.connections.first().map(|c| &c.status) {
+        Some(ConnStatus::Connecting) => " connecting… ",
+        _ if snapshot.profiles.is_empty() => " no connections configured — write connections.toml ",
+        _ => " nothing connected — press c ",
     }
 }
 
@@ -360,6 +365,7 @@ mod tests {
     use sqlake_app::action::Action;
     use sqlake_app::snapshot::{ConnectionView, TabView};
     use sqlake_app::store::Drivers;
+    use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeRef, TableRef};
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, mock_summary};
 
@@ -403,6 +409,27 @@ mod tests {
         let screen = rows.join("\n");
         assert!(screen.contains("nothing connected"), "{screen}");
         assert!(!screen.contains("no connections"), "{screen}");
+
+        // And a third: the tree is empty because the handshake has not
+        // finished. Telling the user to press `c` here would open a second
+        // connection to the profile they are already waiting for.
+        let summary = mock_summary("mock");
+        let connecting = Snapshot {
+            connections: vec![ConnectionView {
+                id: ConnId::new(),
+                profile: summary.id.clone(),
+                name: summary.name.clone(),
+                kind: summary.kind,
+                status: ConnStatus::Connecting,
+                capabilities: None,
+            }],
+            profiles: Arc::new(vec![summary]),
+            ..Snapshot::default()
+        };
+        let (rows, _) = render(&connecting, &mut ui, 120, 30);
+        let screen = rows.join("\n");
+        assert!(screen.contains("connecting"), "{screen}");
+        assert!(!screen.contains("press c"), "{screen}");
     }
 
     fn render(snapshot: &Snapshot, ui: &mut UiState, w: u16, h: u16) -> (Vec<String>, HitMap) {

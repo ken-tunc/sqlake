@@ -234,16 +234,16 @@ async fn a_connection_leaves_nothing_behind() {
     session.close().await;
     until_gone(&watcher).await;
 
-    // And one that fails on the way in. The socket is open by the time the
-    // database is rejected, so a driver that forgets it would leave it behind.
-    let mut bad = profile(port);
-    if let Params::Postgres(params) = &mut bad.params {
-        params.database = "no_such_database".to_owned();
-    }
-    PgDriver::new()
-        .connect(&bad)
+    // And one that is dropped rather than closed, which is what happens when
+    // `Connect` fails after the session exists — the tree's first fetch not
+    // answering, say. The socket is the spawned connection task's, and only
+    // dropping the client ends it.
+    let dropped = PgDriver::new()
+        .connect(&profile(port))
         .await
-        .expect_err("should not connect");
+        .expect("should connect");
+    assert_eq!(ours(&watcher).await, 1, "the connection is not there");
+    drop(dropped);
     until_gone(&watcher).await;
 }
 
