@@ -194,7 +194,7 @@ impl Session for PgSession {
     }
 
     async fn children(&self, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
-        catalog::children(&self.client, of).await
+        catalog::children(&self.client, &self.database, of).await
     }
 
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
@@ -209,10 +209,10 @@ impl Session for PgSession {
     }
 }
 
-/// `SELECT current_database()`, as its own step.
+/// [`catalog::CURRENT_DATABASE`], as its own step.
 async fn current_database(client: &Client) -> DriverResult<String> {
     client
-        .query_one("SELECT current_database()", &[])
+        .query_one(catalog::CURRENT_DATABASE, &[])
         .await
         .and_then(|row| row.try_get(0))
         .map_err(|err| DriverError::Connect(describe(&err)))

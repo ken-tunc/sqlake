@@ -18,7 +18,7 @@ use tokio_postgres::Client;
 /// PostgreSQL has no cross-database queries, so the tree shows the one
 /// database the connection was opened against rather than everything on the
 /// server: a node nobody can open is worse than a node that is not there.
-const CURRENT_DATABASE: &str = "SELECT current_database()";
+pub(crate) const CURRENT_DATABASE: &str = "SELECT current_database()";
 
 /// Schemas, minus the ones that are never worth reading.
 ///
@@ -52,30 +52,32 @@ const RELATIONS: &str = "\
 /// `p` is a partitioned table, which is a table with no storage of its own;
 /// showing it as anything else would be a distinction without a difference to
 /// someone reading rows out of it.
-const RELKINDS: [&str; 5] = ["r", "p", "v", "m", "f"];
+/// Bytes rather than strings because `relkind` is `"char"`, PostgreSQL's
+/// one-byte type, and not `text`: the server infers `$2` as `"char"[]`, and a
+/// `&[&str]` bound to that is refused by the client before it is ever sent.
+const RELKINDS: [i8; 5] = [b'r' as i8, b'p' as i8, b'v' as i8, b'm' as i8, b'f' as i8];
 
 /// One level of the tree.
-pub async fn children(client: &Client, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
+///
+/// `database` is the one the session is attached to, asked for once when the
+/// connection was opened: it cannot change under a live connection, so the top
+/// level is answered without a round trip.
+pub async fn children(
+    client: &Client,
+    database: &str,
+    of: &NodeRef,
+) -> DriverResult<Vec<TreeNode>> {
     match of.kind {
-        NodeKind::Root => database(client, of).await,
+        NodeKind::Root => Ok(vec![TreeNode::branch(
+            of.child(NodeKind::Catalog, database),
+            database,
+        )]),
         NodeKind::Catalog => schemas(client, of).await,
         NodeKind::Namespace => relations(client, of).await,
         // A relation's children are its columns, which is `describe`'s answer
         // in M5 rather than another level of tree.
         NodeKind::Relation => Ok(Vec::new()),
     }
-}
-
-async fn database(client: &Client, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
-    let row = client
-        .query_one(CURRENT_DATABASE, &[])
-        .await
-        .map_err(query)?;
-    let name: String = row.try_get(0).map_err(query)?;
-    Ok(vec![TreeNode::branch(
-        of.child(NodeKind::Catalog, &name),
-        name,
-    )])
 }
 
 async fn schemas(client: &Client, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
@@ -162,5 +164,18 @@ mod tests {
         assert!(RELATIONS.contains("ORDER BY c.relname"));
         // Parameters, not interpolation: a schema name is a value here.
         assert!(RELATIONS.contains("n.nspname = $1"));
+    }
+
+    #[test]
+    fn the_relkind_filter_binds_as_the_type_the_server_infers() {
+        use tokio_postgres::types::{ToSql, Type};
+
+        // `pg_class.relkind` is `"char"` — PostgreSQL's one-byte type, not
+        // `text` — so the server types `$2` as `"char"[]`. A `&[&str]` bound
+        // there is refused by the client before the statement is ever
+        // executed, and only a live server would otherwise show it.
+        assert!(<&[i8] as ToSql>::accepts(&Type::CHAR_ARRAY));
+        assert!(!<&[&str] as ToSql>::accepts(&Type::CHAR_ARRAY));
+        assert!(RELKINDS.iter().all(|kind| *kind > 0));
     }
 }
