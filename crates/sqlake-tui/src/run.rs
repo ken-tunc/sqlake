@@ -25,6 +25,7 @@ use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
 use sqlake_app::snapshot::{ConnStatus, Snapshot, TabContent};
 use sqlake_app::store::Store;
+use sqlake_app::tree::TreeView;
 use tokio::sync::watch;
 
 use crate::chrome;
@@ -171,6 +172,24 @@ fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
     ));
 }
 
+/// What the explorer says when it has nothing to show.
+///
+/// "Nothing connected" is only true when there is something to connect to. A
+/// fresh install has no config file at all, and a pane that says nothing
+/// leaves the user pressing keys at a client that cannot do anything yet.
+///
+/// The first connection is the one whose tree this pane draws, so its status is
+/// what the message has to be about: a handshake can take the whole of the
+/// driver's deadline, and `c` during one opens a *second* connection to the
+/// same profile rather than hurrying the first along.
+fn waiting_for(snapshot: &Snapshot) -> &'static str {
+    match snapshot.connections.first().map(|c| &c.status) {
+        Some(ConnStatus::Connecting) => " connecting… ",
+        _ if snapshot.profiles.is_empty() => " no connections configured — write connections.toml ",
+        _ => " nothing connected — press c ",
+    }
+}
+
 /// Translate one event, collecting its intents. Returns whether the screen has
 /// to be drawn again because of it.
 fn apply_event(
@@ -255,13 +274,15 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         ui.focus == PaneId::Explorer,
     );
     ui.set_viewport(PaneId::Explorer, explorer);
+    // An empty view is drawn rather than skipped: with no connection there is
+    // no tree at all, and a blank pane says nothing about why.
+    let empty = TreeView::default();
     let view = snapshot
         .connections
         .first()
-        .and_then(|c| snapshot.tree(c.id));
-    if let Some(view) = view {
-        tree::render(frame, hits, explorer, view, &ui.tree);
-    }
+        .and_then(|c| snapshot.tree(c.id))
+        .unwrap_or(&empty);
+    tree::render(frame, hits, explorer, view, &ui.tree, waiting_for(snapshot));
 
     chrome::splitter(
         frame,
@@ -344,6 +365,7 @@ mod tests {
     use sqlake_app::action::Action;
     use sqlake_app::snapshot::{ConnectionView, TabView};
     use sqlake_app::store::Drivers;
+    use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeRef, TableRef};
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, mock_summary};
 
@@ -366,6 +388,48 @@ mod tests {
         .await;
         let snap = rx.borrow_and_update().clone();
         (store, snap)
+    }
+
+    #[test]
+    fn an_empty_explorer_says_which_kind_of_empty_it_is() {
+        // Two different problems that look identical on screen: nothing to
+        // connect to, and nothing connected yet. Only one of them is fixed by
+        // pressing a key, and a blank pane says neither.
+        let mut ui = UiState::new();
+        let fresh = Snapshot::default();
+        let (rows, _) = render(&fresh, &mut ui, 120, 30);
+        let screen = rows.join("\n");
+        assert!(screen.contains("no connections"), "{screen}");
+
+        let configured = Snapshot {
+            profiles: Arc::new(vec![mock_summary("mock")]),
+            ..Snapshot::default()
+        };
+        let (rows, _) = render(&configured, &mut ui, 120, 30);
+        let screen = rows.join("\n");
+        assert!(screen.contains("nothing connected"), "{screen}");
+        assert!(!screen.contains("no connections"), "{screen}");
+
+        // And a third: the tree is empty because the handshake has not
+        // finished. Telling the user to press `c` here would open a second
+        // connection to the profile they are already waiting for.
+        let summary = mock_summary("mock");
+        let connecting = Snapshot {
+            connections: vec![ConnectionView {
+                id: ConnId::new(),
+                profile: summary.id.clone(),
+                name: summary.name.clone(),
+                kind: summary.kind,
+                status: ConnStatus::Connecting,
+                capabilities: None,
+            }],
+            profiles: Arc::new(vec![summary]),
+            ..Snapshot::default()
+        };
+        let (rows, _) = render(&connecting, &mut ui, 120, 30);
+        let screen = rows.join("\n");
+        assert!(screen.contains("connecting"), "{screen}");
+        assert!(!screen.contains("press c"), "{screen}");
     }
 
     fn render(snapshot: &Snapshot, ui: &mut UiState, w: u16, h: u16) -> (Vec<String>, HitMap) {

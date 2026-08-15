@@ -3544,6 +3544,7 @@ dependencies = [
  "sqlake-config",
  "sqlake-core",
  "sqlake-driver-mock",
+ "sqlake-driver-postgres",
  "sqlake-tui",
  "tokio",
  "tracing",

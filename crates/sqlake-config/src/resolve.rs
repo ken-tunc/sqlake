@@ -14,12 +14,43 @@
 use std::process::Command;
 
 use sqlake_core::id::ProfileId;
-use sqlake_core::profile::{Params, PostgresParams, ResolvedProfile};
+use sqlake_core::profile::{
+    Params, PostgresParams, ProfileError, ProfileSummary, Profiles, ResolvedProfile,
+};
 use sqlake_core::secret::Secret;
 use zeroize::Zeroize as _;
 
 use crate::error::{ConfigError, ConfigResult};
+use crate::load::Config;
 use crate::profile::{DriverConfig, Profile, SecretRef};
+
+/// The configuration file, as the application layer sees it.
+///
+/// This is the seam `sqlake-app` holds: the store knows there is somewhere
+/// profiles come from and never learns that it is TOML on a disk. The blocking
+/// half is [`Profiles::resolve`] — reading a secret can wait on a keyring
+/// dialog — and the caller runs it on a blocking task.
+impl Profiles for Config {
+    fn list(&self) -> Vec<ProfileSummary> {
+        self.profiles()
+            .iter()
+            .map(|profile| ProfileSummary {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+                kind: profile.kind(),
+            })
+            .collect()
+    }
+
+    fn resolve(&self, id: &ProfileId) -> Result<ResolvedProfile, ProfileError> {
+        let profile = self
+            .profile(id)
+            .ok_or_else(|| ProfileError::new(format!("no connection called `{id}`")))?;
+        // The message is already written for the person reading it: it names
+        // the file, the connection and what went wrong.
+        resolve(profile).map_err(|err| ProfileError::new(err.to_string()))
+    }
+}
 
 /// The service name every sqlake entry is stored under.
 ///
@@ -356,6 +387,43 @@ mod tests {
         )));
         let err = resolved(&profile).unwrap_err();
         assert!(!format!("{err:?}").contains("hunter2"), "{err:?}");
+    }
+
+    #[test]
+    fn the_config_is_what_the_application_layer_holds() {
+        // The seam: a store that asks for profiles gets these, and never
+        // learns they came out of a file.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join("connections.toml"),
+            r#"
+            [[connection]]
+            id = "prod-pg"
+            name = "Prod (read replica)"
+            driver = "postgres"
+            host = "db.internal"
+            database = "app"
+            user = "readonly"
+            "#,
+        )
+        .expect("write");
+        let config = Config::load_from(dir.path()).expect("should load");
+
+        let listed = Profiles::list(&config);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Prod (read replica)");
+        assert_eq!(
+            listed[0].kind,
+            sqlake_core::capability::DriverKind::Postgres
+        );
+
+        // No password key, so nothing is read and this resolves offline.
+        let resolved = Profiles::resolve(&config, &listed[0].id).expect("should resolve");
+        assert_eq!(resolved.id, listed[0].id);
+
+        let err = Profiles::resolve(&config, &ProfileId::parse("nope").unwrap())
+            .expect_err("no such profile");
+        assert!(err.to_string().contains("nope"), "{err}");
     }
 
     #[test]
