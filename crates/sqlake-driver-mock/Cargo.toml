@@ -18,6 +18,7 @@ time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+sqlake-conformance.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # Test-only: the unicode fixture exists to distinguish display width from
 # character count, so the test guarding that property needs a width oracle.
