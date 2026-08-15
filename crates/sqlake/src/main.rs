@@ -1,14 +1,18 @@
 //! Argument parsing, dependency wiring, startup. Nothing else lives here.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
-use sqlake_core::profile::Profiles as _;
+use sqlake_config::Config;
+use sqlake_core::id::ProfileId;
+use sqlake_core::profile::Profiles;
 use sqlake_driver_mock::{MockDriver, MockProfiles};
+use sqlake_driver_postgres::PgDriver;
 use sqlake_tui::terminal::{TerminalGuard, install_panic_hook};
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +42,22 @@ struct Args {
     )]
     log_level: String,
 
+    /// Ignore the config file and open the built-in mock database.
+    ///
+    /// What the client ran against for the whole of M0. It is worth keeping:
+    /// it is how every screen can be looked at without a server, and how a bug
+    /// report can be reproduced by somebody with no access to the database it
+    /// happened on.
+    #[arg(long)]
+    mock: bool,
+
+    /// Connect to these profiles at startup instead of the first one.
+    ///
+    /// Names come from `connections.toml`. Several are allowed: two
+    /// connections is the ordinary case, not an exotic one.
+    #[arg(long = "connect", value_name = "PROFILE")]
+    connect: Vec<String>,
+
     /// Panic once the terminal is taken over, to prove it is given back.
     ///
     /// The screen has to be restored from the panic hook rather than from a
@@ -60,19 +80,13 @@ fn main() -> Result<()> {
     // input that the terminal is now echoing.
     install_panic_hook(!args.no_mouse);
 
+    let profiles = profiles(&args)?;
+    let opening = opening(&profiles, &args)?;
+
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let store = runtime.block_on(async {
-        // Still the mock, and still the only profile there is. What changed is
-        // that it arrives as a profile rather than as a driver kind, so the
-        // path it takes is the path a real connection will take; T7 swaps this
-        // for the profiles in `connections.toml`.
-        let profiles = MockProfiles::default();
-        let first = profiles.list().first().map(|p| p.id.clone());
-        let store = Store::spawn(
-            Drivers::new().with(std::sync::Arc::new(MockDriver::default())),
-            std::sync::Arc::new(profiles),
-        );
-        if let Some(id) = first {
+        let store = Store::spawn(drivers(), profiles);
+        for id in opening {
             store.dispatch(Action::Connect(id));
         }
         store
@@ -100,6 +114,67 @@ fn main() -> Result<()> {
     // of this function whether `result` is an error or not.
     result.context("the render loop stopped")?;
     Ok(())
+}
+
+/// Every driver this build can talk to.
+///
+/// All of them, always: which one a connection needs is a fact about its
+/// profile, and a registry that depended on the flags would make `--mock` mean
+/// "and nothing else works".
+fn drivers() -> Drivers {
+    Drivers::new()
+        .with(Arc::new(MockDriver::default()))
+        .with(Arc::new(PgDriver::new()))
+}
+
+/// Where connections come from: the config file, or the built-in mock.
+fn profiles(args: &Args) -> Result<Arc<dyn Profiles>> {
+    if args.mock {
+        return Ok(Arc::new(MockProfiles::default()));
+    }
+    // Reading it here rather than inside the store means a broken file is a
+    // message on a terminal that still works, instead of an error raised into
+    // a client that has already taken the screen over.
+    let config = Config::load().context("reading the configuration")?;
+    Ok(Arc::new(config))
+}
+
+/// Which profiles to open at startup.
+///
+/// The first one when nothing was asked for. Opening every profile would put a
+/// keyring prompt and a connection attempt in front of somebody who wanted to
+/// look at one database.
+fn opening(profiles: &Arc<dyn Profiles>, args: &Args) -> Result<Vec<ProfileId>> {
+    let available = profiles.list();
+    if args.connect.is_empty() {
+        return Ok(available
+            .first()
+            .map(|p| p.id.clone())
+            .into_iter()
+            .collect());
+    }
+
+    args.connect
+        .iter()
+        .map(|name| {
+            let id = ProfileId::parse(name).map_err(|why| anyhow::anyhow!("--connect: {why}"))?;
+            if available.iter().any(|p| p.id == id) {
+                Ok(id)
+            } else {
+                // Before the screen is taken over, where a message can be read
+                // — and with the list, because the usual cause is a typo.
+                let names: Vec<&str> = available.iter().map(|p| p.id.as_str()).collect();
+                Err(anyhow::anyhow!(
+                    "--connect: no connection called `{name}`. Configured: {}",
+                    if names.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        names.join(", ")
+                    }
+                ))
+            }
+        })
+        .collect()
 }
 
 /// Logs go to a file and nowhere else.

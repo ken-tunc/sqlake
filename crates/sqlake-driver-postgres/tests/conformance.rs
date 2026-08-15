@@ -199,6 +199,78 @@ async fn values_survive_the_round_trip() {
     session.close().await;
 }
 
+/// A session that closes, and one that never opens, both leave the server
+/// with nothing.
+///
+/// `application_name` is set in the startup packet, so `pg_stat_activity`
+/// answers this directly — which is the only way to tell a connection that was
+/// closed from one that was merely dropped on the floor.
+#[tokio::test]
+async fn a_connection_leaves_nothing_behind() {
+    use sqlake_core::driver::Driver as _;
+
+    let Some(container) = start().await else {
+        return;
+    };
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("a mapped port");
+    seed(port).await;
+
+    let watcher = raw_client(port).await;
+    assert_eq!(
+        ours(&watcher).await,
+        0,
+        "the fixture left a connection open"
+    );
+
+    // One that opens and is closed.
+    let session = PgDriver::new()
+        .connect(&profile(port))
+        .await
+        .expect("should connect");
+    assert_eq!(ours(&watcher).await, 1, "the connection is not there");
+    session.close().await;
+    until_gone(&watcher).await;
+
+    // And one that fails on the way in. The socket is open by the time the
+    // database is rejected, so a driver that forgets it would leave it behind.
+    let mut bad = profile(port);
+    if let Params::Postgres(params) = &mut bad.params {
+        params.database = "no_such_database".to_owned();
+    }
+    PgDriver::new()
+        .connect(&bad)
+        .await
+        .expect_err("should not connect");
+    until_gone(&watcher).await;
+}
+
+/// How many connections this client has open, as the server sees them.
+async fn ours(client: &tokio_postgres::Client) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'sqlake'",
+            &[],
+        )
+        .await
+        .expect("should count")
+        .get(0)
+}
+
+/// Wait for the server to notice, which is not instant: the backend clears its
+/// row when it reads the closed socket, not when the client drops the handle.
+async fn until_gone(client: &tokio_postgres::Client) {
+    for _ in 0..50 {
+        if ours(client).await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("a connection was still open five seconds after it should have gone");
+}
+
 /// `None` when there is no Docker to talk to.
 ///
 /// # Panics

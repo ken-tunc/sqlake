@@ -12,7 +12,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use sqlake_app::tree::{NodeState, TreeView, VisibleNode};
 use sqlake_core::node::RelationKind;
 
@@ -28,13 +28,30 @@ const INDENT: u16 = 2;
 const TOGGLE_WIDTH: u16 = 2;
 
 /// Draw the explorer's contents into `area`, which is the inside of its pane.
-pub fn render(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, view: &TreeView, ui: &TreeUi) {
+///
+/// `empty` is what to say when there is nothing to draw. The reason differs —
+/// no config file, or a config file nobody has connected from — and the pane
+/// is the only place either one can be read.
+pub fn render(
+    frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    area: Rect,
+    view: &TreeView,
+    ui: &TreeUi,
+    empty: &str,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     if view.is_empty() {
+        // Wrapped, because the explorer is twelve columns wide at the smallest
+        // size this client draws at, and a sentence that says why the pane is
+        // empty is longer than that. Truncated, it would be one more thing
+        // that says nothing.
         frame.render_widget(
-            Paragraph::new(" nothing connected ").style(Style::new().fg(Color::DarkGray)),
+            Paragraph::new(empty)
+                .wrap(Wrap { trim: true })
+                .style(Style::new().fg(Color::DarkGray)),
             area,
         );
         return;
@@ -171,6 +188,9 @@ const fn label_colour(state: &NodeState) -> Color {
 
 #[cfg(test)]
 mod tests {
+    /// Any placeholder: these tests are about rows, not about it.
+    const EMPTY: &str = " nothing connected ";
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -214,7 +234,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), view, ui))
+            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), view, ui, EMPTY))
             .unwrap();
         (terminal.backend().buffer().clone(), hits)
     }

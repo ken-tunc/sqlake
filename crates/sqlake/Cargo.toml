@@ -17,6 +17,7 @@ sqlake-app.workspace = true
 sqlake-config.workspace = true
 sqlake-core.workspace = true
 sqlake-driver-mock.workspace = true
+sqlake-driver-postgres.workspace = true
 sqlake-tui.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
