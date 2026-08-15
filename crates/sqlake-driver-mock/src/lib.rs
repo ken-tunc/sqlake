@@ -60,8 +60,8 @@ pub fn mock_summary(id: &str) -> ProfileSummary {
 /// A set of mock profiles, in place of a config file.
 ///
 /// The store takes `Arc<dyn Profiles>`, so this is what stands in for
-/// `sqlake-config` in a test — and, until M1 finishes wiring the real thing,
-/// what `--mock` gives the binary.
+/// `sqlake-config` in a test, and what `--mock` gives the binary in place of
+/// the file.
 #[derive(Debug, Clone)]
 pub struct MockProfiles {
     profiles: Vec<ProfileSummary>,

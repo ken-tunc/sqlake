@@ -409,7 +409,7 @@ that "the driver behaves" means the same thing for all three.
 | # | Content | Done when |
 | --- | --- | --- |
 | **M0 — Foundation** ✅ | workspace, domain types, staged types, `UseCase` trait, store, render loop, `TerminalGuard`, `HitMap` and one input pipeline, base widgets, mock driver | Done. `crates/` and `git log` are the record |
-| **M1** | Connection management (feature 1) | `Profile → ResolvedProfile`, keyring, connection test, connection tabs |
+| **M1 — Connection management** ✅ | `sqlake-config`, `Profile → ResolvedProfile`, keyring, PostgreSQL driver, driver conformance suite, every connection in the explorer | Done. `crates/` and `git log` are the record |
 | **M2** | Table list (feature 2) | Lazy tree expansion for pg and bq, filter search. A second driver also gives `Capabilities` a second answer, which the mock alone cannot |
 | **M3** | Table preview (feature 3) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
 | **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
@@ -460,18 +460,10 @@ choice already made:
 # persistence (M7, M8)
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# PostgreSQL (M1)
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-time-0_3"] }
-tokio-postgres-rustls = "0.13"
-rustls = "0.23"
-
 # BigQuery (M2)
 gcp-bigquery-client = "0.28"
 yup-oauth2 = "12"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "socks"] }
-
-# driver conformance (M1)
-testcontainers = "0.25"
 ```
 
 For `ValidatedSql` (M4), start by checking whether splitting on semicolons and classifying the
