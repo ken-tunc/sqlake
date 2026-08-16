@@ -312,8 +312,10 @@ masking lives in exactly one function and never reaches the log.
 - **Where the crate lags the API, work around it in the driver and say so at the call.** It
   already does in one place: `datasets.list` models the dataset array as a plain `Vec`, and
   the API omits that key when a project has none, so an empty project's perfectly good 200
-  arrives as a decode error. That is why connecting treats only an explicit refusal as a
-  failure. The escape hatch when a workaround is not enough is a thin `reqwest` call.
+  arrives as a decode error. That is why connecting forgives a body that did not parse — and
+  only that: a token it could not fetch is a connection that will never answer, not something
+  to ask again later. The escape hatch when a workaround is not enough is a thin `reqwest`
+  call.
 - **Preview uses `tabledata.list`, which is not billed as a query.** Implementing it as
   `SELECT *` would incur scan costs on every preview. The correct implementation of
   `preview()` for BigQuery issues no SQL.

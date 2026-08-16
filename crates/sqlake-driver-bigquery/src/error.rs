@@ -17,8 +17,8 @@ pub fn connect_failed(err: BQError) -> DriverError {
 
 /// A failure with no better home. Not `Unsupported`: that means the caller
 /// asked for something the driver does not do.
-pub fn driver_error(what: &str) -> DriverError {
-    DriverError::Query(what.to_owned())
+pub fn driver_error(what: impl Into<String>) -> DriverError {
+    DriverError::Query(what.into())
 }
 
 /// What went wrong, as a sentence.

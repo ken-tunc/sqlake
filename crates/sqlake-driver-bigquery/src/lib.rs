@@ -66,8 +66,14 @@ pub const DEADLINE: Duration = Duration::from_secs(30);
 /// no request leaves the machine.
 const API_URL: &str = "https://bigquery.googleapis.com/bigquery/v2";
 
-/// The OAuth scope a token is asked for. Read-write, because M4 runs queries;
-/// `readonly` is a separate scope the crate derives by appending to this one.
+/// The OAuth scope a token is asked for.
+///
+/// Read-write even for a profile whose `readonly` is set, which the PostgreSQL
+/// driver does honour: the narrower `…/bigquery.readonly` scope cannot create a
+/// job, and *reading* a table with SQL is a job, so a token with it could not
+/// run the `SELECT` the read-only profile exists to allow. A read-only BigQuery
+/// connection is therefore a job the profile's own IAM role does, and M4's
+/// refusal of a statement that writes — not something a scope can express.
 const SCOPE: &str = "https://www.googleapis.com/auth/bigquery";
 
 #[derive(Debug)]
@@ -174,11 +180,12 @@ impl Driver for BqDriver {
         // has access to would connect happily and fail on the first click.
         let client = tokio::time::timeout(self.deadline, opening)
             .await
+            // Google, not `api_url`: the token exchange is under this deadline
+            // too and goes to the credential's own endpoint — the metadata
+            // server, when ADC is what answers — so naming the API URL would
+            // send someone to check the host that was still responding.
             .map_err(|_| {
-                DriverError::Connect(format!(
-                    "no answer from {} within {:?}",
-                    self.api_url, self.deadline
-                ))
+                DriverError::Connect(format!("no answer from Google within {:?}", self.deadline))
             })??;
 
         Ok(Box::new(BqSession {
@@ -193,13 +200,22 @@ impl Driver for BqDriver {
 /// 403, and one that does not exist answers 404. Asking for a single dataset
 /// keeps it cheap on a project with thousands.
 ///
-/// **Only a refusal is a failure.** `gcp-bigquery-client` 0.28 models the
-/// response's `datasets` as a plain `Vec`, and the API omits that key entirely
-/// when a project has no datasets in it — so a perfectly good empty project
-/// answers 200 and comes back as a decode error. Refusing the connection on
-/// that would make a new project the one thing this client cannot open. What
-/// is left over — a body that did not parse, a socket that dropped — is
-/// reported by whatever asks next, on the node it was asked for.
+/// **A body that did not parse is the one failure forgiven here.**
+/// `gcp-bigquery-client` 0.28 models the response's `datasets` as a plain
+/// `Vec`, and the API omits that key entirely when a project has no datasets in
+/// it — so a perfectly good empty project answers 200 and comes back as a
+/// decode error. Refusing the connection on that would make a new project the
+/// one thing this client cannot open.
+///
+/// Nothing else is forgiven, and the difference matters most for the failure
+/// that does not look like one: the token is fetched here, not while the client
+/// is built, so a revoked key and an ADC login that expired both arrive as an
+/// authentication error from this call. Treating those as "ask again later"
+/// would report a connection that can never answer anything.
+///
+/// The gap left is an error *response* whose body is not Google's JSON — a
+/// proxy's HTML 502 — which is a decode failure too and is let through. Closing
+/// it would mean reimplementing the call to see the status code.
 async fn verify(client: &Client, project: &str) -> DriverResult<()> {
     match client
         .dataset()
@@ -207,11 +223,11 @@ async fn verify(client: &Client, project: &str) -> DriverResult<()> {
         .await
     {
         Ok(_) => Ok(()),
-        Err(err @ BQError::ResponseError { .. }) => Err(connect_failed(err)),
-        Err(other) => {
-            tracing::debug!(error = %other, %project, "listing datasets while connecting");
+        Err(BQError::RequestError(err)) if err.is_decode() => {
+            tracing::debug!(error = %err, %project, "the dataset list did not parse");
             Ok(())
         }
+        Err(other) => Err(connect_failed(other)),
     }
 }
 
@@ -246,7 +262,7 @@ impl Session for BqSession {
 
     /// T4.
     async fn preview(&self, table: &TableRef, _req: &PageRequest) -> DriverResult<ResultSet> {
-        Err(driver_error(&format!("reading {table} is not built yet")))
+        Err(driver_error(format!("reading {table} is not built yet")))
     }
 
     /// Nothing to release: `reqwest` owns a connection pool that drops with the

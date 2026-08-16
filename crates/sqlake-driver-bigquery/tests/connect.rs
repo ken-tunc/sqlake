@@ -107,6 +107,30 @@ async fn the_wrong_credentials_fail_with_the_reason() {
 }
 
 #[tokio::test]
+async fn a_key_the_token_endpoint_refuses_does_not_connect() {
+    // The failure that does not look like one. A key is only read while the
+    // client is built; it is first *used* by the call that verifies the
+    // project, so a revoked key and an expired ADC login both arrive here as
+    // an authentication error rather than as an HTTP refusal from BigQuery.
+    let google = Google::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Invalid grant: account not found",
+        })))
+        .mount(&google.server)
+        .await;
+
+    let err = google
+        .driver()
+        .connect(&profile(google.key_file()))
+        .await
+        .expect_err("a credential that cannot get a token is not a connection");
+    assert!(matches!(err, DriverError::Connect(_)), "{err:?}");
+}
+
+#[tokio::test]
 async fn a_key_file_that_is_not_there_says_so() {
     let google = Google::start().await;
     let err = google
