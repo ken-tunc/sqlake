@@ -15,6 +15,7 @@ sqlake-app = { path = "crates/sqlake-app" }
 sqlake-config = { path = "crates/sqlake-config" }
 sqlake-conformance = { path = "crates/sqlake-conformance" }
 sqlake-core = { path = "crates/sqlake-core" }
+sqlake-driver-bigquery = { path = "crates/sqlake-driver-bigquery" }
 sqlake-driver-mock = { path = "crates/sqlake-driver-mock" }
 sqlake-driver-postgres = { path = "crates/sqlake-driver-postgres" }
 sqlake-tui = { path = "crates/sqlake-tui" }
@@ -28,6 +29,12 @@ clap = { version = "4", features = ["derive"] }
 # Declared directly only to turn on `event-stream`.
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"
+# Brings `tonic` and `prost` in unconditionally for the Storage Write API,
+# which this client never uses. Taken anyway: it implements `tabledata.list`
+# with the parameters preview needs, `yup-oauth2` already handles ADC and
+# service-account keys, and `ClientBuilder::with_v2_base_url` is what lets the
+# driver be tested against a stub with no network.
+gcp-bigquery-client = "0.28"
 insta = "1"
 keyring = "4"
 postgres-protocol = "0.6"
@@ -56,6 +63,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+wiremock = "0.6"
 zeroize = "1"
 
 # Lints are set to `warn` here and promoted to errors in CI with `-D warnings`,

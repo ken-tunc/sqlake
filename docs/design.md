@@ -309,9 +309,13 @@ masking lives in exactly one function and never reaches the log.
 
 ### 10.2 BigQuery
 
-- `gcp-bigquery-client` with `yup-oauth2` (ADC, service account, or impersonation). Where the
-  crate lags the API, wrap REST calls thinly inside the driver so `reqwest` can be used
-  directly.
+- **Where the crate lags the API, work around it in the driver and say so at the call.** It
+  already does in one place: `datasets.list` models the dataset array as a plain `Vec`, and
+  the API omits that key when a project has none, so an empty project's perfectly good 200
+  arrives as a decode error. That is why connecting forgives a body that did not parse — and
+  only that: a token it could not fetch is a connection that will never answer, not something
+  to ask again later. The escape hatch when a workaround is not enough is a thin `reqwest`
+  call.
 - **Preview uses `tabledata.list`, which is not billed as a query.** Implementing it as
   `SELECT *` would incur scan costs on every preview. The correct implementation of
   `preview()` for BigQuery issues no SQL.
@@ -449,10 +453,8 @@ choice already made:
 # persistence (M7, M8)
 rusqlite = { version = "0.37", features = ["bundled"] }
 
-# BigQuery (M2)
-gcp-bigquery-client = "0.28"
-yup-oauth2 = "12"
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "socks"] }
+# proxying (M6) — BigQuery is HTTPS, so its tunnel is a reqwest concern
+reqwest = { version = "0.12", features = ["socks"] }
 ```
 
 For `ValidatedSql` (M4), start by checking whether splitting on semicolons and classifying the

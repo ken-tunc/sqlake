@@ -11,6 +11,7 @@ use sqlake_app::store::{Drivers, Store};
 use sqlake_config::{Config, Settings};
 use sqlake_core::id::ProfileId;
 use sqlake_core::profile::Profiles;
+use sqlake_driver_bigquery::BqDriver;
 use sqlake_driver_mock::{MockDriver, MockProfiles};
 use sqlake_driver_postgres::PgDriver;
 use sqlake_tui::terminal::{TerminalGuard, install_panic_hook};
@@ -125,6 +126,7 @@ fn drivers() -> Drivers {
     Drivers::new()
         .with(Arc::new(MockDriver::default()))
         .with(Arc::new(PgDriver::new()))
+        .with(Arc::new(BqDriver::new()))
 }
 
 fn configuration(args: &Args) -> Result<(Arc<dyn Profiles>, Settings)> {

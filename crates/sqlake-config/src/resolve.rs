@@ -15,14 +15,16 @@ use std::process::Command;
 
 use sqlake_core::id::ProfileId;
 use sqlake_core::profile::{
-    Params, PostgresParams, ProfileError, ProfileSummary, Profiles, ResolvedProfile,
+    BigQueryAuth as CoreAuth, BigQueryParams, Params, PostgresParams, ProfileError, ProfileSummary,
+    Profiles, ResolvedProfile,
 };
 use sqlake_core::secret::Secret;
 use zeroize::Zeroize as _;
 
+use crate::bytes::ByteSize;
 use crate::error::{ConfigError, ConfigResult};
 use crate::load::Config;
-use crate::profile::{DriverConfig, Profile, SecretRef};
+use crate::profile::{BigQueryAuth, DriverConfig, Profile, SecretRef};
 
 /// The configuration file, as the application layer sees it.
 ///
@@ -129,12 +131,18 @@ pub fn resolve_with(profile: &Profile, keyring: &dyn Keyring) -> ConfigResult<Re
                 password,
             })
         }
-        DriverConfig::BigQuery(_) => {
-            return Err(secret_error(
-                &profile.id,
-                "BigQuery connections arrive in M2".to_owned(),
-            ));
-        }
+        // No keyring round trip: both auth modes name where a credential lives
+        // rather than carrying one, so resolving a BigQuery profile cannot put
+        // a fingerprint dialog on the user's screen.
+        DriverConfig::BigQuery(bq) => Params::BigQuery(BigQueryParams {
+            project: bq.project.clone(),
+            location: bq.location.clone(),
+            auth: match &bq.auth {
+                BigQueryAuth::Adc => CoreAuth::Adc,
+                BigQueryAuth::ServiceAccount(path) => CoreAuth::ServiceAccount(path.clone()),
+            },
+            max_bytes_billed: bq.max_bytes_billed.map(ByteSize::get),
+        }),
     };
 
     Ok(ResolvedProfile {
@@ -248,6 +256,17 @@ mod tests {
             self.0
                 .map(|p| Secret::new(p.to_owned()))
                 .ok_or_else(|| secret_error(profile, "no keyring entry".to_owned()))
+        }
+    }
+
+    /// A keyring that fails the test rather than the resolution, for the paths
+    /// that must not reach one at all.
+    #[derive(Debug)]
+    struct ExplodingKeyring;
+
+    impl Keyring for ExplodingKeyring {
+        fn password(&self, profile: &ProfileId) -> ConfigResult<Secret> {
+            panic!("the keyring was opened for `{profile}`");
         }
     }
 
@@ -428,7 +447,38 @@ mod tests {
     }
 
     #[test]
-    fn bigquery_says_which_milestone_it_arrives_in() {
+    fn a_bigquery_profile_resolves_with_every_field_it_was_given() {
+        // Each of these is a setting the user wrote that nothing else would
+        // notice going missing: the driver reads them, and this is the only
+        // step between the file and the driver.
+        let profile = Profile {
+            id: ProfileId::parse("bq").unwrap(),
+            name: "bq".to_owned(),
+            driver: DriverConfig::BigQuery(BigQueryConfig {
+                project: "analytics-prod".to_owned(),
+                location: Some("asia-northeast1".to_owned()),
+                auth: BigQueryAuth::ServiceAccount("/keys/bq.json".into()),
+                max_bytes_billed: Some(ByteSize::new(20 * 1024 * 1024 * 1024)),
+            }),
+            readonly: false,
+            color: None,
+            tunnel: None,
+        };
+        let resolved = resolved(&profile).expect("should resolve");
+        let Params::BigQuery(bq) = resolved.params else {
+            panic!("not a BigQuery profile: {resolved:?}");
+        };
+        assert_eq!(bq.project, "analytics-prod");
+        assert_eq!(bq.location.as_deref(), Some("asia-northeast1"));
+        assert_eq!(bq.auth, CoreAuth::ServiceAccount("/keys/bq.json".into()));
+        assert_eq!(bq.max_bytes_billed, Some(20 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn resolving_a_bigquery_profile_touches_no_keyring() {
+        // Not an implementation detail: `resolve` blocks, and on macOS a
+        // keyring read can wait on a fingerprint. A profile whose credentials
+        // are a file or ADC must not be able to put that dialog on screen.
         let profile = Profile {
             id: ProfileId::parse("bq").unwrap(),
             name: "bq".to_owned(),
@@ -442,7 +492,6 @@ mod tests {
             color: None,
             tunnel: None,
         };
-        let err = resolved(&profile).unwrap_err().to_string();
-        assert!(err.contains("M2"), "{err}");
+        resolve_with(&profile, &ExplodingKeyring).expect("should resolve");
     }
 }
