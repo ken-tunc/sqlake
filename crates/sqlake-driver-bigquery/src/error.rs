@@ -15,10 +15,35 @@ pub fn connect_failed(err: BQError) -> DriverError {
     DriverError::Connect(describe(err))
 }
 
+/// A failure while walking the tree or reading a table.
+pub fn listing_failed(err: BQError) -> DriverError {
+    DriverError::Query(describe(err))
+}
+
 /// A failure with no better home. Not `Unsupported`: that means the caller
 /// asked for something the driver does not do.
 pub fn driver_error(what: impl Into<String>) -> DriverError {
     DriverError::Query(what.into())
+}
+
+/// Whether this is the decode failure a project with no datasets in it comes
+/// back as.
+///
+/// `gcp-bigquery-client` 0.28 models `datasets.list`'s array as a plain `Vec`
+/// while the API omits the key entirely when there is nothing to list, so a
+/// perfectly good empty project answers 200 and arrives as a parse error.
+/// Refusing on it would make a new project the one thing this client cannot
+/// open, and an empty branch the one thing it cannot draw.
+///
+/// The gap this leaves, and the reason it is a predicate rather than a blanket
+/// `Ok`: an error *response* whose body is not Google's JSON — a proxy's HTML
+/// 502 — is a decode failure too, and is read here as "nothing to list".
+/// Closing it means reimplementing the call to see the status code. Callers
+/// narrow it as far as they can instead: a paged listing asks this only about
+/// its first request, because every later one was promised a page.
+#[must_use]
+pub fn is_empty_dataset_list(err: &BQError) -> bool {
+    matches!(err, BQError::RequestError(err) if err.is_decode())
 }
 
 /// What went wrong, as a sentence.

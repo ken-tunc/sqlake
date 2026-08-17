@@ -10,22 +10,23 @@
 //! `sortable_preview` false: `tabledata.list` is not billed and cannot order
 //! rows, and the only way to order them is the thing that costs.
 
+pub mod catalog;
 pub mod error;
 
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::client_builder::ClientBuilder;
 use gcp_bigquery_client::dataset::ListOptions;
-use gcp_bigquery_client::error::BQError;
 use sqlake_core::capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{BigQueryAuth, BigQueryParams, Params, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet};
 
-use crate::error::{connect_failed, driver_error};
+use crate::error::{connect_failed, driver_error, is_empty_dataset_list};
 
 /// Project, dataset, table — the same three levels PostgreSQL has, under
 /// different names. Keeping the names in the level list is what lets the tree
@@ -54,12 +55,14 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     quote_style: QuoteStyle::Backtick,
 };
 
-/// How long a connection has to prove its credentials work.
+/// How long a call to Google has to answer.
 ///
-/// The token exchange and the verifying call are both HTTPS to Google, and
-/// `reqwest` has no deadline of its own: without this, a machine behind a
-/// proxy that accepts connections and answers nothing leaves the connection
-/// spinning with no way to abandon it.
+/// Every call this driver makes is HTTPS and `reqwest` has no deadline of its
+/// own: without this, a machine behind a proxy that accepts connections and
+/// answers nothing leaves the caller spinning with no way to abandon it. That
+/// costs more after the connection is open than during it — one session actor
+/// serialises every request for a connection, so a listing that never returns
+/// takes the connection's previews and every other branch of its tree with it.
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The BigQuery REST API. Overridden in tests, where the whole point is that
@@ -191,6 +194,7 @@ impl Driver for BqDriver {
         Ok(Box::new(BqSession {
             client,
             project: params.project.clone(),
+            deadline: self.deadline,
         }))
     }
 }
@@ -200,22 +204,12 @@ impl Driver for BqDriver {
 /// 403, and one that does not exist answers 404. Asking for a single dataset
 /// keeps it cheap on a project with thousands.
 ///
-/// **A body that did not parse is the one failure forgiven here.**
-/// `gcp-bigquery-client` 0.28 models the response's `datasets` as a plain
-/// `Vec`, and the API omits that key entirely when a project has no datasets in
-/// it — so a perfectly good empty project answers 200 and comes back as a
-/// decode error. Refusing the connection on that would make a new project the
-/// one thing this client cannot open.
-///
-/// Nothing else is forgiven, and the difference matters most for the failure
-/// that does not look like one: the token is fetched here, not while the client
-/// is built, so a revoked key and an ADC login that expired both arrive as an
-/// authentication error from this call. Treating those as "ask again later"
-/// would report a connection that can never answer anything.
-///
-/// The gap left is an error *response* whose body is not Google's JSON — a
-/// proxy's HTML 502 — which is a decode failure too and is let through. Closing
-/// it would mean reimplementing the call to see the status code.
+/// An empty project is the one failure forgiven — see
+/// [`is_empty_dataset_list`]. Nothing else is, and the difference matters most
+/// for the failure that does not look like one: the token is fetched here, not
+/// while the client is built, so a revoked key and an ADC login that expired
+/// both arrive as an authentication error from this call. Treating those as
+/// "ask again later" would report a connection that can never answer anything.
 async fn verify(client: &Client, project: &str) -> DriverResult<()> {
     match client
         .dataset()
@@ -223,7 +217,7 @@ async fn verify(client: &Client, project: &str) -> DriverResult<()> {
         .await
     {
         Ok(_) => Ok(()),
-        Err(BQError::RequestError(err)) if err.is_decode() => {
+        Err(err) if is_empty_dataset_list(&err) => {
             tracing::debug!(error = %err, %project, "the dataset list did not parse");
             Ok(())
         }
@@ -234,6 +228,29 @@ async fn verify(client: &Client, project: &str) -> DriverResult<()> {
 pub struct BqSession {
     client: Client,
     project: String,
+    deadline: Duration,
+}
+
+impl BqSession {
+    /// Give up on a call to Google that is not going to answer.
+    ///
+    /// The whole of a listing rather than each page: what the caller is
+    /// waiting for is the branch, and a first page that arrives inside the
+    /// deadline is no comfort if the second never does.
+    async fn within_deadline<T>(
+        &self,
+        what: &str,
+        work: impl Future<Output = DriverResult<T>>,
+    ) -> DriverResult<T> {
+        tokio::time::timeout(self.deadline, work)
+            .await
+            .map_err(|_| {
+                driver_error(format!(
+                    "no answer from Google within {:?} while {what}",
+                    self.deadline
+                ))
+            })?
+    }
 }
 
 /// Hand-written because `Client` is not `Debug` — and it should stay
@@ -253,11 +270,12 @@ impl Session for BqSession {
         CAPABILITIES
     }
 
-    /// T3. Reported as a failure rather than as an empty list: a tree that
-    /// silently has no children looks like a project with nothing in it.
-    async fn children(&self, _of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
-        let _ = (&self.client, &self.project);
-        Err(driver_error("browsing a BigQuery project is not built yet"))
+    async fn children(&self, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
+        self.within_deadline(
+            &format!("expanding `{of}`"),
+            catalog::children(&self.client, &self.project, of),
+        )
+        .await
     }
 
     /// T4.
