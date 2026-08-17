@@ -38,7 +38,9 @@ pub fn driver_error(what: impl Into<String>) -> DriverError {
 /// The gap this leaves, and the reason it is a predicate rather than a blanket
 /// `Ok`: an error *response* whose body is not Google's JSON — a proxy's HTML
 /// 502 — is a decode failure too, and is read here as "nothing to list".
-/// Closing it means reimplementing the call to see the status code.
+/// Closing it means reimplementing the call to see the status code. Callers
+/// narrow it as far as they can instead: a paged listing asks this only about
+/// its first request, because every later one was promised a page.
 #[must_use]
 pub fn is_empty_dataset_list(err: &BQError) -> bool {
     matches!(err, BQError::RequestError(err) if err.is_decode())

@@ -6,6 +6,8 @@
 //! asks for, and what the driver does with the answers — including the two
 //! answers that are easy to get wrong, an empty list and a second page.
 
+use std::time::Duration;
+
 use sqlake_core::driver::{Driver, Session};
 use sqlake_core::node::{NodeKind, NodeRef, RelationKind};
 use wiremock::ResponseTemplate;
@@ -185,6 +187,62 @@ async fn every_page_of_datasets_is_followed() {
 }
 
 #[tokio::test]
+async fn a_project_node_with_no_project_in_it_is_refused_by_name() {
+    // The guard is not decoration: without it the path's last segment — or an
+    // empty string — goes into the URL, and `/projects//datasets` is a request
+    // the API answers for whichever project the credential defaults to.
+    let google = Google::start().await;
+    google.issues_a_token().await;
+    google.answers_datasets(datasets(&["events"], None)).await;
+    let session = connected(&google).await;
+
+    let before = google.requests_to_datasets().await;
+    let nonsense = NodeRef::new(NodeKind::Catalog, [PROJECT, "events", "clicks"]);
+    let err = session
+        .children(&nonsense)
+        .await
+        .expect_err("not a project node");
+    assert!(
+        err.to_string().contains("is not a BigQuery project"),
+        "{err}"
+    );
+    assert_eq!(
+        google.requests_to_datasets().await,
+        before,
+        "a node this driver could not have made must not become a request"
+    );
+    session.close().await;
+}
+
+#[tokio::test]
+async fn a_page_that_does_not_parse_is_a_failure_rather_than_a_short_list() {
+    // The empty-project workaround, kept to the one request that needs it. A
+    // page asked for by token was promised to have datasets in it, so a body
+    // that does not parse there is a proxy or a truncated response — and
+    // forgiving it would return half a branch with nothing to say so, which is
+    // the one failure the user cannot see.
+    let google = Google::start().await;
+    google.issues_a_token().await;
+    google
+        .answers_datasets_at_page(None, datasets(&["a"], Some("page-2")))
+        .await;
+    google
+        .answers_datasets_at_page(
+            Some("page-2"),
+            ResponseTemplate::new(200).set_body_string("<html>502 Bad Gateway</html>"),
+        )
+        .await;
+    let session = connected(&google).await;
+
+    let project = NodeRef::new(NodeKind::Catalog, [PROJECT]);
+    session
+        .children(&project)
+        .await
+        .expect_err("half a listing is not a listing");
+    session.close().await;
+}
+
+#[tokio::test]
 async fn every_page_of_tables_is_followed_too() {
     // The one that bites sooner: a dataset holding a table per day passes 50
     // in under two months, and BigQuery's own public datasets are far past it.
@@ -273,6 +331,59 @@ async fn a_refused_listing_says_why() {
         .await
         .expect_err("should be refused");
     assert!(err.to_string().contains("bigquery.datasets.list"), "{err}");
+}
+
+#[tokio::test]
+async fn a_listing_that_never_answers_gives_up() {
+    // `connect` has this guard already; a listing needs its own, and needs it
+    // more. One actor serialises every request a connection makes, so a call
+    // that never returns takes the connection's previews and every other
+    // branch of its tree down with it, with nothing left to cancel it.
+    let google = Google::start().await;
+    google.issues_a_token().await;
+    google.answers_datasets(datasets(&["events"], None)).await;
+    google
+        .answers_tables(
+            "events",
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(30)),
+        )
+        .await;
+    let session = connected(&google).await;
+
+    // The deadline is left at its real length and the clock is stopped
+    // instead: shortening it would race the connection above, which has to
+    // finish inside the same deadline and signs a token with real RSA on the
+    // way. With nothing runnable, tokio winds time forward to the next timer,
+    // which is the one being tested.
+    tokio::time::pause();
+    let dataset = NodeRef::new(NodeKind::Namespace, [PROJECT, "events"]);
+    let err = session
+        .children(&dataset)
+        .await
+        .expect_err("should give up");
+    assert!(err.to_string().contains("no answer"), "{err}");
+    assert!(err.is_retryable(), "a hang is worth trying again");
+    session.close().await;
+}
+
+#[tokio::test]
+async fn a_dataset_that_names_no_project_is_refused_by_name() {
+    // Not reachable by clicking — every node the tree draws was built by this
+    // driver — but reachable by anything that constructs a `NodeRef` from a
+    // string, and a path with the project missing still produces a URL: one
+    // that asks for a dataset in whichever project the credential defaults to.
+    let google = Google::start().await;
+    google.issues_a_token().await;
+    google.answers_datasets(datasets(&["events"], None)).await;
+    let session = connected(&google).await;
+
+    let err = session
+        .children(&NodeRef::new(NodeKind::Namespace, ["events"]))
+        .await
+        .expect_err("should be refused");
+    assert!(err.to_string().contains("events"), "{err}");
+    assert_eq!(google.requests_ending_in("/tables").await, 0);
+    session.close().await;
 }
 
 // ── fixtures ───────────────────────────────────────────────────────────────

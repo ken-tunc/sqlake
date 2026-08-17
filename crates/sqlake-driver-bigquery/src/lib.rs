@@ -13,6 +13,7 @@
 pub mod catalog;
 pub mod error;
 
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -54,12 +55,14 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     quote_style: QuoteStyle::Backtick,
 };
 
-/// How long a connection has to prove its credentials work.
+/// How long a call to Google has to answer.
 ///
-/// The token exchange and the verifying call are both HTTPS to Google, and
-/// `reqwest` has no deadline of its own: without this, a machine behind a
-/// proxy that accepts connections and answers nothing leaves the connection
-/// spinning with no way to abandon it.
+/// Every call this driver makes is HTTPS and `reqwest` has no deadline of its
+/// own: without this, a machine behind a proxy that accepts connections and
+/// answers nothing leaves the caller spinning with no way to abandon it. That
+/// costs more after the connection is open than during it — one session actor
+/// serialises every request for a connection, so a listing that never returns
+/// takes the connection's previews and every other branch of its tree with it.
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The BigQuery REST API. Overridden in tests, where the whole point is that
@@ -191,6 +194,7 @@ impl Driver for BqDriver {
         Ok(Box::new(BqSession {
             client,
             project: params.project.clone(),
+            deadline: self.deadline,
         }))
     }
 }
@@ -224,6 +228,29 @@ async fn verify(client: &Client, project: &str) -> DriverResult<()> {
 pub struct BqSession {
     client: Client,
     project: String,
+    deadline: Duration,
+}
+
+impl BqSession {
+    /// Give up on a call to Google that is not going to answer.
+    ///
+    /// The whole of a listing rather than each page: what the caller is
+    /// waiting for is the branch, and a first page that arrives inside the
+    /// deadline is no comfort if the second never does.
+    async fn within_deadline<T>(
+        &self,
+        what: &str,
+        work: impl Future<Output = DriverResult<T>>,
+    ) -> DriverResult<T> {
+        tokio::time::timeout(self.deadline, work)
+            .await
+            .map_err(|_| {
+                driver_error(format!(
+                    "no answer from Google within {:?} while {what}",
+                    self.deadline
+                ))
+            })?
+    }
 }
 
 /// Hand-written because `Client` is not `Debug` — and it should stay
@@ -244,7 +271,11 @@ impl Session for BqSession {
     }
 
     async fn children(&self, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
-        catalog::children(&self.client, &self.project, of).await
+        self.within_deadline(
+            &format!("expanding `{of}`"),
+            catalog::children(&self.client, &self.project, of),
+        )
+        .await
     }
 
     /// T4.
