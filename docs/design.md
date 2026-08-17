@@ -316,17 +316,16 @@ masking lives in exactly one function and never reaches the log.
   only that: a token it could not fetch is a connection that will never answer, not something
   to ask again later. The escape hatch when a workaround is not enough is a thin `reqwest`
   call.
-- **Preview uses `tabledata.list`, which is not billed as a query.** Implementing it as
-  `SELECT *` would incur scan costs on every preview. The correct implementation of
-  `preview()` for BigQuery issues no SQL.
 - Table definitions come from `tables.get` — schema, partitioning, clustering, row count and
-  byte size, all free.
+  byte size, all free. Preview already asks it for the first two of those.
 - `estimate()` is `jobs.insert(dryRun)`. Since `execute()` accepts only `ApprovedQuery`, there
   is no path that skips estimation; `maximumBytesBilled` is always set as a second layer.
 - Cancellation is `jobs.cancel`. `location` comes from the profile, with inference from the
   dataset.
-- `RECORD` and `REPEATED` fields are flattened into dotted column names (`user.name`) in the
-  grid, with the original nesting shown in the detail popover.
+- **`RECORD` and `REPEATED` are flattened for display only.** The driver decodes them as
+  `Value::Struct` and `Value::Array`, because `sqlake-api` hands an agent the same values and
+  a document is what it asked for. Dotted column names (`user.name`) and the nesting in the
+  detail popover are the front-end's rendering of that, and belong with M3's cell detail.
 
 ---
 

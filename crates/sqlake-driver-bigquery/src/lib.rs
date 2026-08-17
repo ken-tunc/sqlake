@@ -12,6 +12,8 @@
 
 pub mod catalog;
 pub mod error;
+pub mod preview;
+pub mod value;
 
 use std::future::Future;
 use std::time::Duration;
@@ -278,9 +280,12 @@ impl Session for BqSession {
         .await
     }
 
-    /// T4.
-    async fn preview(&self, table: &TableRef, _req: &PageRequest) -> DriverResult<ResultSet> {
-        Err(driver_error(format!("reading {table} is not built yet")))
+    async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
+        self.within_deadline(
+            &format!("reading `{table}`"),
+            preview::preview(&self.client, table, req),
+        )
+        .await
     }
 
     /// Nothing to release: `reqwest` owns a connection pool that drops with the
