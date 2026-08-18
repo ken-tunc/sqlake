@@ -24,6 +24,7 @@ use sqlake_app::PagedResult;
 use sqlake_app::snapshot::{ConnStatus, Snapshot};
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
+use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, TabId};
 use sqlake_core::node::TableRef;
 
@@ -58,6 +59,30 @@ pub struct Toast {
     pub text: String,
     pub severity: Severity,
     pub created_at: Instant,
+}
+
+/// A search over the explorer.
+///
+/// `editing` is separate from the text because the two ends of a search are
+/// different things: while it is being typed the box holds the keyboard, and
+/// once it is not, the *filtered tree* does — which is the only way a
+/// keyboard can reach what was searched for. design.md §1: nothing is
+/// reachable by mouse only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    pub text: String,
+    pub editing: bool,
+}
+
+impl Filter {
+    /// The box, open and empty, as `/` leaves it.
+    #[must_use]
+    pub fn opening() -> Self {
+        Self {
+            text: String::new(),
+            editing: true,
+        }
+    }
 }
 
 /// Neither pane is useful below this, so the splitter stops here rather than
@@ -147,6 +172,12 @@ pub struct UiState {
     /// the last leaves a second connection's failure unreported, because the
     /// first stays in the list and is what a search keeps finding.
     pub reported_failures: HashSet<ConnId>,
+    /// The explorer's search, or `None` when there is not one.
+    ///
+    /// Screen state, not application state: it decides which rows *this*
+    /// screen draws, the way scrolling does. An agent reading the same
+    /// snapshot through `sqlake-api` wants the tree, not one person's search.
+    pub filter: Option<Filter>,
     /// Every tab this screen has open, in the order they appear in the tab
     /// bar. At most one per `(conn, table)`.
     pub tabs: Vec<OpenTab>,
@@ -315,6 +346,7 @@ impl UiState {
                 }
             }
 
+            ViewCmd::SetFilter(filter) => self.set_filter(filter, snapshot),
             ViewCmd::SelectTreeRow(index) => self.select_tree_row(index, snapshot),
             ViewCmd::MoveTreeSelection(delta) => {
                 let from = self.tree.selected.unwrap_or(0);
@@ -420,7 +452,7 @@ impl UiState {
 
     fn content_rows(&self, pane: PaneId, snapshot: &Snapshot) -> usize {
         match pane {
-            PaneId::Explorer => tree_len(snapshot),
+            PaneId::Explorer => self.visible_len(snapshot),
             PaneId::Grid => self.row_count(snapshot),
             PaneId::TabBar | PaneId::StatusBar => 0,
         }
@@ -448,8 +480,68 @@ impl UiState {
         Some(self.grids.entry(tab).or_default())
     }
 
+    /// The rows the explorer is showing, as indices into the flattened tree.
+    ///
+    /// Both drawing and input go through this, so a click lands on the row the
+    /// user is looking at rather than on whatever is at that position in the
+    /// unfiltered tree.
+    #[must_use]
+    pub fn visible_rows(&self, snapshot: &Snapshot) -> Vec<usize> {
+        crate::tree::visible(
+            &snapshot.explorer.nodes,
+            self.filter.as_ref().map(|f| f.text.as_str()),
+        )
+    }
+
+    /// The node a visible row points at.
+    #[must_use]
+    pub fn visible_node<'a>(&self, snapshot: &'a Snapshot, row: usize) -> Option<&'a VisibleNode> {
+        snapshot
+            .explorer
+            .get(*self.visible_rows(snapshot).get(row)?)
+    }
+
+    /// Set the filter, keeping the same *node* selected rather than the same
+    /// row number.
+    ///
+    /// Filtering renumbers every row under the first one it removes, so a
+    /// selection left where it was would slide onto something the user never
+    /// pointed at — and then `Enter` opens it. When the selected node is
+    /// filtered out there is nothing to follow, and the first row is where a
+    /// search leaves you anyway.
+    fn set_filter(&mut self, filter: Option<Filter>, snapshot: &Snapshot) {
+        let was = self
+            .tree
+            .selected
+            .and_then(|row| self.visible_node(snapshot, row))
+            .map(|node| (node.conn, node.node_ref.clone()));
+
+        self.filter = filter;
+
+        // Once, and reused: this runs on every keystroke, and each call walks
+        // the whole tree lower-casing labels.
+        let rows = self.visible_rows(snapshot);
+        let now = was.and_then(|(conn, node_ref)| {
+            rows.iter().position(|&index| {
+                snapshot
+                    .explorer
+                    .get(index)
+                    .is_some_and(|node| node.conn == conn && node.node_ref == node_ref)
+            })
+        });
+        match now {
+            Some(row) => self.select_tree_row(row, snapshot),
+            None if rows.is_empty() => self.tree.selected = None,
+            None => self.select_tree_row(0, snapshot),
+        }
+    }
+
+    fn visible_len(&self, snapshot: &Snapshot) -> usize {
+        self.visible_rows(snapshot).len()
+    }
+
     fn select_tree_row(&mut self, index: usize, snapshot: &Snapshot) {
-        let len = tree_len(snapshot);
+        let len = self.visible_len(snapshot);
         if len == 0 {
             self.tree.selected = None;
             return;
@@ -547,10 +639,6 @@ impl UiState {
     }
 }
 
-fn tree_len(snapshot: &Snapshot) -> usize {
-    snapshot.explorer.len()
-}
-
 /// Apply a signed delta to an index without wrapping past zero.
 fn step(from: usize, delta: i32) -> usize {
     if delta < 0 {
@@ -645,6 +733,15 @@ mod tests {
     /// A snapshot and a `UiState` with its one preview already open as tab
     /// `TabId::new(1)` — what the render loop would have done on the frame
     /// that first drew it.
+    /// A search that has been made, which is the state the tree is filtered
+    /// in — the box's own editing state changes no rows.
+    fn search(text: &str) -> Filter {
+        Filter {
+            text: text.to_owned(),
+            editing: false,
+        }
+    }
+
     fn setup(tree_rows: usize, grid_rows: usize, grid_cols: usize) -> (Snapshot, UiState) {
         let conn = ConnId::new();
         let snap = snapshot(conn, tree_rows, grid_rows, grid_cols);
@@ -662,6 +759,70 @@ mod tests {
             &snap,
         );
         (snap, ui)
+    }
+
+    #[test]
+    fn filtering_keeps_the_same_node_selected_not_the_same_row() {
+        // The answer M2 owed to its second open question. Rows are renumbered
+        // by everything the filter removes above them, so a selection left at
+        // its old number lands on a node the user never pointed at — and then
+        // `Enter` opens it.
+        let (snap, mut ui) = setup(30, 0, 0);
+        ui.apply(ViewCmd::SelectTreeRow(17), &snap);
+        assert_eq!(
+            ui.visible_node(&snap, 17).map(|n| n.label.clone()),
+            Some("n17".to_owned())
+        );
+
+        // `n17` is the only row left, so it is row zero now.
+        ui.apply(ViewCmd::SetFilter(Some(search("n17"))), &snap);
+        assert_eq!(ui.tree.selected, Some(0));
+        assert_eq!(
+            ui.visible_node(&snap, 0).map(|n| n.label.clone()),
+            Some("n17".to_owned())
+        );
+
+        // And back again: clearing restores the tree, and the selection goes
+        // with the node rather than staying at zero.
+        ui.apply(ViewCmd::SetFilter(None), &snap);
+        assert_eq!(ui.tree.selected, Some(17));
+    }
+
+    #[test]
+    fn a_selection_the_filter_removes_falls_to_the_first_row() {
+        // There is nothing to follow, and the first row is where a search
+        // leaves you anyway.
+        let (snap, mut ui) = setup(30, 0, 0);
+        ui.apply(ViewCmd::SelectTreeRow(17), &snap);
+        ui.apply(ViewCmd::SetFilter(Some(search("n2"))), &snap);
+        assert_eq!(ui.tree.selected, Some(0));
+        assert_eq!(
+            ui.visible_node(&snap, 0).map(|n| n.label.clone()),
+            Some("n2".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_selects_nothing() {
+        let (snap, mut ui) = setup(30, 0, 0);
+        ui.apply(ViewCmd::SelectTreeRow(3), &snap);
+        ui.apply(ViewCmd::SetFilter(Some(search("zzz"))), &snap);
+        assert_eq!(ui.tree.selected, None);
+    }
+
+    #[test]
+    fn moving_the_selection_stays_inside_the_filtered_rows() {
+        // The clamp reads the visible count, not the tree's: otherwise `G`
+        // runs off the end of a filtered list into rows that are not drawn.
+        let (snap, mut ui) = setup(30, 0, 0);
+        ui.apply(ViewCmd::SetFilter(Some(search("n1"))), &snap);
+        // n1, n10..n19 — eleven rows.
+        ui.apply(ViewCmd::MoveTreeSelection(1000), &snap);
+        assert_eq!(ui.tree.selected, Some(10));
+        assert_eq!(
+            ui.visible_node(&snap, 10).map(|n| n.label.clone()),
+            Some("n19".to_owned())
+        );
     }
 
     #[test]

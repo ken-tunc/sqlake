@@ -64,6 +64,14 @@ pub enum ViewCmd {
     SelectTreeRow(usize),
     MoveTreeSelection(i32),
 
+    /// The explorer's filter, or `None` to close the box and show the tree
+    /// whole again.
+    ///
+    /// The whole string rather than one edit at a time: the key that changed
+    /// it is the only thing that knows what it did, and a `Backspace` that
+    /// removed nothing is not a state the view should have to reason about.
+    SetFilter(Option<crate::ui::Filter>),
+
     SelectCell {
         row: usize,
         col: usize,
@@ -132,6 +140,7 @@ intent_kinds! {
     MoveSplit          => "move the split between panes",
     EvenSplit          => "reset the split",
     DismissModal       => "close the dialog",
+    Filter             => "search the explorer",
 
     Connect            => "open a connection",
     Disconnect         => "close a connection",
@@ -163,6 +172,7 @@ impl IntentKind {
                 ViewCmd::ScrollToStart(_) | ViewCmd::ScrollToEnd(_) => Self::ScrollEdge,
                 ViewCmd::ScrollXBy { .. } => Self::ScrollHorizontally,
                 ViewCmd::SelectTreeRow(_) | ViewCmd::MoveTreeSelection(_) => Self::TreeSelection,
+                ViewCmd::SetFilter(_) => Self::Filter,
                 ViewCmd::SelectCell { .. } | ViewCmd::MoveCellSelection { .. } => {
                     Self::GridSelection
                 }
@@ -202,6 +212,9 @@ pub enum Context {
     Grid,
     /// A dialog is open, which takes over the keyboard.
     Modal,
+    /// The explorer's filter box has the keyboard. Like `Modal`, it takes it
+    /// over entirely: a search for a table called `q` must not quit.
+    Filter,
 }
 
 impl Context {
@@ -212,7 +225,7 @@ impl Context {
         match self {
             Self::Explorer => Some(PaneId::Explorer),
             Self::Grid => Some(PaneId::Grid),
-            Self::Global | Self::Modal => None,
+            Self::Global | Self::Modal | Self::Filter => None,
         }
     }
 }

@@ -232,7 +232,7 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         connection: ui
             .tree
             .selected
-            .and_then(|i| snapshot.explorer.get(i))
+            .and_then(|row| ui.visible_node(snapshot, row))
             .map(|node| node.conn)
             .or_else(|| snapshot.connections.first().map(|c| c.id)),
         tree_selection: ui.tree.selected,
@@ -240,6 +240,7 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         tabs: &ui.tabs,
         active_tab: ui.active_tab,
         toasts: &ui.toasts,
+        filter: ui.filter.as_ref(),
     }
 }
 
@@ -261,8 +262,20 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         "Explorer",
         ui.focus == PaneId::Explorer,
     );
-    ui.set_viewport(PaneId::Explorer, explorer);
-    tree::render(frame, hits, explorer, snapshot, &ui.tree);
+    // The rows, not the pane: the search box takes the top line, and a
+    // viewport measured with it in leaves the last row unscrollable-to.
+    ui.set_viewport(
+        PaneId::Explorer,
+        tree::rows_area(explorer, ui.filter.as_ref()),
+    );
+    tree::render(
+        frame,
+        hits,
+        explorer,
+        snapshot,
+        &ui.tree,
+        ui.filter.as_ref(),
+    );
 
     chrome::splitter(
         frame,
@@ -444,6 +457,24 @@ mod tests {
         let mut ui = UiState::new();
         let (text, _) = render(&snap, &mut ui, 100, 30);
         assert!(text.join("").contains("public"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn the_explorer_viewport_leaves_out_the_search_box() {
+        // The scroll clamp and the page size are measured from it, so a
+        // viewport that counts the box's row leaves the last row of a filtered
+        // tree impossible to scroll to.
+        let (_store, snap) = connected().await;
+        let mut ui = UiState::new();
+        let _ = render(&snap, &mut ui, 100, 30);
+        let whole = ui.viewport(PaneId::Explorer).height;
+
+        ui.apply(
+            crate::intent::ViewCmd::SetFilter(Some(crate::ui::Filter::opening())),
+            &snap,
+        );
+        let _ = render(&snap, &mut ui, 100, 30);
+        assert_eq!(ui.viewport(PaneId::Explorer).height, whole - 1);
     }
 
     #[tokio::test]
