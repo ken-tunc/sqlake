@@ -390,10 +390,11 @@ CREATE TABLE templates (
 ## 13. Testing
 
 The testing rules that apply to every commit are in [CLAUDE.md](../CLAUDE.md). `sqlake-conformance`
-holds the shared **driver conformance suite**: one set of cases, run against the mock and, via
-`testcontainers`, against PostgreSQL. BigQuery's leg, against a recorded fixture rather than
-an emulator, arrives with the driver in M2, so that "the driver behaves" means the same thing
-for all three.
+holds the shared **driver conformance suite**: one set of cases, run against all three drivers,
+so that "the driver behaves" means the same thing for each. What each leg runs against differs,
+and the difference is the interesting part: the mock is in-process, PostgreSQL is a container,
+and BigQuery is a recorded fixture because the emulator does not implement the paging the suite
+asks about — the reasoning is in `tests/conformance.rs`.
 
 ---
 
@@ -403,7 +404,7 @@ for all three.
 | --- | --- | --- |
 | **M0 — Foundation** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M1 — Connection management** ✅ | — | Done. `crates/` and `git log` are the record |
-| **M2** | Table list (feature 2) — [design-m2.md](design-m2.md) | Lazy tree expansion for pg and bq, filter search. A second driver also gives `Capabilities` a second answer, which the mock alone cannot |
+| **M2 — Table list** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M3** | Table preview (feature 3) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
 | **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
 | **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |
