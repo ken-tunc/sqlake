@@ -18,7 +18,7 @@ principle. BigQuery is what tests it.
 | 2 | Previewing a BigQuery table issues no query, and nothing in the client can make it |
 | 3 | Filter search narrows the explorer to matching nodes, across every open connection |
 | 4 | `sqlake-tui` still has no `if driver == …`, now that there is a second answer to disagree with |
-| 5 | `cargo test` still passes with no network; the BigQuery conformance leg runs when an emulator is available |
+| 5 | `cargo test` still passes with no network, and the BigQuery conformance leg is part of it |
 
 ---
 
@@ -63,6 +63,20 @@ the user gets instead is a filter over the rows the explorer already holds, whic
 different feature from "find this table anywhere" — that one belongs with a catalogue search
 the driver can answer in one call, and it is not this.
 
+**D4 — BigQuery's conformance leg runs against a fixture, and there is no emulator leg.**
+This was meant to be the open question M2 answered by trying it, and the trying settled it:
+`goccy/bigquery-emulator` implements every endpoint this driver uses, and its
+`tabledata.list` ignores `startIndex` and `maxResults` — it answers `SELECT * FROM t` and
+returns the whole table. Two of the suite's seven cases are about exactly those two
+parameters, so the emulator can only be put through the suite by carving them out, and a
+shared suite with a driver-shaped hole in it is worth less than one that runs on a fixture.
+
+What is lost is real and is not made up for elsewhere in the suite: nothing here checks that
+Google would accept these requests. What is kept is the property the suite was built for —
+the application layer drives all three drivers the same way — plus the one claim only this
+leg can hold, that a driver answering `sortable_preview` false is made to refuse. The wire
+itself is covered separately, by responses written from what BigQuery actually sends.
+
 **D3 — the mock keeps advertising a third shape.** Its `Capabilities` is already
 configurable per test (`with_capabilities`, `DEEP_HIERARCHY`), which is what has been
 standing in for a second driver. That stays: BigQuery is one more real answer, not a
@@ -89,12 +103,8 @@ Each is one PR, reviewed before the next starts.
 
 Left open deliberately; the answers belong in the code that settles them.
 
-1. **Whether an emulator is worth it.** The BigQuery emulators are partial, and a conformance
-   leg that passes against one proves less than the PostgreSQL leg does against a real server.
-   The alternative is a recorded-response fixture, which proves less again but never lies about
-   what it covers.
-2. **Where `location` comes from when the profile omits it.** Inferring it from the dataset is
+1. **Where `location` comes from when the profile omits it.** Inferring it from the dataset is
    one round trip; requiring it is one more thing to get wrong in a config file.
-3. **What search does to the selection.** The explorer's selection is an index into the
+2. **What search does to the selection.** The explorer's selection is an index into the
    flattened tree, so filtering renumbers every row underneath it. Keeping the same *node*
    selected across a keystroke is a different thing from keeping the same index.

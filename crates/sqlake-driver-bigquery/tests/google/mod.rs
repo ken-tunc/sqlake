@@ -13,7 +13,7 @@
 use sqlake_core::id::ProfileId;
 use sqlake_core::profile::{BigQueryAuth, BigQueryParams, Params, ResolvedProfile};
 use sqlake_driver_bigquery::BqDriver;
-use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
+use wiremock::matchers::{header, method, path, path_regex, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 pub const PROJECT: &str = "analytics-prod";
@@ -168,7 +168,12 @@ impl Google {
         self
     }
 
-    pub async fn answers_rows(&self, dataset: &str, table: &str, response: ResponseTemplate) {
+    pub async fn answers_rows(
+        &self,
+        dataset: &str,
+        table: &str,
+        response: impl wiremock::Respond + 'static,
+    ) {
         Mock::given(method("GET"))
             .and(path(format!(
                 "/projects/{PROJECT}/datasets/{dataset}/tables/{table}/data"
@@ -196,6 +201,27 @@ impl Google {
             .and(header("authorization", "Bearer a-token"))
             .and(query_param("startIndex", start_index))
             .and(query_param("maxResults", max_results))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
+    /// Any table in any dataset, for the tests that need a "there is nothing
+    /// else here" answer. Mounted after a specific table so that the specific
+    /// one wins.
+    pub async fn describes_any_table(&self, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/projects/[^/]+/datasets/[^/]+/tables/[^/]+$"))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
+    pub async fn answers_any_rows(&self, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/projects/[^/]+/datasets/[^/]+/tables/[^/]+/data$",
+            ))
             .respond_with(response)
             .mount(&self.server)
             .await;
