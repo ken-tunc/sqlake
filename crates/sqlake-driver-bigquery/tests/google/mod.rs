@@ -120,6 +120,87 @@ impl Google {
         .await;
     }
 
+    /// What `tables.get` answers: the schema a row's positional cells are read
+    /// against, and the row count the grid shows a position in.
+    pub async fn describes_table(
+        &self,
+        dataset: &str,
+        table: &str,
+        schema: serde_json::Value,
+        num_rows: Option<&str>,
+    ) -> &Self {
+        let mut body = serde_json::json!({
+            "kind": "bigquery#table",
+            "id": format!("{PROJECT}:{dataset}.{table}"),
+            "tableReference": {
+                "projectId": PROJECT,
+                "datasetId": dataset,
+                "tableId": table,
+            },
+            "type": "TABLE",
+            "schema": schema,
+        });
+        if let Some(num_rows) = num_rows {
+            body["numRows"] = serde_json::json!(num_rows);
+        }
+        self.describes_table_with(
+            dataset,
+            table,
+            ResponseTemplate::new(200).set_body_json(body),
+        )
+        .await
+    }
+
+    pub async fn describes_table_with(
+        &self,
+        dataset: &str,
+        table: &str,
+        response: ResponseTemplate,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/projects/{PROJECT}/datasets/{dataset}/tables/{table}"
+            )))
+            .and(header("authorization", "Bearer a-token"))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn answers_rows(&self, dataset: &str, table: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/projects/{PROJECT}/datasets/{dataset}/tables/{table}/data"
+            )))
+            .and(header("authorization", "Bearer a-token"))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
+    /// The same, for one window of the table. Matched on `startIndex` and
+    /// `maxResults` so that a request for the wrong window is not answered.
+    pub async fn answers_rows_at(
+        &self,
+        dataset: &str,
+        table: &str,
+        start_index: &str,
+        max_results: &str,
+        response: ResponseTemplate,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/projects/{PROJECT}/datasets/{dataset}/tables/{table}/data"
+            )))
+            .and(header("authorization", "Bearer a-token"))
+            .and(query_param("startIndex", start_index))
+            .and(query_param("maxResults", max_results))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
     pub async fn requests_to_datasets(&self) -> usize {
         self.requests_ending_in("/datasets").await
     }

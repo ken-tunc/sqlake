@@ -22,6 +22,10 @@ sqlake-tui = { path = "crates/sqlake-tui" }
 
 anyhow = "1"
 async-trait = "0.1"
+# BigQuery sends `BYTES` as base64 in JSON. Without decoding it the grid would
+# show the encoding rather than the value, and hex is what it draws for the
+# same type out of PostgreSQL.
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 # Must stay in step with the crossterm that ratatui re-exports as
