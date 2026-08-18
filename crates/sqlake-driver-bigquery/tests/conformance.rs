@@ -2,15 +2,17 @@
 //!
 //! What this leg proves is the suite's own claim: that the application layer
 //! can walk and page this driver exactly as it does the other two, and that
-//! the pair `(free_preview, sortable_preview)` it answers is one the suite
-//! holds it to — reversal where sorting is offered, a refusal where it is not.
+//! the `sortable_preview` it answers false is one the suite holds it to — a
+//! refusal, where a driver that offers sorting has to reverse the rows.
 //! Nothing else in the workspace could catch this driver claiming it can sort.
+//! (`free_preview` is held elsewhere, by `tests/preview.rs` watching for a
+//! query that is never issued; the shared suite does not look at it.)
 //!
 //! **It runs against a fixture, not against a server, and that was not the
 //! first choice.** `goccy/bigquery-emulator` implements every endpoint this
 //! driver uses, and its `tabledata.list` ignores `startIndex` and `maxResults`
-//! outright — it answers `SELECT * FROM t` and returns the whole table. Two of
-//! the suite's cases are precisely about those two parameters, so the
+//! outright — it answers `SELECT * FROM t` and returns the whole table. Three
+//! of the suite's cases are precisely about those two parameters, so the
 //! emulator cannot be put through it without carving them out, and a shared
 //! suite with a driver-shaped hole in it is worth less than one that runs on a
 //! fixture.

@@ -212,6 +212,7 @@ impl Google {
     pub async fn describes_any_table(&self, response: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path_regex(r"^/projects/[^/]+/datasets/[^/]+/tables/[^/]+$"))
+            .and(header("authorization", "Bearer a-token"))
             .respond_with(response)
             .mount(&self.server)
             .await;
@@ -222,6 +223,7 @@ impl Google {
             .and(path_regex(
                 r"^/projects/[^/]+/datasets/[^/]+/tables/[^/]+/data$",
             ))
+            .and(header("authorization", "Bearer a-token"))
             .respond_with(response)
             .mount(&self.server)
             .await;

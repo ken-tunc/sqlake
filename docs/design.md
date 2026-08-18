@@ -391,8 +391,9 @@ CREATE TABLE templates (
 
 The testing rules that apply to every commit are in [CLAUDE.md](../CLAUDE.md). `sqlake-conformance`
 holds the shared **driver conformance suite**: one set of cases, run against the mock and, via
-`testcontainers`, against PostgreSQL. BigQuery's leg, against an emulator, arrives with the
-driver in M2, so that "the driver behaves" means the same thing for all three.
+`testcontainers`, against PostgreSQL. BigQuery's leg, against a recorded fixture rather than
+an emulator, arrives with the driver in M2, so that "the driver behaves" means the same thing
+for all three.
 
 ---
 

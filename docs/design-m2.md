@@ -63,11 +63,16 @@ the user gets instead is a filter over the rows the explorer already holds, whic
 different feature from "find this table anywhere" — that one belongs with a catalogue search
 the driver can answer in one call, and it is not this.
 
+**D3 — the mock keeps advertising a third shape.** Its `Capabilities` is already
+configurable per test (`with_capabilities`, `DEEP_HIERARCHY`), which is what has been
+standing in for a second driver. That stays: BigQuery is one more real answer, not a
+replacement for being able to construct an unreasonable one on demand.
+
 **D4 — BigQuery's conformance leg runs against a fixture, and there is no emulator leg.**
 This was meant to be the open question M2 answered by trying it, and the trying settled it:
 `goccy/bigquery-emulator` implements every endpoint this driver uses, and its
 `tabledata.list` ignores `startIndex` and `maxResults` — it answers `SELECT * FROM t` and
-returns the whole table. Two of the suite's seven cases are about exactly those two
+returns the whole table. Three of the suite's seven cases are about exactly those two
 parameters, so the emulator can only be put through the suite by carving them out, and a
 shared suite with a driver-shaped hole in it is worth less than one that runs on a fixture.
 
@@ -76,11 +81,6 @@ Google would accept these requests. What is kept is the property the suite was b
 the application layer drives all three drivers the same way — plus the one claim only this
 leg can hold, that a driver answering `sortable_preview` false is made to refuse. The wire
 itself is covered separately, by responses written from what BigQuery actually sends.
-
-**D3 — the mock keeps advertising a third shape.** Its `Capabilities` is already
-configurable per test (`with_capabilities`, `DEEP_HIERARCHY`), which is what has been
-standing in for a second driver. That stays: BigQuery is one more real answer, not a
-replacement for being able to construct an unreasonable one on demand.
 
 ---
 
@@ -94,7 +94,7 @@ Each is one PR, reviewed before the next starts.
 | T2 | `sqlake-driver-bigquery`: connect, auth, `Capabilities`, `close` | A profile with ADC connects, and the wrong credentials fail with the reason |
 | T3 | BigQuery metadata: `children` for project, dataset and table | The tree fills to three levels, with datasets named as datasets |
 | T4 | BigQuery preview via `tabledata.list`, and type decoding | A table pages without a query being issued; `RECORD`/`REPEATED` arrive as something the grid can draw |
-| T5 | The BigQuery leg of the conformance suite | The same cases pass for three drivers, and skip cleanly with no emulator |
+| T5 | The BigQuery leg of the conformance suite | The same cases pass for three drivers, with no network and no emulator |
 | T6 | Filter search in the explorer | Typing narrows the tree across every open connection, and clearing it restores the tree unchanged |
 
 ---
