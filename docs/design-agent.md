@@ -217,7 +217,7 @@ keeps M1–M8 aligned one-to-one with the eight features.
 
 | # | Lands after | Content | Done when |
 | --- | --- | --- | --- |
-| **A1** | M2 | Read-only CLI and socket API | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
+| **A1** | M2 | Read-only CLI and socket API — [design-a1.md](design-a1.md) | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
 | **A2** | M4 | Query execution over the API | `query estimate\|run\|status\|wait\|cancel`, the byte budget and `NeedsApproval`, read-only enforcement, `issuer` in history |
 | **A3** | A2 | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
