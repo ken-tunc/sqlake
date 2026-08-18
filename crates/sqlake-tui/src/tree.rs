@@ -19,11 +19,12 @@ use sqlake_app::tree::TreeView;
 use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::node::RelationKind;
 use sqlake_core::profile::ProfileColor;
+use unicode_width::UnicodeWidthChar;
 
 use crate::chrome;
 use crate::grid::{display_width, sanitise};
 use crate::hit::{ButtonId, HitMap, PaneId, Target, Z_CONTENT};
-use crate::ui::TreeUi;
+use crate::ui::{Filter, TreeUi};
 
 /// Cells of indent per level.
 const INDENT: u16 = 2;
@@ -78,6 +79,25 @@ pub fn visible(nodes: &[VisibleNode], filter: Option<&str>) -> Vec<usize> {
     kept
 }
 
+/// The part of the pane the rows are drawn in, which is the pane less the
+/// search box.
+///
+/// The scroll clamp and the page size are measured from this rather than from
+/// the pane, the same way the grid's are measured from its body: a viewport a
+/// row taller than what is drawn leaves the last row impossible to scroll to.
+#[must_use]
+pub fn rows_area(area: Rect, filter: Option<&Filter>) -> Rect {
+    if filter.is_none() {
+        return area;
+    }
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
+}
+
 /// Draw the explorer's contents into `area`, which is the inside of its pane.
 ///
 /// `empty` is what to say when there is nothing to draw. The reason differs —
@@ -89,7 +109,7 @@ pub fn render(
     area: Rect,
     snapshot: &Snapshot,
     ui: &TreeUi,
-    filter: Option<&str>,
+    filter: Option<&Filter>,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -97,16 +117,13 @@ pub fn render(
     // The box takes the top line whether or not anything matches: a search
     // that hid its own text as soon as it stopped matching would look like the
     // client had lost the keystroke.
-    let area = match filter {
-        Some(text) => {
-            render_filter(frame, hits, Rect::new(area.x, area.y, area.width, 1), text);
-            if area.height == 1 {
-                return;
-            }
-            Rect::new(area.x, area.y + 1, area.width, area.height - 1)
-        }
-        None => area,
-    };
+    if let Some(text) = filter {
+        render_filter(frame, hits, Rect::new(area.x, area.y, area.width, 1), text);
+    }
+    let area = rows_area(area, filter);
+    if area.height == 0 {
+        return;
+    }
     let view = &snapshot.explorer;
     if view.is_empty() {
         // Wrapped, because the explorer is twelve columns wide at the smallest
@@ -131,7 +148,7 @@ pub fn render(
         area
     };
 
-    let rows = visible(&view.nodes, filter);
+    let rows = visible(&view.nodes, filter.map(|f| f.text.as_str()));
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(" no match ").style(Style::new().fg(Color::DarkGray)),
@@ -179,18 +196,46 @@ pub fn render(
     }
 }
 
+/// The last `columns` columns of `text`.
+///
+/// The end and not the beginning, which is what `chrome::fit` keeps: a label
+/// is read from its start, but a box being typed into is read at the caret,
+/// and past the pane's width the letters arriving would stop appearing.
+fn tail(text: &str, columns: u16) -> String {
+    if display_width(text) <= columns {
+        return text.to_owned();
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let width = u16::try_from(UnicodeWidthChar::width(ch).unwrap_or(0)).unwrap_or(u16::MAX);
+        if used + width > columns {
+            break;
+        }
+        kept.push(ch);
+        used += width;
+    }
+    kept.chars().rev().collect()
+}
+
 /// The search box, drawn whether or not it has anything in it yet.
-fn render_filter(frame: &mut Frame<'_>, hits: &mut HitMap, row: Rect, text: &str) {
+fn render_filter(frame: &mut Frame<'_>, hits: &mut HitMap, row: Rect, filter: &Filter) {
     hits.push(row, Z_CONTENT, Target::Button(ButtonId::Filter));
-    let shown = chrome::fit(&sanitise(text), row.width.saturating_sub(2));
+    // Two columns are spoken for: the `/` and the caret.
+    let shown = tail(&sanitise(&filter.text), row.width.saturating_sub(2));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("/", Style::new().fg(Color::DarkGray)),
             Span::styled(shown, Style::new().fg(Color::White)),
-            // A block where the next character goes. The terminal's own cursor
-            // is parked off-screen while the TUI is up, so without this there
-            // is nothing to say the box is taking input.
-            Span::styled("▏", Style::new().fg(Color::Cyan)),
+            // The caret is only there while the box is taking input — the
+            // terminal's own cursor is parked off-screen while the TUI is up,
+            // so this is the only thing that says where the keyboard is. Once
+            // `Enter` hands it to the tree, the query stays on screen to
+            // explain the missing rows, and the caret goes with the keyboard.
+            Span::styled(
+                if filter.editing { "▏" } else { "" },
+                Style::new().fg(Color::Cyan),
+            ),
         ]))
         .style(Style::new().bg(Color::Black)),
         row,
@@ -399,7 +444,7 @@ mod tests {
         ui: &TreeUi,
         w: u16,
         h: u16,
-        filter: Option<&str>,
+        filter: Option<&Filter>,
     ) -> (Buffer, HitMap) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitMap::new();
@@ -421,6 +466,13 @@ mod tests {
     fn draw(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (String, HitMap) {
         let (rows, hits) = draw_rows(view, ui, w, h);
         (rows.concat(), hits)
+    }
+
+    fn editing(text: &str) -> Filter {
+        Filter {
+            text: text.to_owned(),
+            editing: true,
+        }
     }
 
     fn flat(rows: &[(u16, &str)]) -> Vec<VisibleNode> {
@@ -497,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_that_matches_keeps_what_is_under_it() {
+    fn a_branch_that_matches_does_not_bring_its_children_with_it() {
         // Matching a dataset shows the dataset, not its tables: opening it is
         // what shows those, and a filter that expanded on a keystroke is the
         // one thing the tree is lazy to avoid.
@@ -533,7 +585,8 @@ mod tests {
             explorer: std::sync::Arc::new(view),
             ..Snapshot::default()
         };
-        let (buffer, _) = draw_filtered(&snapshot, &TreeUi::default(), 20, 4, Some("zzz"));
+        let (buffer, _) =
+            draw_filtered(&snapshot, &TreeUi::default(), 20, 4, Some(&editing("zzz")));
         let text: String = (0..4)
             .flat_map(|y| (0..20).map(move |x| (x, y)))
             .map(|(x, y)| buffer[(x, y)].symbol().to_owned())
@@ -558,7 +611,7 @@ mod tests {
             explorer: std::sync::Arc::new(view),
             ..Snapshot::default()
         };
-        let (_, hits) = draw_filtered(&snapshot, &TreeUi::default(), 20, 5, Some("hits"));
+        let (_, hits) = draw_filtered(&snapshot, &TreeUi::default(), 20, 5, Some(&editing("hits")));
         // Row 0 is the box; `prod`, `analytics`, `hits` follow.
         assert_eq!(
             hits.at(Position::new(1, 3)),

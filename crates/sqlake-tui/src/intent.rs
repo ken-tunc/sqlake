@@ -70,7 +70,7 @@ pub enum ViewCmd {
     /// The whole string rather than one edit at a time: the key that changed
     /// it is the only thing that knows what it did, and a `Backspace` that
     /// removed nothing is not a state the view should have to reason about.
-    SetFilter(Option<String>),
+    SetFilter(Option<crate::ui::Filter>),
 
     SelectCell {
         row: usize,
