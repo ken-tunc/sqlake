@@ -3950,6 +3950,7 @@ dependencies = [
  "base64 0.22.1",
  "gcp-bigquery-client",
  "serde_json",
+ "sqlake-conformance",
  "sqlake-core",
  "tempfile",
  "time",
