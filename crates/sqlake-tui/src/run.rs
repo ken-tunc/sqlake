@@ -232,7 +232,7 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         connection: ui
             .tree
             .selected
-            .and_then(|i| snapshot.explorer.get(i))
+            .and_then(|row| ui.visible_node(snapshot, row))
             .map(|node| node.conn)
             .or_else(|| snapshot.connections.first().map(|c| c.id)),
         tree_selection: ui.tree.selected,
@@ -240,6 +240,7 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         tabs: &ui.tabs,
         active_tab: ui.active_tab,
         toasts: &ui.toasts,
+        filter: ui.filter.as_deref(),
     }
 }
 
@@ -262,7 +263,14 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         ui.focus == PaneId::Explorer,
     );
     ui.set_viewport(PaneId::Explorer, explorer);
-    tree::render(frame, hits, explorer, snapshot, &ui.tree);
+    tree::render(
+        frame,
+        hits,
+        explorer,
+        snapshot,
+        &ui.tree,
+        ui.filter.as_deref(),
+    );
 
     chrome::splitter(
         frame,

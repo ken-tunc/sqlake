@@ -88,6 +88,23 @@ pub const KEYMAP: &[KeyBinding] = &[
         context: Context::Global,
         kind: IntentKind::Focus,
     },
+    // `/` opens the box, and inside it every key is the box's. `Filter` is the
+    // only kind bound in two contexts, and it has to be: a keymap that let the
+    // global bindings through would make a search for a table called `q` quit.
+    KeyBinding {
+        keys: &[key('/')],
+        context: Context::Global,
+        kind: IntentKind::Filter,
+    },
+    KeyBinding {
+        keys: &[
+            KeyCombo::new(KeyCode::Backspace),
+            KeyCombo::new(KeyCode::Esc),
+            KeyCombo::new(KeyCode::Enter),
+        ],
+        context: Context::Filter,
+        kind: IntentKind::Filter,
+    },
     KeyBinding {
         keys: &[
             key('j'),
@@ -246,6 +263,9 @@ pub struct InputContext<'a> {
     pub tabs: &'a [OpenTab],
     pub active_tab: Option<TabId>,
     pub toasts: &'a [Toast],
+    /// What the explorer's filter box holds, or `None` when it is closed.
+    /// Its presence is what redirects the keyboard into it.
+    pub filter: Option<&'a str>,
 }
 
 impl InputContext<'_> {
@@ -274,8 +294,14 @@ impl InputContext<'_> {
             .map(|p| p.id.clone())
     }
 
+    /// The node a *visible* row points at.
+    ///
+    /// Through the filter, not straight into the tree: a row number means a
+    /// position on screen, and with rows hidden the two stop agreeing. Acting
+    /// on the wrong one is how a click opens a table the user cannot see.
     fn node(&self, index: usize) -> Option<&VisibleNode> {
-        self.snapshot.explorer.get(index)
+        let row = *crate::tree::visible(&self.snapshot.explorer.nodes, self.filter).get(index)?;
+        self.snapshot.explorer.get(row)
     }
 
     fn active_tab(&self) -> Option<TabId> {
@@ -313,6 +339,8 @@ impl InputContext<'_> {
     fn key_context(&self) -> Context {
         if self.modal_open {
             Context::Modal
+        } else if self.filter.is_some() {
+            Context::Filter
         } else {
             match self.focus {
                 PaneId::Explorer => Context::Explorer,
@@ -445,6 +473,10 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
         (Target::Button(ButtonId::Cancel(busy)), Gesture::Click) => {
             vec![Action::Cancel(busy).into()]
         }
+        // A pointer cannot type, so the box's only gesture is to be dismissed.
+        (Target::Button(ButtonId::Filter), Gesture::Click) => {
+            vec![ViewCmd::SetFilter(None).into()]
+        }
         (Target::Button(ButtonId::DismissModal), Gesture::Click) => {
             vec![ViewCmd::DismissModal.into()]
         }
@@ -568,9 +600,19 @@ pub fn on_key(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
     // context with no fallback: it has the keyboard, so `q` behind a "discard
     // these changes?" dialog must not quit instead of answering it.
     let bound = matching(context).or_else(|| match context {
-        Context::Modal => None,
+        // Neither has a fallback: both hold the keyboard, so `q` behind a
+        // "discard these changes?" dialog must not quit instead of answering
+        // it, and a `q` typed into the search box must reach the box.
+        Context::Modal | Context::Filter => None,
         _ => matching(Context::Global),
     });
+
+    // Every remaining key belongs to the box, which is what a text input is.
+    // Enumerating the printable characters in `KEYMAP` instead would be a
+    // hundred bindings that the coverage test would then have to skip.
+    if bound.is_none() && context == Context::Filter {
+        return materialise(IntentKind::Filter, event, ctx);
+    }
 
     let Some(binding) = bound else {
         return Vec::new();
@@ -653,6 +695,7 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         ],
         IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
         IntentKind::DismissModal => vec![ViewCmd::DismissModal.into()],
+        IntentKind::Filter => vec![ViewCmd::SetFilter(next_filter(event, ctx)).into()],
 
         IntentKind::Connect => ctx
             .connectable_profile()
@@ -706,6 +749,29 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|t| vec![ViewCmd::DismissToast(t.id).into()])
             .unwrap_or_default(),
         IntentKind::Quit => vec![Action::Quit.into()],
+    }
+}
+
+/// What the filter box holds after this key.
+///
+/// `Esc` closes it and `Enter` leaves it closed with the tree whole again:
+/// both are ways of saying "done", and a filter that outlived its box would
+/// hide rows with nothing on screen to explain why. `Backspace` on an empty
+/// box closes it too, which is where the user's fingers already are.
+fn next_filter(event: KeyEvent, ctx: &InputContext<'_>) -> Option<String> {
+    let Some(current) = ctx.filter else {
+        // Not open yet, so this is the `/` that opens it — and `/` is a
+        // character the box would otherwise have taken as its first letter.
+        return Some(String::new());
+    };
+    match event.code {
+        KeyCode::Esc | KeyCode::Enter => None,
+        KeyCode::Backspace => {
+            let mut text = current.to_owned();
+            text.pop().map(|_| text)
+        }
+        KeyCode::Char(c) => Some(format!("{current}{c}")),
+        _ => Some(current.to_owned()),
     }
 }
 
@@ -788,6 +854,7 @@ mod tests {
                 tabs: &self.tabs,
                 active_tab: None,
                 toasts: &self.toasts,
+                filter: None,
             }
         }
     }
@@ -1185,6 +1252,93 @@ mod tests {
     }
 
     #[test]
+    fn the_search_box_takes_the_keyboard_from_everything_else() {
+        // The reason it needs a context of its own: `q` quits, `s` sorts, `/`
+        // opens the box — and every one of them is a letter in a table's name.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        c.filter = Some("us");
+
+        for (key, expected) in [('q', "usq"), ('s', "uss"), ('/', "us/")] {
+            assert_eq!(
+                on_key(press(KeyCode::Char(key)), &c),
+                [Intent::View(ViewCmd::SetFilter(Some(expected.to_owned())))],
+                "{key} should have gone into the box"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_opens_the_box_and_is_not_typed_into_it() {
+        let f = fixture();
+        let c = f.ctx(PaneId::Explorer);
+        assert_eq!(
+            on_key(press(KeyCode::Char('/')), &c),
+            [Intent::View(ViewCmd::SetFilter(Some(String::new())))]
+        );
+    }
+
+    #[test]
+    fn every_way_out_of_the_box_leaves_the_tree_whole() {
+        // `None` and not `Some("")`: a filter that outlived its box would hide
+        // rows with nothing on screen to explain why.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        c.filter = Some("users");
+        for key in [KeyCode::Esc, KeyCode::Enter] {
+            assert_eq!(
+                on_key(press(key), &c),
+                [Intent::View(ViewCmd::SetFilter(None))],
+                "{key:?}"
+            );
+        }
+        // And the pointer's way out, which is the only thing a pointer can do
+        // to a box it cannot type into.
+        assert_eq!(
+            on_mouse(Target::Button(ButtonId::Filter), Gesture::Click, &c),
+            [Intent::View(ViewCmd::SetFilter(None))]
+        );
+    }
+
+    #[test]
+    fn backspace_empties_the_box_and_then_closes_it() {
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        c.filter = Some("us");
+        assert_eq!(
+            on_key(press(KeyCode::Backspace), &c),
+            [Intent::View(ViewCmd::SetFilter(Some("u".to_owned())))]
+        );
+        // On an empty box there is nothing to delete, and closing is where the
+        // user's fingers already are.
+        c.filter = Some("");
+        assert_eq!(
+            on_key(press(KeyCode::Backspace), &c),
+            [Intent::View(ViewCmd::SetFilter(None))]
+        );
+    }
+
+    #[test]
+    fn a_row_the_filter_removed_is_not_reached_through_the_tree() {
+        // Row numbers are positions on screen. Read straight out of the tree
+        // they keep meaning whatever sits at that index, so a click lands on a
+        // relation that is not drawn — and `Enter` opens it.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        assert!(
+            !on_mouse(Target::TreeRow { index: 1 }, Gesture::DoubleClick, &c).is_empty(),
+            "row 1 is `users` with the tree whole"
+        );
+
+        // `public` matches and `users` does not, so only row 0 is left.
+        c.filter = Some("public");
+        assert!(
+            on_mouse(Target::TreeRow { index: 1 }, Gesture::DoubleClick, &c).is_empty(),
+            "row 1 is not on screen and must not act on anything"
+        );
+    }
+
+    #[test]
     fn shift_tab_moves_focus_the_other_way() {
         let f = fixture();
         let c = f.ctx(PaneId::Grid);
@@ -1441,6 +1595,7 @@ mod tests {
             tabs: &[],
             active_tab: None,
             toasts: &[],
+            filter: None,
         };
         for code in [
             KeyCode::Char('s'),
@@ -1616,10 +1771,16 @@ mod tests {
         ] {
             for selection in [None, Some(0), Some(1)] {
                 for modal_open in [false, true] {
-                    let mut c = f.ctx(focus);
-                    c.tree_selection = selection;
-                    c.modal_open = modal_open;
-                    out.push(c);
+                    // The search box included: a binding in `Context::Filter`
+                    // can only fire while it is open, and a sweep that never
+                    // opens it would report those bindings as dead.
+                    for filter in [None, Some("")] {
+                        let mut c = f.ctx(focus);
+                        c.tree_selection = selection;
+                        c.modal_open = modal_open;
+                        c.filter = filter;
+                        out.push(c);
+                    }
                 }
             }
         }

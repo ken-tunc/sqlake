@@ -22,7 +22,7 @@ use sqlake_core::profile::ProfileColor;
 
 use crate::chrome;
 use crate::grid::{display_width, sanitise};
-use crate::hit::{HitMap, PaneId, Target, Z_CONTENT};
+use crate::hit::{ButtonId, HitMap, PaneId, Target, Z_CONTENT};
 use crate::ui::TreeUi;
 
 /// Cells of indent per level.
@@ -30,6 +30,53 @@ const INDENT: u16 = 2;
 
 /// The toggle column, wide enough to hit and to hold the widest glyph.
 const TOGGLE_WIDTH: u16 = 2;
+
+/// Which rows the filter leaves on screen, as indices into the flattened tree.
+///
+/// A node stays if it matches, and also if anything under it does: a table
+/// called `users` with its dataset hidden would be a row with no path to it,
+/// and the level names are half of what a path means. Nothing is fetched to
+/// find out — the tree is lazy, and reaching into unloaded nodes would put a
+/// network round trip, and on BigQuery a bill, behind every keystroke.
+///
+/// The match is case-insensitive and on the label alone. Matching the whole
+/// path instead would make one dataset's name select every table under it,
+/// which is what expanding the dataset already does.
+#[must_use]
+pub fn visible(nodes: &[VisibleNode], filter: Option<&str>) -> Vec<usize> {
+    let Some(needle) = filter else {
+        return (0..nodes.len()).collect();
+    };
+    // The box right after `/`, and a shortcut rather than a rule: `contains`
+    // on an empty needle is true of everything, so the walk below would reach
+    // the same answer. What it would also do is lower-case every label in the
+    // tree, on every frame, to decide nothing.
+    if needle.is_empty() {
+        return (0..nodes.len()).collect();
+    }
+    let needle = needle.to_lowercase();
+
+    // Backwards, because whether a node stays depends on its descendants, and
+    // in a flattened tree those are the rows after it that are deeper. The
+    // shallowest depth kept so far is all that has to be carried: a row is an
+    // ancestor of something kept exactly when it is shallower than that, and
+    // it is never *un*-kept by a row further right.
+    let mut kept = Vec::new();
+    let mut shallowest_kept: Option<u16> = None;
+    for (index, node) in nodes.iter().enumerate().rev() {
+        // `None` and not `u16::MAX`: with nothing kept yet there is no
+        // descendant to be an ancestor of, and a sentinel deeper than every
+        // depth answers that question the other way round — which keeps the
+        // last row of the tree whatever it says.
+        let holds_a_match = shallowest_kept.is_some_and(|depth| depth > node.depth);
+        if holds_a_match || node.label.to_lowercase().contains(&needle) {
+            kept.push(index);
+            shallowest_kept = Some(shallowest_kept.map_or(node.depth, |d| d.min(node.depth)));
+        }
+    }
+    kept.reverse();
+    kept
+}
 
 /// Draw the explorer's contents into `area`, which is the inside of its pane.
 ///
@@ -42,10 +89,24 @@ pub fn render(
     area: Rect,
     snapshot: &Snapshot,
     ui: &TreeUi,
+    filter: Option<&str>,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    // The box takes the top line whether or not anything matches: a search
+    // that hid its own text as soon as it stopped matching would look like the
+    // client had lost the keystroke.
+    let area = match filter {
+        Some(text) => {
+            render_filter(frame, hits, Rect::new(area.x, area.y, area.width, 1), text);
+            if area.height == 1 {
+                return;
+            }
+            Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+        }
+        None => area,
+    };
     let view = &snapshot.explorer;
     if view.is_empty() {
         // Wrapped, because the explorer is twelve columns wide at the smallest
@@ -70,9 +131,21 @@ pub fn render(
         area
     };
 
+    let rows = visible(&view.nodes, filter);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no match ").style(Style::new().fg(Color::DarkGray)),
+            rows_area,
+        );
+        return;
+    }
+
     let height = rows_area.height as usize;
-    for (line, index) in (ui.offset..view.len().min(ui.offset.saturating_add(height))).enumerate() {
-        let Some(node) = view.get(index) else {
+    for (line, index) in (ui.offset..rows.len().min(ui.offset.saturating_add(height))).enumerate() {
+        // `index` is the row on screen and `rows[index]` is the node it stands
+        // for. Every hit target is recorded with the first, because that is
+        // what a later click will arrive as.
+        let Some(node) = rows.get(index).and_then(|&node| view.get(node)) else {
             break;
         };
         let y = rows_area.y + u16::try_from(line).unwrap_or(u16::MAX);
@@ -102,8 +175,26 @@ pub fn render(
     }
 
     if bar {
-        chrome::scrollbar(frame, hits, area, PaneId::Explorer, ui.offset, view.len());
+        chrome::scrollbar(frame, hits, area, PaneId::Explorer, ui.offset, rows.len());
     }
+}
+
+/// The search box, drawn whether or not it has anything in it yet.
+fn render_filter(frame: &mut Frame<'_>, hits: &mut HitMap, row: Rect, text: &str) {
+    hits.push(row, Z_CONTENT, Target::Button(ButtonId::Filter));
+    let shown = chrome::fit(&sanitise(text), row.width.saturating_sub(2));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/", Style::new().fg(Color::DarkGray)),
+            Span::styled(shown, Style::new().fg(Color::White)),
+            // A block where the next character goes. The terminal's own cursor
+            // is parked off-screen while the TUI is up, so without this there
+            // is nothing to say the box is taking input.
+            Span::styled("▏", Style::new().fg(Color::Cyan)),
+        ]))
+        .style(Style::new().bg(Color::Black)),
+        row,
+    );
 }
 
 fn render_row(
@@ -300,10 +391,29 @@ mod tests {
     }
 
     fn draw_buffer_of(snapshot: &Snapshot, ui: &TreeUi, w: u16, h: u16) -> (Buffer, HitMap) {
+        draw_filtered(snapshot, ui, w, h, None)
+    }
+
+    fn draw_filtered(
+        snapshot: &Snapshot,
+        ui: &TreeUi,
+        w: u16,
+        h: u16,
+        filter: Option<&str>,
+    ) -> (Buffer, HitMap) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), snapshot, ui))
+            .draw(|frame| {
+                render(
+                    frame,
+                    &mut hits,
+                    Rect::new(0, 0, w, h),
+                    snapshot,
+                    ui,
+                    filter,
+                );
+            })
             .unwrap();
         (terminal.backend().buffer().clone(), hits)
     }
@@ -311,6 +421,149 @@ mod tests {
     fn draw(view: &TreeView, ui: &TreeUi, w: u16, h: u16) -> (String, HitMap) {
         let (rows, hits) = draw_rows(view, ui, w, h);
         (rows.concat(), hits)
+    }
+
+    fn flat(rows: &[(u16, &str)]) -> Vec<VisibleNode> {
+        rows.iter()
+            .map(|(depth, label)| VisibleNode {
+                conn: sqlake_core::id::ConnId::new(),
+                depth: *depth,
+                label: (*label).to_owned(),
+                node_ref: NodeRef::new(NodeKind::Namespace, [*label]),
+                relation_kind: None,
+                state: NodeState::Collapsed,
+            })
+            .collect()
+    }
+
+    fn kept<'a>(nodes: &'a [VisibleNode], filter: Option<&str>) -> Vec<&'a str> {
+        visible(nodes, filter)
+            .into_iter()
+            .map(|index| nodes[index].label.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn no_filter_and_an_empty_one_show_the_whole_tree() {
+        // An empty box is the state right after `/`, and hiding everything
+        // then would make the feature look broken before a letter is typed.
+        let nodes = flat(&[(0, "prod"), (1, "public"), (2, "users")]);
+        assert_eq!(kept(&nodes, None), ["prod", "public", "users"]);
+        assert_eq!(kept(&nodes, Some("")), ["prod", "public", "users"]);
+    }
+
+    #[test]
+    fn a_match_brings_its_ancestors_with_it() {
+        // A table with its dataset hidden is a row with no path to it, and the
+        // level names are half of what a path means.
+        let nodes = flat(&[
+            (0, "prod"),
+            (1, "public"),
+            (2, "users"),
+            (2, "orders"),
+            (1, "analytics"),
+            (2, "events"),
+        ]);
+        assert_eq!(kept(&nodes, Some("orders")), ["prod", "public", "orders"]);
+    }
+
+    #[test]
+    fn a_branch_with_nothing_under_it_goes() {
+        // The case a naive "keep every ancestor" gets wrong: `public` is an
+        // ancestor of a kept row, `analytics` is only an ancestor of the row
+        // that was dropped.
+        let nodes = flat(&[
+            (0, "prod"),
+            (1, "public"),
+            (2, "users"),
+            (1, "analytics"),
+            (2, "events"),
+        ]);
+        assert_eq!(kept(&nodes, Some("users")), ["prod", "public", "users"]);
+    }
+
+    #[test]
+    fn a_match_under_a_later_branch_keeps_the_root() {
+        // Walking backwards, the run that kept `analytics` is interrupted by
+        // rows that were dropped; the root is still an ancestor of it.
+        let nodes = flat(&[
+            (0, "prod"),
+            (1, "public"),
+            (2, "users"),
+            (1, "analytics"),
+            (2, "hits"),
+        ]);
+        assert_eq!(kept(&nodes, Some("hits")), ["prod", "analytics", "hits"]);
+    }
+
+    #[test]
+    fn a_branch_that_matches_keeps_what_is_under_it() {
+        // Matching a dataset shows the dataset, not its tables: opening it is
+        // what shows those, and a filter that expanded on a keystroke is the
+        // one thing the tree is lazy to avoid.
+        let nodes = flat(&[(0, "prod"), (1, "public"), (2, "users")]);
+        assert_eq!(kept(&nodes, Some("public")), ["prod", "public"]);
+    }
+
+    #[test]
+    fn every_connection_is_searched_and_the_ones_that_miss_go() {
+        let nodes = flat(&[(0, "prod"), (1, "public"), (0, "staging"), (1, "reporting")]);
+        assert_eq!(kept(&nodes, Some("report")), ["staging", "reporting"]);
+    }
+
+    #[test]
+    fn the_match_is_case_insensitive() {
+        let nodes = flat(&[(0, "prod"), (1, "Users")]);
+        assert_eq!(kept(&nodes, Some("users")), ["prod", "Users"]);
+        assert_eq!(kept(&nodes, Some("USERS")), ["prod", "Users"]);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_keeps_nothing() {
+        let nodes = flat(&[(0, "prod"), (1, "public")]);
+        assert!(kept(&nodes, Some("zzz")).is_empty());
+    }
+
+    #[test]
+    fn the_box_is_drawn_even_when_nothing_matches() {
+        // Otherwise the pane goes blank as soon as the search stops matching,
+        // and the text that caused it goes with it.
+        let view = tree(flat(&[(0, "prod"), (1, "public")]));
+        let snapshot = Snapshot {
+            explorer: std::sync::Arc::new(view),
+            ..Snapshot::default()
+        };
+        let (buffer, _) = draw_filtered(&snapshot, &TreeUi::default(), 20, 4, Some("zzz"));
+        let text: String = (0..4)
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_owned())
+            .collect();
+        assert!(text.contains("zzz"), "{text}");
+        assert!(text.contains("no match"), "{text}");
+    }
+
+    #[test]
+    fn a_row_is_hit_by_where_it_is_on_screen() {
+        // The filter renumbers the rows, and a hit target carrying the node's
+        // position in the unfiltered tree would open whatever happened to sit
+        // at that index.
+        let view = tree(flat(&[
+            (0, "prod"),
+            (1, "public"),
+            (2, "users"),
+            (1, "analytics"),
+            (2, "hits"),
+        ]));
+        let snapshot = Snapshot {
+            explorer: std::sync::Arc::new(view),
+            ..Snapshot::default()
+        };
+        let (_, hits) = draw_filtered(&snapshot, &TreeUi::default(), 20, 5, Some("hits"));
+        // Row 0 is the box; `prod`, `analytics`, `hits` follow.
+        assert_eq!(
+            hits.at(Position::new(1, 3)),
+            Some(Target::TreeRow { index: 2 })
+        );
     }
 
     fn tree(nodes: Vec<VisibleNode>) -> TreeView {

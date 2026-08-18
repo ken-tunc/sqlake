@@ -73,6 +73,9 @@ pub enum ButtonId {
     Cancel(BusyId),
     /// The modal's own way out, for a pointer that never goes near `Esc`.
     DismissModal,
+    /// The explorer's search box. Clicking it closes it, which is the only
+    /// thing a pointer can usefully do to a box it cannot type into.
+    Filter,
 }
 
 /// What a rectangle on screen belongs to.
