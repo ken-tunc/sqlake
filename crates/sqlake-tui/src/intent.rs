@@ -190,7 +190,10 @@ impl IntentKind {
             Intent::App(action) => match action {
                 Action::Connect(_) => Self::Connect,
                 Action::Disconnect(_) => Self::Disconnect,
-                Action::ToggleNode { .. } => Self::ToggleNode,
+                // Paired with `Action::ToggleNode`: one capability, "open a
+                // node". The TUI never sends the idempotent form — it has the
+                // row in front of it.
+                Action::ToggleNode { .. } | Action::ExpandNode { .. } => Self::ToggleNode,
                 Action::PreviewTable { .. } => Self::PreviewTable,
                 Action::SortPreview { .. } => Self::SortPreview,
                 Action::LoadMore { .. } => Self::LoadMore,

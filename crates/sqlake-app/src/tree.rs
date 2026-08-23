@@ -154,6 +154,34 @@ impl TreeState {
         }
     }
 
+    /// Expand, never collapse.
+    ///
+    /// `toggle` on an already-expanded node hides it, which is the wrong answer
+    /// to "show me what is in here" from a caller that could not see it was
+    /// open.
+    pub fn expand(&mut self, node: &NodeRef) -> Toggle {
+        if matches!(self.status.get(node), Some(NodeState::Expanded)) {
+            return Toggle::Local;
+        }
+        self.toggle(node)
+    }
+
+    /// Whether the tree holds this node at all.
+    ///
+    /// A node that nothing has loaded has nowhere to report anything: `flatten`
+    /// walks what is loaded, so neither its spinner nor its error would ever be
+    /// drawn, and the fetch it started would surface only as a busy row naming
+    /// a node that does not exist.
+    #[must_use]
+    pub fn contains(&self, node: &NodeRef) -> bool {
+        node.path.is_empty()
+            || self
+                .loaded
+                .values()
+                .flatten()
+                .any(|child| &child.node_ref == node)
+    }
+
     fn has_failed(&self, node: &NodeRef) -> bool {
         matches!(self.status.get(node), Some(NodeState::Failed(_)))
     }
@@ -266,6 +294,50 @@ mod tests {
             .iter()
             .map(|n| (n.depth, n.label.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn expanding_a_loaded_node_asks_for_nothing() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        assert_eq!(t.expand(&public), Toggle::Load);
+        t.finish_load(&public, Ok(vec![table("public", "users")]));
+        assert_eq!(t.expand(&public), Toggle::Local);
+    }
+
+    #[test]
+    fn expanding_never_closes_what_is_open() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        t.expand(&public);
+        t.finish_load(&public, Ok(vec![table("public", "users")]));
+
+        t.expand(&public);
+        assert_eq!(labels(&t.flatten(conn())).len(), 3);
+        // The gesture this is not: a caller that can see the row gets to close
+        // it again.
+        t.toggle(&public);
+        assert_eq!(labels(&t.flatten(conn())).len(), 2);
+    }
+
+    #[test]
+    fn expanding_a_failed_node_retries_it() {
+        let mut t = state_with_roots();
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        t.expand(&public);
+        t.finish_load(&public, Err("permission denied".to_owned()));
+        assert_eq!(t.expand(&public), Toggle::Load);
+    }
+
+    #[test]
+    fn a_node_nothing_loaded_is_not_in_the_tree() {
+        let t = state_with_roots();
+        assert!(t.contains(&NodeRef::new(NodeKind::Namespace, ["public"])));
+        assert!(t.contains(&NodeRef::root()));
+        assert!(!t.contains(&NodeRef::new(NodeKind::Namespace, ["ghost"])));
+        // Loaded, but only as a parent: its own children are what `loaded`
+        // holds under it, and being a key there is not being a node.
+        assert!(!t.contains(&NodeRef::new(NodeKind::Relation, ["public", "users"])));
     }
 
     #[test]

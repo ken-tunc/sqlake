@@ -188,6 +188,13 @@ fn root_state(conn: &Conn) -> NodeState {
     }
 }
 
+/// Whether opening a node may also close it.
+#[derive(Debug, Clone, Copy)]
+enum Open {
+    Toggle,
+    ExpandOnly,
+}
+
 /// A page request that has gone out and not yet come back.
 ///
 /// The preview keeps this rather than optimistically advancing `page`, so
@@ -209,6 +216,8 @@ struct Preview {
     sort: Option<Sort>,
     /// The last page successfully loaded, never a page merely asked for.
     page: PageRequest,
+    /// How wide the relation turned out to be. `None` until a page lands.
+    columns: Option<usize>,
     pending: Option<PendingPage>,
     data: LoadState<Arc<PagedResult>>,
     loaded_rows: usize,
@@ -318,7 +327,8 @@ impl Runtime {
         match action {
             Action::Connect(profile) => self.connect(&profile),
             Action::Disconnect(id) => self.disconnect(id),
-            Action::ToggleNode { conn, node } => self.toggle_node(conn, node),
+            Action::ToggleNode { conn, node } => self.open_node(conn, node, Open::Toggle),
+            Action::ExpandNode { conn, node } => self.open_node(conn, node, Open::ExpandOnly),
             Action::PreviewTable { conn, table } => self.preview_table(conn, table),
             Action::SortPreview {
                 conn,
@@ -433,14 +443,17 @@ impl Runtime {
         self.previews.retain(|p| p.conn != id);
     }
 
-    fn toggle_node(&mut self, conn_id: ConnId, node: NodeRef) {
+    fn open_node(&mut self, conn_id: ConnId, node: NodeRef, how: Open) {
         // The connection's own row. Its children arrived with `Connect`, so
         // this is opening and closing rather than fetching — and it works on a
         // connection that failed, which is the only way to get its error off
         // the screen without disconnecting.
         if node.path.is_empty() {
             if let Some(conn) = self.conn_mut(conn_id) {
-                conn.expanded = !conn.expanded;
+                conn.expanded = match how {
+                    Open::Toggle => !conn.expanded,
+                    Open::ExpandOnly => true,
+                };
             }
             return;
         }
@@ -452,7 +465,20 @@ impl Runtime {
             return;
         };
 
-        let outcome = conn.tree.toggle(&node);
+        // A front-end takes this from a row it drew, so it is always a node the
+        // tree holds. One arriving over a socket need not be, and an unknown
+        // node is worse than a wasted round trip: the reply has nowhere to land,
+        // so all anyone sees is "expanding …" naming something that is not
+        // there.
+        if !conn.tree.contains(&node) {
+            tracing::warn!(%node, "expand: no such node");
+            return;
+        }
+
+        let outcome = match how {
+            Open::Toggle => conn.tree.toggle(&node),
+            Open::ExpandOnly => conn.tree.expand(&node),
+        };
         conn.view = Arc::new(conn.tree.flatten(conn.id));
         if outcome == Toggle::Local {
             return;
@@ -480,6 +506,15 @@ impl Runtime {
     }
 
     fn preview_table(&mut self, conn_id: ConnId, table: TableRef) {
+        // Not checked against the tree, unlike a node: a preview is its own
+        // place to report a failure, so a relation that is not there comes back
+        // as the database's own answer rather than as this store's guess from a
+        // cache of whatever happens to have been expanded. An empty path is
+        // refused because it names nothing to answer about.
+        if table.path.is_empty() {
+            tracing::warn!("preview: a relation with no name");
+            return;
+        }
         if self.session(conn_id).is_none() {
             return;
         }
@@ -508,6 +543,7 @@ impl Runtime {
             table: table.clone(),
             sort: None,
             page,
+            columns: None,
             pending: None,
             data: LoadState::Loading,
             loaded_rows: 0,
@@ -535,6 +571,18 @@ impl Runtime {
         let Some(preview) = self.preview_mut(conn_id, &table) else {
             return;
         };
+        // A column index the view computed came from a grid it drew; one that
+        // arrived over a socket did not. Unchecked it sticks to the preview,
+        // and `preview_table`'s retry re-issues the same rejected ordering for
+        // as long as the preview lives.
+        //
+        // Only checkable once a page has landed. Refusing before that would
+        // also refuse sorting a preview whose first page failed — the retry is
+        // exactly where the ordering has to be kept.
+        if preview.columns.is_some_and(|n| column >= n) {
+            tracing::warn!(%table, column, "sort: no such column");
+            return;
+        }
         // The store owns the direction. Deriving it in the view would race
         // with a sort already in flight.
         let dir = match preview.sort {
@@ -807,6 +855,7 @@ impl Runtime {
                     };
                     preview.page = page;
                     let rows = Arc::new(rows);
+                    preview.columns = Some(rows.columns().len());
                     preview.loaded_rows = rows.row_count();
                     preview.data = LoadState::Ready(rows);
                 }
@@ -1241,6 +1290,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expanding_leaves_an_open_node_open() {
+        // A toggle is a statement about a state the caller can see. This
+        // caller cannot, and in a session somebody else is clicking in, the
+        // node can be opened between the read and the dispatch.
+        let (store, mut rx, conn) = connected_store().await;
+        let public = NodeRef::new(NodeKind::Namespace, ["public"]);
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: public.clone(),
+        });
+        until(&mut rx, |s| s.tree(conn).count() > 3).await;
+
+        store.dispatch(Action::ExpandNode { conn, node: public });
+        // A collapse needs no round trip, so it would already have happened by
+        // the time this second expansion has anything to show.
+        store.dispatch(Action::ExpandNode {
+            conn,
+            node: NodeRef::new(NodeKind::Namespace, ["analytics"]),
+        });
+        let snap = until(&mut rx, |s| {
+            s.tree(conn).any(|n| n.label == "daily_summary")
+        })
+        .await;
+        assert!(snap.tree(conn).any(|n| n.label == "users"));
+    }
+
+    #[tokio::test]
+    async fn expanding_a_connections_own_row_opens_it_and_leaves_it_open() {
+        let (store, mut rx, conn) = connected_store().await;
+        let root = NodeRef::root();
+        store.dispatch(Action::ToggleNode {
+            conn,
+            node: root.clone(),
+        });
+        until(&mut rx, |s| s.tree(conn).count() == 0).await;
+
+        store.dispatch(Action::ExpandNode {
+            conn,
+            node: root.clone(),
+        });
+        store.dispatch(Action::ExpandNode { conn, node: root });
+        store.dispatch(Action::Quit);
+        let snap = until(&mut rx, |s| s.should_quit).await;
+        assert_eq!(snap.tree(conn).count(), 3);
+    }
+
+    #[tokio::test]
+    async fn expanding_a_node_the_tree_never_heard_of_asks_for_nothing() {
+        // Unreachable from a front-end holding the row. The cost of letting it
+        // through is not a wasted round trip but a reply with nowhere to land:
+        // the node is invisible either way, so all the user would see is
+        // "expanding ghost" in the status bar.
+        let (store, mut rx, conn) = connected_store().await;
+        store.dispatch(Action::ExpandNode {
+            conn,
+            node: NodeRef::new(NodeKind::Namespace, ["ghost"]),
+        });
+        store.dispatch(Action::Quit);
+        let snap = until(&mut rx, |s| s.should_quit).await;
+        assert!(snap.busy.is_empty(), "{:?}", snap.busy);
+    }
+
+    #[tokio::test]
+    async fn previewing_a_relation_with_no_name_asks_for_nothing() {
+        let (store, mut rx, conn) = connected_store().await;
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: TableRef::new([] as [&str; 0]),
+        });
+        store.dispatch(Action::Quit);
+        let snap = until(&mut rx, |s| s.should_quit).await;
+        assert!(snap.previews.is_empty());
+    }
+
+    #[tokio::test]
     async fn previewing_fills_a_preview_for_that_relation() {
         let (store, mut rx, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
@@ -1407,6 +1531,43 @@ mod tests {
                 .row_count(),
             50
         );
+    }
+
+    #[tokio::test]
+    async fn sorting_by_a_column_that_is_not_there_is_refused() {
+        // The mock answers "out of range", as a real engine does. Passed
+        // through, the ordering would stick to the preview, so every later
+        // request — including the retry `PreviewTable` is — would carry it and
+        // fail the same way for as long as the preview lived.
+        let (store, mut rx, conn) = connected_store().await;
+        let table = TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let width = preview_of(&snap, conn, &table)
+            .data
+            .ready()
+            .unwrap()
+            .columns()
+            .len();
+
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: width,
+        });
+        store.dispatch(Action::Quit);
+        let snap = until(&mut rx, |s| s.should_quit).await;
+
+        let preview = preview_of(&snap, conn, &table);
+        assert!(preview.sort.is_none());
+        assert!(preview.data.ready().is_some(), "{:?}", preview.data);
     }
 
     #[tokio::test]
