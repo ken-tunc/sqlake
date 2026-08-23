@@ -168,10 +168,11 @@ impl TreeState {
 
     /// Whether the tree holds this node at all.
     ///
-    /// A node that nothing has loaded has nowhere to report anything: `flatten`
-    /// walks what is loaded, so neither its spinner nor its error would ever be
-    /// drawn, and the fetch it started would surface only as a busy row naming
-    /// a node that does not exist.
+    /// A node is one some parent's children name — being a key of `loaded` is
+    /// being a parent, not being a node. Anything else has nowhere to report:
+    /// its spinner and its error hang off a row `flatten` never emits, so a
+    /// fetch started for it would surface only as a busy row naming a node that
+    /// does not exist.
     #[must_use]
     pub fn contains(&self, node: &NodeRef) -> bool {
         node.path.is_empty()
@@ -331,13 +332,19 @@ mod tests {
 
     #[test]
     fn a_node_nothing_loaded_is_not_in_the_tree() {
-        let t = state_with_roots();
+        let mut t = state_with_roots();
         assert!(t.contains(&NodeRef::new(NodeKind::Namespace, ["public"])));
         assert!(t.contains(&NodeRef::root()));
         assert!(!t.contains(&NodeRef::new(NodeKind::Namespace, ["ghost"])));
-        // Loaded, but only as a parent: its own children are what `loaded`
-        // holds under it, and being a key there is not being a node.
+        // Nothing has loaded `public`'s children, so nothing under it is a node
+        // yet.
         assert!(!t.contains(&NodeRef::new(NodeKind::Relation, ["public", "users"])));
+
+        // Loaded, but only as a parent: its children are what `loaded` holds
+        // under it, and being a key there is not being a node.
+        let ghost = NodeRef::new(NodeKind::Namespace, ["ghost"]);
+        t.finish_load(&ghost, Ok(vec![table("ghost", "users")]));
+        assert!(!t.contains(&ghost));
     }
 
     #[test]

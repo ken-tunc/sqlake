@@ -576,10 +576,14 @@ impl Runtime {
         // and `preview_table`'s retry re-issues the same rejected ordering for
         // as long as the preview lives.
         //
-        // Only checkable once a page has landed. Refusing before that would
-        // also refuse sorting a preview whose first page failed — the retry is
-        // exactly where the ordering has to be kept.
-        if preview.columns.is_some_and(|n| column >= n) {
+        // Until a page has landed the width is unknown, and column 0 is then
+        // the only index that cannot be wrong for a relation with any columns
+        // at all. It is also the only one a front-end can reach, having no grid
+        // to have selected a cell in — so treating the unknown width as 1
+        // refuses nothing anybody can ask for, and still lets a preview whose
+        // first page failed be sorted, which is where a retry has to keep the
+        // ordering the header is showing.
+        if column >= preview.columns.unwrap_or(1) {
             tracing::warn!(%table, column, "sort: no such column");
             return;
         }
@@ -1568,6 +1572,44 @@ mod tests {
         let preview = preview_of(&snap, conn, &table);
         assert!(preview.sort.is_none());
         assert!(preview.data.ready().is_some(), "{:?}", preview.data);
+    }
+
+    #[tokio::test]
+    async fn a_preview_that_has_never_loaded_can_still_only_be_sorted_by_column_zero() {
+        // The state the width is unknown in, and the one the loop lived in: a
+        // sort accepted here would ride every later request, including the
+        // retry that is the only way back.
+        let store = store(Behaviour {
+            flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 1)],
+            ..Behaviour::instant()
+        });
+        let (store, mut rx, conn) = connected(store).await;
+        let table = TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.error().is_some())
+        })
+        .await;
+
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 99,
+        });
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let snap = until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        assert!(preview_of(&snap, conn, &table).sort.is_none());
     }
 
     #[tokio::test]
