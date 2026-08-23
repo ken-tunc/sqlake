@@ -60,9 +60,34 @@ impl Drivers {
     }
 }
 
+/// Where an action sits in the queue.
+///
+/// Returned by [`Store::dispatch`] so a caller can tell a snapshot published
+/// after its action from one published before. Without it every wait starts by
+/// examining state that predates what it is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Dispatched(u64);
+
+impl Dispatched {
+    #[must_use]
+    pub const fn ordinal(self) -> u64 {
+        self.0
+    }
+}
+
+/// The counter and the sender move together on purpose: an ordinal handed out
+/// before a send that another thread wins is an ordinal for somebody else's
+/// action. Once the socket server exists, dispatching concurrently is the
+/// normal case rather than a corner of one.
+#[derive(Debug)]
+struct Queue {
+    sent: u64,
+    actions: mpsc::UnboundedSender<Action>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
-    actions: mpsc::UnboundedSender<Action>,
+    queue: Arc<std::sync::Mutex<Queue>>,
     snapshots: watch::Receiver<Arc<Snapshot>>,
 }
 
@@ -97,20 +122,31 @@ impl Store {
             next_id: 1,
             should_quit: false,
             rev: 0,
+            applied: 0,
         };
         tokio::spawn(runtime.run(action_rx, event_rx, snapshot_tx));
 
         Self {
-            actions: action_tx,
+            queue: Arc::new(std::sync::Mutex::new(Queue {
+                sent: 0,
+                actions: action_tx,
+            })),
             snapshots: snapshot_rx,
         }
     }
 
     /// Non-blocking on purpose: the render loop must never await.
-    pub fn dispatch(&self, action: Action) {
+    pub fn dispatch(&self, action: Action) -> Dispatched {
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.sent += 1;
         // A closed store means the process is shutting down; dropping the
-        // action is the correct response.
-        let _ = self.actions.send(action);
+        // action is the correct response. The ordinal is still handed back, and
+        // the wait it belongs to ends as `Stopped`.
+        let _ = queue.actions.send(action);
+        Dispatched(queue.sent)
     }
 
     #[must_use]
@@ -237,6 +273,7 @@ struct Runtime {
     next_id: u64,
     should_quit: bool,
     rev: u64,
+    applied: u64,
 }
 
 impl Runtime {
@@ -255,6 +292,7 @@ impl Runtime {
                     // actor — and its database connection — alive.
                     let Some(action) = action else { break };
                     tracing::debug!(%action, "action");
+                    self.applied += 1;
                     self.apply(action);
                 }
                 Some(event) = events.recv() => self.handle(event),
@@ -348,9 +386,10 @@ impl Runtime {
         // The caller names its own connection, so a duplicate is a caller that
         // has lost track of one it already has — not a request for a second
         // window onto the same database, which is what a second `Connect` with
-        // a fresh id is.
+        // a fresh id is. A closed or failed connection keeps its row and so
+        // keeps its id: reopening is a fresh id, not this one back.
         if self.conns.iter().any(|c| c.id == id) {
-            tracing::warn!(%profile, conn = %id.short(), "connect: already open");
+            tracing::warn!(%profile, conn = %id.short(), "connect: that id is taken");
             return;
         }
 
@@ -945,6 +984,7 @@ impl Runtime {
         self.rev += 1;
         Snapshot {
             rev: self.rev,
+            applied: self.applied,
             profiles: Arc::clone(&self.profile_list),
             connections: self
                 .conns
@@ -1049,12 +1089,30 @@ mod tests {
 
     async fn connected(store: Store) -> (Store, ConnId) {
         let conn = ConnId::new();
-        store.dispatch(Action::Connect {
-            profile: pid("mock"),
-            conn,
-        });
-        until(&store, |s| s.connection_settled(conn)).await;
+        settled(
+            &store,
+            Action::Connect {
+                profile: pid("mock"),
+                conn,
+            },
+            move |s| s.connection_settled(conn),
+        )
+        .await;
         (store, conn)
+    }
+
+    /// Dispatch and wait, with a timeout long enough that only a real hang
+    /// trips it. `settled` rather than `until` wherever the condition is one
+    /// the store could also have satisfied before the action.
+    async fn settled(
+        store: &Store,
+        action: Action,
+        done: impl Fn(&Snapshot) -> bool,
+    ) -> Arc<Snapshot> {
+        store
+            .dispatch_and_settle(action, std::time::Duration::from_secs(5), done)
+            .await
+            .expect("the condition never held")
     }
 
     fn preview_of<'a>(snap: &'a Snapshot, conn: ConnId, table: &TableRef) -> &'a PreviewView {
@@ -1234,11 +1292,15 @@ mod tests {
             PageRequest::DEFAULT_LIMIT,
         );
         let conn = ConnId::new();
-        store.dispatch(Action::Connect {
-            profile: pid("unserved"),
-            conn,
-        });
-        let snap = until(&store, |s| s.connection_settled(conn)).await;
+        let snap = settled(
+            &store,
+            Action::Connect {
+                profile: pid("unserved"),
+                conn,
+            },
+            move |s| s.connection_settled(conn),
+        )
+        .await;
         assert_eq!(
             snap.connection(conn).map(|c| c.status.clone()),
             Some(ConnStatus::Failed(

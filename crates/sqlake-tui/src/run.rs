@@ -122,7 +122,9 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                     ui.apply(cmd, &snapshot);
                     dirty = true;
                 }
-                Intent::App(action) => store.dispatch(action),
+                Intent::App(action) => {
+                    store.dispatch(action);
+                }
             }
         }
     }

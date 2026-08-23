@@ -985,6 +985,7 @@ mod tests {
 
         let snapshot = Snapshot {
             rev: 1,
+            applied: 0,
             profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![ConnectionView {
                 id: conn,
