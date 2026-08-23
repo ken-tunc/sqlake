@@ -4,6 +4,12 @@
 //! The store turns one into a use case input, which is where the raw-to-checked
 //! conversion happens.
 //!
+//! Every field here is an input somebody has to check, and the somebody is the
+//! store rather than whichever front-end built it. A front-end takes a column
+//! index from a grid it drew and a `TableRef` from a node its tree loaded, so
+//! it cannot construct most bad actions; one sending these over a socket has
+//! neither, and a check that lives in it is a check only it has.
+//!
 //! Everything here either touches data or performs I/O. Scrolling, selection,
 //! column widths and split positions are *not* actions: they are handled inside
 //! the render loop, because routing them through an async task adds a round
@@ -42,6 +48,18 @@ pub enum Action {
 
     /// Expand or collapse a tree node, fetching its children if needed.
     ToggleNode {
+        conn: ConnId,
+        node: NodeRef,
+    },
+
+    /// Expand a tree node, leaving an already-expanded one alone.
+    ///
+    /// A toggle is a statement about a state the caller can see. A caller that
+    /// cannot — one sending actions over a socket — would have to read the
+    /// snapshot first and decide, and in a session a person is also clicking in
+    /// the state can change between the read and the dispatch. So the
+    /// idempotent form is its own action rather than a flag on `ToggleNode`.
+    ExpandNode {
         conn: ConnId,
         node: NodeRef,
     },
@@ -89,6 +107,7 @@ impl fmt::Display for Action {
             Self::Connect(profile) => write!(f, "connect({profile})"),
             Self::Disconnect(id) => write!(f, "disconnect({})", id.short()),
             Self::ToggleNode { node, .. } => write!(f, "toggle({node})"),
+            Self::ExpandNode { node, .. } => write!(f, "expand({node})"),
             Self::PreviewTable { table, .. } => write!(f, "preview({table})"),
             Self::SortPreview { table, column, .. } => write!(f, "sort({table}, col {column})"),
             Self::LoadMore { table, .. } => write!(f, "load_more({table})"),
