@@ -417,7 +417,7 @@ of its parts becomes possible at a different point:
 
 | # | Lands after | Content |
 | --- | --- | --- |
-| **A1** | M2 | Read-only CLI and socket API. Needs no terminal, and exercises `sqlake-app` through a second front-end while the interactive client is still half-written |
+| **A1** | M2 | Read-only CLI and socket API — [design-a1.md](design-a1.md). Needs no terminal, and exercises `sqlake-app` through a second front-end while the interactive client is still half-written |
 | **A2** | M4 | Query execution over the API, where `ApprovedQuery` and the byte budget arrive |
 | **A3** | A2 | MCP server |
 
