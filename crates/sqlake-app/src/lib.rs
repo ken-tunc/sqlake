@@ -21,6 +21,7 @@ pub mod snapshot;
 pub mod store;
 pub mod tree;
 pub mod usecase;
+pub mod wait;
 
 pub use action::{Action, BusyId};
 pub use error::{AppError, AppResult};
@@ -30,3 +31,4 @@ pub use snapshot::{BusyItem, ConnStatus, ConnectionView, LoadState, PreviewView,
 pub use store::{Drivers, Store};
 pub use tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 pub use usecase::UseCase;
+pub use wait::WaitError;

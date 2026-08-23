@@ -325,7 +325,7 @@ impl Runtime {
 
     fn apply(&mut self, action: Action) {
         match action {
-            Action::Connect(profile) => self.connect(&profile),
+            Action::Connect { profile, conn } => self.connect(&profile, conn),
             Action::Disconnect(id) => self.disconnect(id),
             Action::ToggleNode { conn, node } => self.open_node(conn, node, Open::Toggle),
             Action::ExpandNode { conn, node } => self.open_node(conn, node, Open::ExpandOnly),
@@ -344,7 +344,16 @@ impl Runtime {
         }
     }
 
-    fn connect(&mut self, profile: &ProfileId) {
+    fn connect(&mut self, profile: &ProfileId, id: ConnId) {
+        // The caller names its own connection, so a duplicate is a caller that
+        // has lost track of one it already has — not a request for a second
+        // window onto the same database, which is what a second `Connect` with
+        // a fresh id is.
+        if self.conns.iter().any(|c| c.id == id) {
+            tracing::warn!(%profile, conn = %id.short(), "connect: already open");
+            return;
+        }
+
         // The summary answers both questions a connection needs before its
         // secret has been read: what to call it, and which driver it wants.
         //
@@ -365,7 +374,7 @@ impl Runtime {
                 // driver this build has not shipped yet — so it gets a row,
                 // where every other connection failure already shows up.
                 self.conns.push(Conn {
-                    id: ConnId::new(),
+                    id,
                     expanded: true,
                     profile: summary.id,
                     name: summary.name,
@@ -380,7 +389,6 @@ impl Runtime {
             }
         };
 
-        let id = ConnId::new();
         let name = summary.name.clone();
         self.conns.push(Conn {
             id,
@@ -979,7 +987,6 @@ mod tests {
     use sqlake_core::node::NodeKind;
     use sqlake_core::value::Value;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, NO_SORT};
-    use tokio::sync::watch::Receiver;
 
     use super::*;
     use crate::tree::NodeState;
@@ -1027,40 +1034,27 @@ mod tests {
         }
     }
 
-    /// Wait until `predicate` holds, or fail. Snapshots arrive asynchronously,
-    /// so tests wait for a condition rather than a fixed number of updates.
-    async fn until(
-        rx: &mut Receiver<Arc<Snapshot>>,
-        predicate: impl Fn(&Snapshot) -> bool,
-    ) -> Arc<Snapshot> {
-        for _ in 0..100 {
-            {
-                let snap = rx.borrow_and_update().clone();
-                if predicate(&snap) {
-                    return snap;
-                }
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed())
-                .await
-                .expect("timed out waiting for a snapshot")
-                .expect("store stopped");
-        }
-        panic!("condition never held");
+    /// The same wait a headless caller makes, with a timeout long enough that
+    /// only a real hang trips it.
+    async fn until(store: &Store, done: impl Fn(&Snapshot) -> bool) -> Arc<Snapshot> {
+        store
+            .settle(std::time::Duration::from_secs(5), done)
+            .await
+            .expect("the condition never held")
     }
 
-    async fn connected_store() -> (Store, Receiver<Arc<Snapshot>>, ConnId) {
+    async fn connected_store() -> (Store, ConnId) {
         connected(store(Behaviour::instant())).await
     }
 
-    async fn connected(store: Store) -> (Store, Receiver<Arc<Snapshot>>, ConnId) {
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
-            s.connections.first().is_some_and(ConnectionView::is_ready)
-        })
-        .await;
-        let id = snap.connections[0].id;
-        (store, rx, id)
+    async fn connected(store: Store) -> (Store, ConnId) {
+        let conn = ConnId::new();
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn,
+        });
+        until(&store, |s| s.connection_settled(conn)).await;
+        (store, conn)
     }
 
     fn preview_of<'a>(snap: &'a Snapshot, conn: ConnId, table: &TableRef) -> &'a PreviewView {
@@ -1069,7 +1063,7 @@ mod tests {
 
     #[tokio::test]
     async fn connecting_populates_the_tree() {
-        let (_store, _rx, id) = connected_store().await;
+        let (_store, id) = connected_store().await;
         let _ = id;
     }
 
@@ -1085,11 +1079,16 @@ mod tests {
             Arc::new(MockProfiles::new(["replica", "staging"])),
             PageRequest::DEFAULT_LIMIT,
         );
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("replica")));
-        store.dispatch(Action::Connect(pid("staging")));
+        store.dispatch(Action::Connect {
+            profile: pid("replica"),
+            conn: ConnId::new(),
+        });
+        store.dispatch(Action::Connect {
+            profile: pid("staging"),
+            conn: ConnId::new(),
+        });
 
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.connections.len() == 2 && s.connections.iter().all(ConnectionView::is_ready)
         })
         .await;
@@ -1113,7 +1112,7 @@ mod tests {
             conn: ids[0],
             node: NodeRef::new(NodeKind::Namespace, ["public"]),
         });
-        let snap = until(&mut rx, |s| s.tree(ids[0]).count() > before).await;
+        let snap = until(&store, |s| s.tree(ids[0]).count() > before).await;
         assert_eq!(snap.tree(ids[1]).count(), before);
     }
 
@@ -1127,10 +1126,15 @@ mod tests {
             Arc::new(MockProfiles::new(["replica", "staging"])),
             PageRequest::DEFAULT_LIMIT,
         );
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("replica")));
-        store.dispatch(Action::Connect(pid("staging")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("replica"),
+            conn: ConnId::new(),
+        });
+        store.dispatch(Action::Connect {
+            profile: pid("staging"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.len() == 2 && s.connections.iter().all(ConnectionView::is_ready)
         })
         .await;
@@ -1158,15 +1162,15 @@ mod tests {
         // Collapsing is not disconnecting: the objects were fetched once and
         // must still be there when the row is opened again, without a round
         // trip and without a spinner.
-        let (store, mut rx, conn) = connected_store().await;
-        let before = rx.borrow_and_update().tree(conn).count();
+        let (store, conn) = connected_store().await;
+        let before = store.snapshot().tree(conn).count();
         assert!(before > 0);
 
         store.dispatch(Action::ToggleNode {
             conn,
             node: NodeRef::root(),
         });
-        let snap = until(&mut rx, |s| s.tree(conn).count() == 0).await;
+        let snap = until(&store, |s| s.tree(conn).count() == 0).await;
         assert_eq!(snap.explorer.len(), 1, "the connection's own row stays");
         assert!(!snap.is_busy(), "closing a row is not a fetch");
 
@@ -1174,7 +1178,7 @@ mod tests {
             conn,
             node: NodeRef::root(),
         });
-        let snap = until(&mut rx, |s| s.tree(conn).count() > 0).await;
+        let snap = until(&store, |s| s.tree(conn).count() > 0).await;
         assert_eq!(snap.tree(conn).count(), before);
     }
 
@@ -1186,10 +1190,12 @@ mod tests {
             connect_fails: true,
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
 
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.explorer
                 .nodes
                 .first()
@@ -1203,15 +1209,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_connection_id_the_caller_already_used_opens_nothing() {
+        // The same id twice is a caller that has lost track of a connection it
+        // holds, not a request for a second window onto the database — that is
+        // a second `Connect` with a fresh id, which is the test below.
+        let (store, conn) = connected_store().await;
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn,
+        });
+        store.dispatch(Action::Quit);
+        let snap = until(&store, |s| s.should_quit).await;
+        assert_eq!(snap.connections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_fails_before_it_starts_still_answers_to_its_id() {
+        // The caller is waiting on the id it chose. A failure row under some
+        // other id would leave that wait to time out, reporting a hang for
+        // something that failed immediately.
+        let store = Store::spawn(
+            Drivers::new(),
+            Arc::new(UnservedProfile(DriverKind::Postgres)),
+            PageRequest::DEFAULT_LIMIT,
+        );
+        let conn = ConnId::new();
+        store.dispatch(Action::Connect {
+            profile: pid("unserved"),
+            conn,
+        });
+        let snap = until(&store, |s| s.connection_settled(conn)).await;
+        assert_eq!(
+            snap.connection(conn).map(|c| c.status.clone()),
+            Some(ConnStatus::Failed(
+                "no driver registered for postgres".to_owned()
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn one_profile_can_be_opened_twice() {
         // A second window onto the same database is a real thing to want, so
         // the profile is not an identity the store deduplicates on.
         let store = store(Behaviour::instant());
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        store.dispatch(Action::Connect(pid("mock")));
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
 
-        let snap = until(&mut rx, |s| s.connections.len() == 2).await;
+        let snap = until(&store, |s| s.connections.len() == 2).await;
         assert_ne!(snap.connections[0].id, snap.connections[1].id);
         assert_eq!(snap.connections[0].profile, snap.connections[1].profile);
     }
@@ -1223,10 +1273,12 @@ mod tests {
         // no connection row exists yet, and inventing one for a name that
         // does not exist would misrepresent what was asked for.
         let store = store(Behaviour::instant());
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("typo")));
+        store.dispatch(Action::Connect {
+            profile: pid("typo"),
+            conn: ConnId::new(),
+        });
         store.dispatch(Action::Quit);
-        let snap = until(&mut rx, |s| s.should_quit).await;
+        let snap = until(&store, |s| s.should_quit).await;
         assert!(snap.connections.is_empty());
     }
 
@@ -1237,10 +1289,12 @@ mod tests {
             Arc::new(UnservedProfile(DriverKind::Postgres)),
             PageRequest::DEFAULT_LIMIT,
         );
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("unserved")));
+        store.dispatch(Action::Connect {
+            profile: pid("unserved"),
+            conn: ConnId::new(),
+        });
 
-        let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
+        let snap = until(&store, |s| !s.connections.is_empty()).await;
         assert_eq!(
             snap.connections[0].status,
             ConnStatus::Failed("no driver registered for postgres".to_owned())
@@ -1253,25 +1307,27 @@ mod tests {
             latency: std::time::Duration::from_millis(50),
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
 
         // The user must see that something is happening, with a way to stop it.
-        let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
+        let snap = until(&store, |s| !s.connections.is_empty()).await;
         assert_eq!(snap.connections[0].status, ConnStatus::Connecting);
         assert!(snap.is_busy());
     }
 
     #[tokio::test]
     async fn expanding_a_node_loads_its_children() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let node = NodeRef::new(NodeKind::Namespace, ["public"]);
         store.dispatch(Action::ToggleNode {
             conn,
             node: node.clone(),
         });
 
-        let snap = until(&mut rx, |s| s.tree(conn).count() > 3).await;
+        let snap = until(&store, |s| s.tree(conn).count() > 3).await;
         let rows: Vec<&VisibleNode> = snap.tree(conn).collect();
         assert_eq!(rows[0].state, NodeState::Expanded);
         assert!(rows.iter().any(|n| n.label == "users"));
@@ -1279,16 +1335,16 @@ mod tests {
 
     #[tokio::test]
     async fn collapsing_needs_no_round_trip() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let node = NodeRef::new(NodeKind::Namespace, ["public"]);
         store.dispatch(Action::ToggleNode {
             conn,
             node: node.clone(),
         });
-        until(&mut rx, |s| s.tree(conn).count() > 3).await;
+        until(&store, |s| s.tree(conn).count() > 3).await;
 
         store.dispatch(Action::ToggleNode { conn, node });
-        let snap = until(&mut rx, |s| s.tree(conn).count() == 3).await;
+        let snap = until(&store, |s| s.tree(conn).count() == 3).await;
         let rows: Vec<&VisibleNode> = snap.tree(conn).collect();
         assert_eq!(rows[0].state, NodeState::Collapsed);
     }
@@ -1298,13 +1354,13 @@ mod tests {
         // A toggle is a statement about a state the caller can see. This
         // caller cannot, and in a session somebody else is clicking in, the
         // node can be opened between the read and the dispatch.
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let public = NodeRef::new(NodeKind::Namespace, ["public"]);
         store.dispatch(Action::ToggleNode {
             conn,
             node: public.clone(),
         });
-        until(&mut rx, |s| s.tree(conn).count() > 3).await;
+        until(&store, |s| s.tree(conn).count() > 3).await;
 
         store.dispatch(Action::ExpandNode { conn, node: public });
         // A collapse needs no round trip, so it would already have happened by
@@ -1313,22 +1369,19 @@ mod tests {
             conn,
             node: NodeRef::new(NodeKind::Namespace, ["analytics"]),
         });
-        let snap = until(&mut rx, |s| {
-            s.tree(conn).any(|n| n.label == "daily_summary")
-        })
-        .await;
+        let snap = until(&store, |s| s.tree(conn).any(|n| n.label == "daily_summary")).await;
         assert!(snap.tree(conn).any(|n| n.label == "users"));
     }
 
     #[tokio::test]
     async fn expanding_a_connections_own_row_opens_it_and_leaves_it_open() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let root = NodeRef::root();
         store.dispatch(Action::ToggleNode {
             conn,
             node: root.clone(),
         });
-        until(&mut rx, |s| s.tree(conn).count() == 0).await;
+        until(&store, |s| s.tree(conn).count() == 0).await;
 
         store.dispatch(Action::ExpandNode {
             conn,
@@ -1336,7 +1389,7 @@ mod tests {
         });
         store.dispatch(Action::ExpandNode { conn, node: root });
         store.dispatch(Action::Quit);
-        let snap = until(&mut rx, |s| s.should_quit).await;
+        let snap = until(&store, |s| s.should_quit).await;
         assert_eq!(snap.tree(conn).count(), 3);
     }
 
@@ -1346,38 +1399,38 @@ mod tests {
         // through is not a wasted round trip but a reply with nowhere to land:
         // the node is invisible either way, so all the user would see is
         // "expanding ghost" in the status bar.
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         store.dispatch(Action::ExpandNode {
             conn,
             node: NodeRef::new(NodeKind::Namespace, ["ghost"]),
         });
         store.dispatch(Action::Quit);
-        let snap = until(&mut rx, |s| s.should_quit).await;
+        let snap = until(&store, |s| s.should_quit).await;
         assert!(snap.busy.is_empty(), "{:?}", snap.busy);
     }
 
     #[tokio::test]
     async fn previewing_a_relation_with_no_name_asks_for_nothing() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         store.dispatch(Action::PreviewTable {
             conn,
             table: TableRef::new([] as [&str; 0]),
         });
         store.dispatch(Action::Quit);
-        let snap = until(&mut rx, |s| s.should_quit).await;
+        let snap = until(&store, |s| s.should_quit).await;
         assert!(snap.previews.is_empty());
     }
 
     #[tokio::test]
     async fn previewing_fills_a_preview_for_that_relation() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
 
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -1388,20 +1441,20 @@ mod tests {
 
     #[tokio::test]
     async fn previewing_the_same_relation_twice_does_not_duplicate_it() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| s.previews.len() == 1).await;
+        until(&store, |s| s.previews.len() == 1).await;
 
         store.dispatch(Action::PreviewTable { conn, table });
         store.dispatch(Action::PreviewTable {
             conn,
             table: TableRef::new(["public", "empty"]),
         });
-        let snap = until(&mut rx, |s| s.previews.len() == 2).await;
+        let snap = until(&store, |s| s.previews.len() == 2).await;
         assert_eq!(
             snap.previews.len(),
             2,
@@ -1420,9 +1473,11 @@ mod tests {
             flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 1)],
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1433,7 +1488,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
@@ -1443,7 +1498,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -1459,9 +1514,11 @@ mod tests {
             failing_nodes: vec![vec!["analytics".to_owned(), "broken".to_owned()]],
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1472,7 +1529,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
@@ -1489,13 +1546,13 @@ mod tests {
 
     #[tokio::test]
     async fn sorting_replaces_the_page_rather_than_appending() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -1506,7 +1563,7 @@ mod tests {
             table: table.clone(),
             column: 0,
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table).and_then(|p| p.sort).is_some()
         })
         .await;
@@ -1520,7 +1577,7 @@ mod tests {
             table: table.clone(),
             column: 0,
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .and_then(|p| p.sort)
                 .is_some_and(|s| s.dir == SortDir::Desc)
@@ -1543,13 +1600,13 @@ mod tests {
         // through, the ordering would stick to the preview, so every later
         // request — including the retry `PreviewTable` is — would carry it and
         // fail the same way for as long as the preview lived.
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -1567,7 +1624,7 @@ mod tests {
             column: width,
         });
         store.dispatch(Action::Quit);
-        let snap = until(&mut rx, |s| s.should_quit).await;
+        let snap = until(&store, |s| s.should_quit).await;
 
         let preview = preview_of(&snap, conn, &table);
         assert!(preview.sort.is_none());
@@ -1583,13 +1640,13 @@ mod tests {
             flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 1)],
             ..Behaviour::instant()
         });
-        let (store, mut rx, conn) = connected(store).await;
+        let (store, conn) = connected(store).await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
@@ -1604,7 +1661,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -1622,13 +1679,13 @@ mod tests {
             MockDriver::new(Behaviour::instant()).with_capabilities(NO_SORT),
             PageRequest::DEFAULT_LIMIT,
         );
-        let (store, mut rx, conn) = connected(store).await;
+        let (store, conn) = connected(store).await;
         let table = TableRef::new(["public", "big"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
@@ -1646,7 +1703,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows >= 400)
         })
@@ -1659,13 +1716,13 @@ mod tests {
 
     #[tokio::test]
     async fn two_quick_load_mores_do_not_skip_a_page() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "big"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
@@ -1684,7 +1741,7 @@ mod tests {
             table: table.clone(),
         });
 
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows >= 400)
         })
@@ -1710,9 +1767,11 @@ mod tests {
             failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1723,7 +1782,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
@@ -1733,7 +1792,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.last_error.is_some())
         })
@@ -1759,9 +1818,11 @@ mod tests {
             flaky_nodes: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1772,7 +1833,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
@@ -1785,7 +1846,7 @@ mod tests {
         // Actions are handled in order, so a snapshot that has seen the quit
         // has seen the `LoadMore` — and nothing is loading because of it.
         store.dispatch(Action::Quit);
-        let snap = until(&mut rx, |s| s.should_quit).await;
+        let snap = until(&store, |s| s.should_quit).await;
 
         assert!(snap.busy.is_empty(), "a page went out anyway");
         let preview = preview_of(&snap, conn, &table);
@@ -1801,9 +1862,11 @@ mod tests {
             slow_latency: std::time::Duration::from_secs(30),
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1814,14 +1877,14 @@ mod tests {
             conn,
             node: node.clone(),
         });
-        let snap = until(&mut rx, Snapshot::is_busy).await;
+        let snap = until(&store, Snapshot::is_busy).await;
         let busy = snap.busy[0].id;
 
         store.dispatch(Action::Cancel(busy));
         // The reply is never coming. A node left in `Loading` cannot even be
         // toggled again, so it would be permanently dead rather than merely
         // failed.
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.tree(conn)
                 .any(|n| n.node_ref == node && matches!(n.state, NodeState::Failed(_)))
         })
@@ -1835,32 +1898,34 @@ mod tests {
             latency: std::time::Duration::from_millis(50),
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| !s.connections.is_empty()).await;
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| !s.connections.is_empty()).await;
         let conn = snap.connections[0].id;
 
         store.dispatch(Action::Disconnect(conn));
-        let snap = until(&mut rx, |s| s.connections[0].status == ConnStatus::Closed).await;
+        let snap = until(&store, |s| s.connections[0].status == ConnStatus::Closed).await;
         assert!(!snap.is_busy(), "in-flight work is dropped with it");
 
         // The reply lands after the disconnect. Writing Ready over a closed
         // connection would resurrect it with a live session attached.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let snap = rx.borrow_and_update().clone();
+        let snap = store.snapshot();
         assert_eq!(snap.connections[0].status, ConnStatus::Closed);
         assert_eq!(snap.tree(conn).count(), 0);
     }
 
     #[tokio::test]
     async fn load_more_appends_to_what_is_already_there() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "big"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 200)
         })
@@ -1870,7 +1935,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.loaded_rows == 400)
         })
@@ -1886,9 +1951,11 @@ mod tests {
         // nothing, so every page was the built-in size whatever the file said
         // — a setting the client appears to honour and does not.
         let store = store_paging(Behaviour::instant(), 25);
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1899,7 +1966,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -1912,7 +1979,7 @@ mod tests {
             table: table.clone(),
             column: 0,
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.sort.is_some() && p.data.ready().is_some())
         })
@@ -1926,7 +1993,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table).is_some_and(|p| p.loaded_rows == 50)
         })
         .await;
@@ -1951,9 +2018,11 @@ mod tests {
             flaky_nodes: vec![(vec!["public".to_owned(), "users".to_owned()], 3)],
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -1964,7 +2033,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| {
+        until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.error().is_some())
         })
@@ -1978,7 +2047,7 @@ mod tests {
                 table: table.clone(),
                 column: 0,
             });
-            until(&mut rx, |s| {
+            until(&store, |s| {
                 s.busy.is_empty() && sort_of(s, conn, &table) == Some(dir)
             })
             .await;
@@ -1988,7 +2057,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -2016,9 +2085,11 @@ mod tests {
         // page of no rows and an offset `next_page` never advances, which is a
         // relation that cannot be read and does not say so.
         let store = store_paging(Behaviour::instant(), 0);
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -2029,7 +2100,7 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| {
+        let snap = until(&store, |s| {
             s.preview(conn, &table)
                 .is_some_and(|p| p.data.ready().is_some())
         })
@@ -2055,9 +2126,11 @@ mod tests {
             slow_latency: std::time::Duration::from_secs(30),
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, |s| {
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
         .await;
@@ -2068,13 +2141,13 @@ mod tests {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, Snapshot::is_busy).await;
+        until(&store, Snapshot::is_busy).await;
 
         store.dispatch(Action::ForgetPreview {
             conn,
             table: table.clone(),
         });
-        let snap = until(&mut rx, |s| s.previews.is_empty()).await;
+        let snap = until(&store, |s| s.previews.is_empty()).await;
         assert!(
             snap.busy.is_empty(),
             "the forgotten preview's page is still loading"
@@ -2083,16 +2156,16 @@ mod tests {
 
     #[tokio::test]
     async fn disconnecting_removes_that_connection_s_previews() {
-        let (store, mut rx, conn) = connected_store().await;
+        let (store, conn) = connected_store().await;
         let table = TableRef::new(["public", "users"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
         });
-        until(&mut rx, |s| s.previews.len() == 1).await;
+        until(&store, |s| s.previews.len() == 1).await;
 
         store.dispatch(Action::Disconnect(conn));
-        let snap = until(&mut rx, |s| s.previews.is_empty()).await;
+        let snap = until(&store, |s| s.previews.is_empty()).await;
         assert_eq!(snap.connections[0].status, ConnStatus::Closed);
         assert_eq!(snap.tree(conn).count(), 0);
     }
@@ -2103,27 +2176,27 @@ mod tests {
             latency: std::time::Duration::from_secs(30),
             ..Behaviour::instant()
         });
-        let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(pid("mock")));
-        let snap = until(&mut rx, Snapshot::is_busy).await;
+        store.dispatch(Action::Connect {
+            profile: pid("mock"),
+            conn: ConnId::new(),
+        });
+        let snap = until(&store, Snapshot::is_busy).await;
 
         store.dispatch(Action::Cancel(snap.busy[0].id));
-        let snap = until(&mut rx, |s| !s.is_busy()).await;
+        let snap = until(&store, |s| !s.is_busy()).await;
         assert!(!snap.is_busy());
     }
 
     #[tokio::test]
     async fn quitting_is_visible_in_the_snapshot() {
         let store = store(Behaviour::instant());
-        let mut rx = store.subscribe();
         store.dispatch(Action::Quit);
-        until(&mut rx, |s| s.should_quit).await;
+        until(&store, |s| s.should_quit).await;
     }
 
     #[tokio::test]
     async fn actions_for_unknown_relations_are_ignored() {
         let store = store(Behaviour::instant());
-        let mut rx = store.subscribe();
         let conn = ConnId::new();
         let table = TableRef::new(["public", "ghost"]);
         store.dispatch(Action::LoadMore {
@@ -2136,6 +2209,6 @@ mod tests {
         store.dispatch(Action::Quit);
 
         // The point is that none of the above panicked the store task.
-        until(&mut rx, |s| s.should_quit).await;
+        until(&store, |s| s.should_quit).await;
     }
 }

@@ -15,7 +15,7 @@ use sqlake_core::result::Sort;
 
 use crate::action::BusyId;
 use crate::pages::PagedResult;
-use crate::tree::{TreeView, VisibleNode};
+use crate::tree::{NodeState, TreeView, VisibleNode};
 
 /// Something that is fetched asynchronously.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +158,46 @@ impl Snapshot {
             .nodes
             .iter()
             .filter(move |node| node.conn == id && !node.node_ref.path.is_empty())
+    }
+
+    /// Whether this connection has finished opening, successfully or not.
+    ///
+    /// A connection nothing has heard of is not settled: `Connect` names an id
+    /// the caller chose, so until the store has applied it there is nothing to
+    /// report — and if it refused the profile, there never will be. That is a
+    /// timeout, and it is the honest one: the caller asked for something the
+    /// store will not do, and no other answer is coming.
+    #[must_use]
+    pub fn connection_settled(&self, id: ConnId) -> bool {
+        self.connection(id).is_some_and(|c| {
+            matches!(
+                c.status,
+                ConnStatus::Ready | ConnStatus::Failed(_) | ConnStatus::Closed
+            )
+        })
+    }
+
+    /// Whether this node has finished loading its children, successfully or not.
+    ///
+    /// `Collapsed` is deliberately not settled. It is the state a node is in
+    /// *before* the store applies the expansion, so counting it would let a
+    /// wait return the moment it started, having loaded nothing.
+    #[must_use]
+    pub fn node_settled(&self, conn: ConnId, node: &NodeRef) -> bool {
+        self.tree(conn).any(|n| {
+            &n.node_ref == node
+                && matches!(
+                    n.state,
+                    NodeState::Expanded | NodeState::Failed(_) | NodeState::Leaf
+                )
+        })
+    }
+
+    /// Whether this preview has a page or an error.
+    #[must_use]
+    pub fn preview_settled(&self, conn: ConnId, table: &TableRef) -> bool {
+        self.preview(conn, table)
+            .is_some_and(|p| !matches!(p.data, LoadState::Idle | LoadState::Loading))
     }
 
     #[must_use]

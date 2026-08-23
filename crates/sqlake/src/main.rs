@@ -9,7 +9,7 @@ use clap::Parser;
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
 use sqlake_config::{Config, Settings};
-use sqlake_core::id::ProfileId;
+use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::profile::Profiles;
 use sqlake_driver_bigquery::BqDriver;
 use sqlake_driver_mock::{MockDriver, MockProfiles};
@@ -87,8 +87,11 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let store = runtime.block_on(async {
         let store = Store::spawn(drivers(), profiles, settings.page_size);
-        for id in opening {
-            store.dispatch(Action::Connect(id));
+        for profile in opening {
+            store.dispatch(Action::Connect {
+                profile,
+                conn: ConnId::new(),
+            });
         }
         store
     });

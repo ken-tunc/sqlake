@@ -188,7 +188,7 @@ impl IntentKind {
                 ViewCmd::DismissToast(_) => Self::DismissToast,
             },
             Intent::App(action) => match action {
-                Action::Connect(_) => Self::Connect,
+                Action::Connect { .. } => Self::Connect,
                 Action::Disconnect(_) => Self::Disconnect,
                 // Paired with `Action::ToggleNode`: one capability, "open a
                 // node". The TUI never sends the idempotent form — it has the
