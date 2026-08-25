@@ -39,11 +39,19 @@ impl BusyId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Open a connection to a configured profile.
+    /// Open a connection to a configured profile, under an id the caller
+    /// chooses.
     ///
     /// Two connections may name the same profile: that is a second window onto
-    /// the same database, not a mistake to deduplicate.
-    Connect(ProfileId),
+    /// the same database, not a mistake to deduplicate. So the profile does not
+    /// identify the connection, and a caller that cannot see the result — one
+    /// waiting on a snapshot for the connection it just opened — has nothing
+    /// else to wait on. Reading the snapshot for "the one that was not there
+    /// before" races every other caller on a shared session.
+    Connect {
+        profile: ProfileId,
+        conn: ConnId,
+    },
     Disconnect(ConnId),
 
     /// Expand or collapse a tree node, fetching its children if needed.
@@ -104,7 +112,9 @@ impl fmt::Display for Action {
     /// Short forms for the log. Deliberately not user-facing text.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect(profile) => write!(f, "connect({profile})"),
+            Self::Connect { profile, conn } => {
+                write!(f, "connect({profile} as {})", conn.short())
+            }
             Self::Disconnect(id) => write!(f, "disconnect({})", id.short()),
             Self::ToggleNode { node, .. } => write!(f, "toggle({node})"),
             Self::ExpandNode { node, .. } => write!(f, "expand({node})"),

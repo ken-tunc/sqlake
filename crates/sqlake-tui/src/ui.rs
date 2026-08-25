@@ -706,6 +706,7 @@ mod tests {
 
         Snapshot {
             rev: 1,
+            applied: 0,
             profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![sqlake_app::snapshot::ConnectionView {
                 id: conn,

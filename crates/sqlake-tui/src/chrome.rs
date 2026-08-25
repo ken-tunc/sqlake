@@ -336,6 +336,7 @@ mod tests {
         let conn = ConnId::new();
         Snapshot {
             rev: 1,
+            applied: 0,
             explorer: std::sync::Arc::new(sqlake_app::tree::TreeView::default()),
             profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![ConnectionView {

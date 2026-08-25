@@ -730,7 +730,15 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
 
         IntentKind::Connect => ctx
             .connectable_profile()
-            .map(|id| vec![Action::Connect(id).into()])
+            .map(|profile| {
+                vec![
+                    Action::Connect {
+                        profile,
+                        conn: ConnId::new(),
+                    }
+                    .into(),
+                ]
+            })
             .unwrap_or_default(),
         IntentKind::Disconnect => ctx
             .connection
@@ -977,6 +985,7 @@ mod tests {
 
         let snapshot = Snapshot {
             rev: 1,
+            applied: 0,
             profiles: Arc::new(vec![mock_summary("mock")]),
             connections: vec![ConnectionView {
                 id: conn,
@@ -1752,9 +1761,13 @@ mod tests {
 
         // `replica` is open, so `c` reaches for the one that is not.
         let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
-        assert_eq!(
-            out,
-            [Intent::App(Action::Connect(mock_summary("staging").id))]
+        assert!(
+            matches!(
+                &out[..],
+                [Intent::App(Action::Connect { profile, .. })]
+                    if *profile == mock_summary("staging").id
+            ),
+            "{out:?}"
         );
 
         // Still opening counts as open. Otherwise a second press while the
@@ -1762,9 +1775,13 @@ mod tests {
         // than moving on to the profile that has nothing.
         f.snapshot.connections[0].status = ConnStatus::Connecting;
         let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
-        assert_eq!(
-            out,
-            [Intent::App(Action::Connect(mock_summary("staging").id))]
+        assert!(
+            matches!(
+                &out[..],
+                [Intent::App(Action::Connect { profile, .. })]
+                    if *profile == mock_summary("staging").id
+            ),
+            "{out:?}"
         );
 
         // Closing a connection leaves its row behind, and a row is not a
@@ -1772,9 +1789,13 @@ mod tests {
         // skipping past it for ever.
         f.snapshot.connections[0].status = ConnStatus::Closed;
         let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
-        assert_eq!(
-            out,
-            [Intent::App(Action::Connect(mock_summary("replica").id))]
+        assert!(
+            matches!(
+                &out[..],
+                [Intent::App(Action::Connect { profile, .. })]
+                    if *profile == mock_summary("replica").id
+            ),
+            "{out:?}"
         );
 
         // The same profile twice is a second window onto one database, so the
@@ -1782,9 +1803,13 @@ mod tests {
         f.snapshot.connections[0].status = ConnStatus::Ready;
         f.snapshot.profiles = Arc::new(vec![mock_summary("replica")]);
         let out = on_key(press(KeyCode::Char('c')), &f.ctx(PaneId::Explorer));
-        assert_eq!(
-            out,
-            [Intent::App(Action::Connect(mock_summary("replica").id))]
+        assert!(
+            matches!(
+                &out[..],
+                [Intent::App(Action::Connect { profile, .. })]
+                    if *profile == mock_summary("replica").id
+            ),
+            "{out:?}"
         );
     }
 

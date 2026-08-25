@@ -122,7 +122,9 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                     ui.apply(cmd, &snapshot);
                     dirty = true;
                 }
-                Intent::App(action) => store.dispatch(action),
+                Intent::App(action) => {
+                    store.dispatch(action);
+                }
             }
         }
     }
@@ -382,7 +384,10 @@ mod tests {
     async fn connected() -> (Store, Arc<Snapshot>) {
         let store = store();
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(mock_summary("mock").id));
+        store.dispatch(Action::Connect {
+            profile: mock_summary("mock").id,
+            conn: ConnId::new(),
+        });
         until(&mut rx, |s| {
             s.connections.first().is_some_and(ConnectionView::is_ready)
         })
@@ -964,7 +969,10 @@ mod tests {
             PageRequest::DEFAULT_LIMIT,
         );
         let mut rx = store.subscribe();
-        store.dispatch(Action::Connect(mock_summary("mock").id));
+        store.dispatch(Action::Connect {
+            profile: mock_summary("mock").id,
+            conn: ConnId::new(),
+        });
         until(&mut rx, |s| {
             s.connections
                 .first()

@@ -15,6 +15,7 @@ use sqlake_core::result::Sort;
 
 use crate::action::BusyId;
 use crate::pages::PagedResult;
+use crate::store::Dispatched;
 use crate::tree::{TreeView, VisibleNode};
 
 /// Something that is fetched asynchronously.
@@ -130,6 +131,8 @@ impl BusyItem {
 
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
+    /// How many actions the store has applied. See [`Snapshot::has_applied`].
+    pub applied: u64,
     /// Increments on every publication. Useful in logs and tests; the UI
     /// redraws on channel notification, not on this.
     pub rev: u64,
@@ -158,6 +161,52 @@ impl Snapshot {
             .nodes
             .iter()
             .filter(move |node| node.conn == id && !node.node_ref.path.is_empty())
+    }
+
+    /// Whether the store has applied an action dispatched at this point in the
+    /// queue.
+    #[must_use]
+    pub fn has_applied(&self, dispatched: Dispatched) -> bool {
+        self.applied >= dispatched.ordinal()
+    }
+
+    /// Whether the store has finished opening this connection, successfully or
+    /// not.
+    ///
+    /// Every `*_settled` predicate reads the same thing: whether the store has
+    /// work in flight for the target. The state it left behind is deliberately
+    /// not consulted, because every state is reachable both before a request
+    /// and after one — a preview reads `Ready` while a page is being appended
+    /// to it, and `Failed` both before a retry and after one that failed again.
+    ///
+    /// Which is why these mean nothing on their own: before the store has
+    /// applied an action, nothing is in flight for it and everything looks
+    /// settled. Pair them with [`Snapshot::has_applied`], which is what
+    /// `Store::dispatch_and_settle` does.
+    ///
+    /// Settled is not succeeded. A caller reads the status it waited for.
+    #[must_use]
+    pub fn connection_settled(&self, id: ConnId) -> bool {
+        !self
+            .busy
+            .iter()
+            .any(|b| matches!(b.owner, BusyOwner::Connection(c) if c == id))
+    }
+
+    /// Whether the store has finished loading this node's children.
+    #[must_use]
+    pub fn node_settled(&self, conn: ConnId, node: &NodeRef) -> bool {
+        !self.busy.iter().any(
+            |b| matches!(&b.owner, BusyOwner::Node { conn: c, node: n } if *c == conn && n == node),
+        )
+    }
+
+    /// Whether the store has finished fetching for this preview.
+    #[must_use]
+    pub fn preview_settled(&self, conn: ConnId, table: &TableRef) -> bool {
+        !self.busy.iter().any(
+            |b| matches!(&b.owner, BusyOwner::Preview { conn: c, table: t } if *c == conn && t == table),
+        )
     }
 
     #[must_use]
