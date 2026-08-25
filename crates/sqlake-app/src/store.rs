@@ -104,9 +104,7 @@ impl Store {
     pub fn spawn(drivers: Drivers, profiles: Arc<dyn Profiles>, page_size: u32) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(Snapshot::default()));
-
-        let runtime = Runtime {
+        let mut runtime = Runtime {
             drivers,
             // Read once, at startup. Editing `connections.toml` while the
             // client is running is a reload, and a reload is a feature with
@@ -124,6 +122,12 @@ impl Store {
             rev: 0,
             applied: 0,
         };
+        // Published before the task starts, not from inside its loop, which
+        // only runs when something happens. The profile list is known here and
+        // is the answer to "what can I connect to" — a caller that asks before
+        // it has done anything is exactly the caller that needs it, and would
+        // otherwise be told there is nothing.
+        let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(runtime.snapshot()));
         tokio::spawn(runtime.run(action_rx, event_rx, snapshot_tx));
 
         Self {
@@ -1326,6 +1330,16 @@ mod tests {
         let snap = until(&store, |s| s.connections.len() == 2).await;
         assert_ne!(snap.connections[0].id, snap.connections[1].id);
         assert_eq!(snap.connections[0].profile, snap.connections[1].profile);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_has_done_nothing_still_says_what_it_could_connect_to() {
+        // The loop publishes when something happens, and until a caller acts
+        // nothing has. Left to it, "what can I connect to" answers "nothing" —
+        // to the agent surface asking before its first command, and to the
+        // interactive client drawing its first frame.
+        let store = store(Behaviour::instant());
+        assert!(!store.snapshot().profiles.is_empty());
     }
 
     #[tokio::test]

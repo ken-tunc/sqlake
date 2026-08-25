@@ -3898,6 +3898,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlake-api"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "sqlake-app",
+ "sqlake-core",
+ "sqlake-driver-mock",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "sqlake-app"
 version = "0.1.0"
 dependencies = [
