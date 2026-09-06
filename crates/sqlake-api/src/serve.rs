@@ -392,7 +392,7 @@ mod tests {
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
     use super::*;
-    use crate::protocol::{ResponseKind, SortBy};
+    use crate::protocol::{FailureKind, ResponseKind, SortBy};
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
         service_of(MockDriver::new(behaviour)).await
@@ -433,7 +433,7 @@ mod tests {
         }
     }
 
-    /// Every key in every response this session can produce.
+    /// Every key in every response that can cross the socket.
     ///
     /// A1's fifth promise is that nothing crossing the socket carries a host, a
     /// user, or anything derived from a credential — and everything crossing it
@@ -441,6 +441,13 @@ mod tests {
     /// absence of a list of bad names: a field added anywhere below a response
     /// fails this and has to be looked at, which is the only version of the
     /// check that keeps working.
+    ///
+    /// Coverage is two levels deep. `Failed` is not one shape — each `Failure`
+    /// carries its own fields — so sampling one failure looks at a sixth of
+    /// what `Failed` can write. And `Malformed` is never produced by
+    /// [`Service::answer`] at all, so provoking failures is not a way to
+    /// enumerate them: the last of each kind is constructed, which serialises
+    /// identically to one that was earned.
     #[tokio::test]
     async fn no_response_carries_a_credential() {
         fn keys(value: &Json, into: &mut BTreeSet<String>) {
@@ -456,51 +463,123 @@ mod tests {
             }
         }
 
-        let (service, conn) = service(Behaviour::instant()).await;
-        let mut responses = Vec::new();
-        for request in [
-            Request::Snapshot {},
-            Request::ConnectionList {},
-            Request::NamespaceList {
-                connection: conn.clone(),
+        let (session, conn) = service(Behaviour::instant()).await;
+        // One column, so `omitted_columns` is written rather than skipped —
+        // every `skip_serializing_if` field below a response is a field this
+        // check does not see unless the sample makes it appear.
+        let narrow = Budget {
+            max_rows: 1,
+            max_columns: 1,
+        };
+        let (refusing, refused_conn) = service(Behaviour {
+            failing_nodes: vec![vec!["restricted".to_owned()]],
+            ..Behaviour::instant()
+        })
+        .await;
+
+        let mut responses = vec![
+            session.answer(&Request::Snapshot {}).await,
+            session.answer(&Request::ConnectionList {}).await,
+            // Relations, so `NodeInfo::relation_kind` is written: it is skipped
+            // on a namespace, and a sample of only namespaces would not see it.
+            session
+                .answer(&Request::TableList {
+                    connection: conn.clone(),
+                    namespace: vec!["public".into()],
+                })
+                .await,
+            // A namespace that failed, so `NodeInfo::error` carries a driver's
+            // own words — the one place they reach the wire.
+            refusing
+                .answer(&Request::NamespaceList {
+                    connection: refused_conn.clone(),
+                })
+                .await,
+            refusing
+                .answer(&Request::TableList {
+                    connection: refused_conn,
+                    namespace: vec!["restricted".into()],
+                })
+                .await,
+        ];
+        responses.push(
+            Service::new(session.store().clone())
+                .with_budget(narrow)
+                .answer(&Request::TablePreview {
+                    connection: conn,
+                    table: vec!["public".into(), "users".into()],
+                    sort: None,
+                    limit: None,
+                })
+                .await,
+        );
+
+        // A connection that failed to open, for `Status::Failed`'s reason.
+        let (broken, _) = service(Behaviour {
+            connect_fails: true,
+            ..Behaviour::instant()
+        })
+        .await;
+        responses.push(broken.answer(&Request::Snapshot {}).await);
+
+        // One of every failure, so `Failed`'s own coverage is total.
+        for failure in [
+            Failure::NoSuchConnection {
+                connection: "id".into(),
             },
-            Request::TableList {
-                connection: conn.clone(),
-                namespace: vec!["public".into()],
+            Failure::NotFound {
+                path: vec!["public".into()],
             },
-            Request::TablePreview {
-                connection: conn.clone(),
-                table: vec!["public".into(), "users".into()],
-                sort: None,
-                limit: Some(1),
+            Failure::Driver {
+                message: "refused".into(),
             },
-            // A failure is a response too, and its message is the one place a
-            // driver's own words reach the wire.
-            Request::NamespaceList {
-                connection: "nope".into(),
+            Failure::Timeout { waited_ms: 1 },
+            Failure::Unsupported {
+                message: "cannot".into(),
+            },
+            Failure::Malformed {
+                message: "not a request".into(),
             },
         ] {
-            responses.push(service.answer(&request).await);
+            responses.push(Response::Failed(failure));
         }
-        // `schema` is left out of the key set on purpose: it is the protocol's
-        // own description, so its keys are every field name in this crate and
-        // it would swamp what this test is looking at.
-        responses.push(service.answer(&Request::Schema {}).await);
+        // The schema is a response too, and is left out of the key set on
+        // purpose: it describes the protocol, so its keys are every field name
+        // in this crate and would swamp what this is looking at.
+        responses.push(session.answer(&Request::Schema {}).await);
 
-        let covered: BTreeSet<_> = responses.iter().map(Response::kind).collect();
         assert_eq!(
-            covered.len(),
-            ResponseKind::ALL.len(),
-            "a response this session can send is not exercised here"
+            responses
+                .iter()
+                .map(Response::kind)
+                .collect::<BTreeSet<_>>(),
+            ResponseKind::ALL.iter().copied().collect::<BTreeSet<_>>(),
+            "a response this surface can send is not exercised here"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter_map(|r| match r {
+                    Response::Failed(f) => Some(f.kind()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>(),
+            FailureKind::ALL.iter().copied().collect::<BTreeSet<_>>(),
+            "a failure this surface can send is not exercised here"
         );
 
         let mut found = BTreeSet::new();
-        for response in &responses {
-            if matches!(response, Response::Schema(_)) {
-                continue;
+        for response in &mut responses {
+            match response {
+                Response::Schema(_) => continue,
+                // Cell values are the caller's data, not protocol structure. A
+                // `STRUCT` column would otherwise put its field names in here,
+                // which makes this assertion a statement about the fixture.
+                Response::Page(page) => page.rows.clear(),
+                _ => {}
             }
             keys(
-                &serde_json::to_value(response).expect("a response serialises"),
+                &serde_json::to_value(&*response).expect("a response serialises"),
                 &mut found,
             );
         }
@@ -519,11 +598,14 @@ mod tests {
             "hierarchy",
             "id",
             "loaded",
+            "message",
             "name",
             "nullable",
+            "omitted_columns",
             "path",
             "profile",
             "profiles",
+            "reason",
             "relation_kind",
             "response",
             "returned",
@@ -534,6 +616,7 @@ mod tests {
             "total",
             "truncated",
             "type_name",
+            "waited_ms",
         ]
         .iter()
         .map(|s| (*s).to_owned())
