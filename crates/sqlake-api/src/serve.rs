@@ -14,6 +14,7 @@ use std::time::Duration;
 use sqlake_app::action::Action;
 use sqlake_app::snapshot::{LoadState, Snapshot};
 use sqlake_app::store::Store;
+use sqlake_app::tree::NodeState;
 use sqlake_app::wait::WaitError;
 use sqlake_core::id::ConnId;
 use sqlake_core::node::{NodeRef, TableRef};
@@ -134,6 +135,12 @@ impl Service {
             Some(sqlake_app::snapshot::ConnStatus::Failed(why)) => Err(Failure::Driver {
                 message: why.clone(),
             }),
+            // A closed connection has no session, so every action below it is
+            // dropped by the store and the request would report the tree as
+            // empty and the table as missing.
+            Some(sqlake_app::snapshot::ConnStatus::Closed) => Err(Failure::Driver {
+                message: "the connection is closed".to_owned(),
+            }),
             _ => Ok(conn),
         }
     }
@@ -158,6 +165,14 @@ impl Service {
         // `NodeKind` is the driver's, and guessing one here would be this crate
         // deciding whether a level is a schema or a dataset.
         let node = self.resolve(conn, namespace).await?;
+        // A relation has no children, so expanding one answers "there is
+        // nothing in here" — which is what an empty namespace says too, and
+        // the caller cannot tell the two apart.
+        if node.as_table().is_some() {
+            return Err(Failure::Unsupported {
+                message: format!("{} is a relation, not a namespace", namespace.join(".")),
+            });
+        }
         let settled = self
             .dispatch_and_settle(
                 Action::ExpandNode {
@@ -167,6 +182,7 @@ impl Service {
                 |s| s.node_settled(conn, &node),
             )
             .await?;
+        expanded(&settled, conn, &node)?;
         Ok(Response::Nodes(
             settled
                 .objects(conn)
@@ -234,20 +250,40 @@ impl Service {
         column: usize,
         settled: std::sync::Arc<Snapshot>,
     ) -> Result<std::sync::Arc<Snapshot>, Failure> {
-        if settled.preview(conn, table).and_then(|p| p.sort)
-            == Some(Sort::new(column, SortDir::Asc))
-        {
+        let wanted = Sort::new(column, SortDir::Asc);
+        if settled.preview(conn, table).and_then(|p| p.sort) == Some(wanted) {
             return Ok(settled);
         }
-        self.dispatch_and_settle(
-            Action::SortPreview {
-                conn,
-                table: table.clone(),
-                column,
-            },
-            |s| s.preview_settled(conn, table),
-        )
-        .await
+        let settled = self
+            .dispatch_and_settle(
+                Action::SortPreview {
+                    conn,
+                    table: table.clone(),
+                    column,
+                },
+                |s| s.preview_settled(conn, table),
+            )
+            .await?;
+
+        // The store drops a sort it cannot perform — an unsortable connection,
+        // a column index no page has — without recording anything, so the wait
+        // above ends on rows in whatever order they already had. Sending those
+        // back as a success answers a question nobody asked, and [`Page`]
+        // carries no ordering for the caller to notice it by.
+        if settled.preview(conn, table).and_then(|p| p.sort) != Some(wanted) {
+            return Err(Failure::Unsupported {
+                message: if settled
+                    .connection(conn)
+                    .and_then(|c| c.capabilities.as_ref())
+                    .is_some_and(|c| !c.sortable_preview)
+                {
+                    "this connection cannot order a preview".to_owned()
+                } else {
+                    format!("there is no column {column} to sort {table} by")
+                },
+            });
+        }
+        Ok(settled)
     }
 
     /// The node at this path, loading whatever has to be loaded to reach it.
@@ -264,14 +300,19 @@ impl Service {
     async fn resolve(&self, conn: ConnId, path: &[String]) -> Result<NodeRef, Failure> {
         for depth in 1..path.len() {
             let ancestor = self.node(conn, &path[..depth])?;
-            self.dispatch_and_settle(
-                Action::ExpandNode {
-                    conn,
-                    node: ancestor.clone(),
-                },
-                |s| s.node_settled(conn, &ancestor),
-            )
-            .await?;
+            let settled = self
+                .dispatch_and_settle(
+                    Action::ExpandNode {
+                        conn,
+                        node: ancestor.clone(),
+                    },
+                    |s| s.node_settled(conn, &ancestor),
+                )
+                .await?;
+            // Checked before descending: an ancestor the driver refused has no
+            // children, so the next lookup reports the path as missing and
+            // hides the refusal behind a plausible "not found".
+            expanded(&settled, conn, &ancestor)?;
         }
         self.node(conn, path)
     }
@@ -320,10 +361,30 @@ impl Service {
     }
 }
 
+/// Whether an expansion that has settled actually loaded anything.
+///
+/// A node the driver refused settles with no children, which is on the wire
+/// indistinguishable from a namespace that is genuinely empty — so a caller
+/// told `[]` concludes the schema has no tables when it was denied permission
+/// to look. The reason is on the node, where the TUI draws it.
+fn expanded(snapshot: &Snapshot, conn: ConnId, node: &NodeRef) -> Result<(), Failure> {
+    match snapshot
+        .objects(conn)
+        .find(|n| &n.node_ref == node)
+        .map(|n| &n.state)
+    {
+        Some(NodeState::Failed(why)) => Err(Failure::Driver {
+            message: why.clone(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use sqlake_app::store::Drivers;
     use sqlake_core::id::ProfileId;
     use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
@@ -332,8 +393,12 @@ mod tests {
     use crate::protocol::SortBy;
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
+        service_of(MockDriver::new(behaviour)).await
+    }
+
+    async fn service_of(driver: MockDriver) -> (Service, String) {
         let store = Store::spawn(
-            Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
+            Drivers::new().with(Arc::new(driver)),
             Arc::new(MockProfiles::default()),
             PageRequest::DEFAULT_LIMIT,
         );
@@ -351,8 +416,6 @@ mod tests {
             .expect("the connection settles");
         (Service::new(store), conn.to_string())
     }
-
-    use sqlake_app::store::Drivers;
 
     fn nodes(response: &Response) -> &[NodeInfo] {
         match response {
@@ -532,9 +595,67 @@ mod tests {
                 namespace: vec!["restricted".into()],
             })
             .await;
-        // The node settles into `Failed`, and its error travels as the node's
-        // rather than as the request's: the request was answered.
-        let nodes = nodes(&answer);
-        assert!(nodes.is_empty(), "a failed expansion produced children");
+        // Not an empty list: a namespace with no tables and one the driver
+        // refused to open are the same answer otherwise, and the second is the
+        // one an agent must not act on.
+        assert!(
+            matches!(answer, Response::Failed(Failure::Driver { .. })),
+            "a refused expansion was reported as an empty namespace: {answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sort_the_connection_cannot_do_is_refused_rather_than_ignored() {
+        let (service, conn) = service_of(
+            MockDriver::new(Behaviour::instant()).with_capabilities(sqlake_driver_mock::NO_SORT),
+        )
+        .await;
+        let answer = service
+            .answer(&Request::TablePreview {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                sort: Some(SortBy { column: 1 }),
+                limit: None,
+            })
+            .await;
+        // The store drops a sort it cannot perform. Answering with the rows in
+        // their original order looks like success, and `Page` says nothing
+        // about ordering for the caller to catch it by.
+        assert!(
+            matches!(answer, Response::Failed(Failure::Unsupported { .. })),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sort_by_a_column_that_is_not_there_is_refused() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TablePreview {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                sort: Some(SortBy { column: 9_999 }),
+                limit: None,
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Unsupported { .. })),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_the_children_of_a_relation_says_it_is_one() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TableList {
+                connection: conn,
+                namespace: vec!["public".into(), "users".into()],
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Unsupported { .. })),
+            "a relation was reported as an empty namespace: {answer:?}"
+        );
     }
 }

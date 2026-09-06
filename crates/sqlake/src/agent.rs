@@ -16,7 +16,7 @@ use sqlake_api::{Failure, Request, Response, Service};
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
 use sqlake_core::id::{ConnId, ProfileId};
-use sqlake_core::profile::Profiles;
+use sqlake_core::profile::{ProfileError, ProfileSummary, Profiles, ResolvedProfile};
 
 /// What a caller can ask for from the command line.
 ///
@@ -155,13 +155,32 @@ impl Command {
     /// `api schema` describes the protocol, which is a fact about the build
     /// rather than about a session. Opening a connection to print it would put
     /// a keyring prompt in front of somebody asking what the commands are.
-    const fn needs_a_connection(&self) -> bool {
+    pub(crate) const fn needs_a_connection(&self) -> bool {
         !matches!(
             self,
             Self::Api {
                 what: ApiCommand::Schema
             }
         )
+    }
+}
+
+/// A store with nothing to connect to.
+///
+/// What a command that [needs no connection](Command::needs_a_connection) runs
+/// against. Reading the config to answer `api schema` would let a
+/// `connections.toml` that does not parse withhold the document describing how
+/// to write one — from the caller least able to guess.
+#[derive(Debug)]
+pub(crate) struct NoProfiles;
+
+impl Profiles for NoProfiles {
+    fn list(&self) -> Vec<ProfileSummary> {
+        Vec::new()
+    }
+
+    fn resolve(&self, id: &ProfileId) -> Result<ResolvedProfile, ProfileError> {
+        Err(ProfileError::new(format!("no profile called `{id}`")))
     }
 }
 
@@ -182,7 +201,10 @@ pub(crate) fn run(
     let response = runtime.block_on(async {
         let service = Service::new(Store::spawn(drivers, profiles, page_size));
         let connection = if command.needs_a_connection() {
-            open(service.store(), connect).await?
+            match open(service.store(), connect).await? {
+                Ok(connection) => connection,
+                Err(failure) => return anyhow::Ok(Response::Failed(failure)),
+            }
         } else {
             String::new()
         };
@@ -207,7 +229,13 @@ pub(crate) fn run(
 /// One, not every configured profile: opening the rest would put a connection
 /// attempt and possibly a credential prompt in front of a caller that asked
 /// about a single table.
-async fn open(store: &Store, connect: Option<ProfileId>) -> Result<String> {
+///
+/// A wait that runs out is a [`Failure`] rather than an error, because it is
+/// the same event the service reports as one — a caller that parses stdout for
+/// `{"error": "timeout"}` should not get an empty stream because the clock ran
+/// out three lines earlier. Having nothing to connect to at all is different:
+/// no request was attempted, and the answer is a sentence about the config.
+async fn open(store: &Store, connect: Option<ProfileId>) -> Result<Result<String, Failure>> {
     let profile = match connect {
         Some(id) => id,
         None => store
@@ -222,15 +250,22 @@ async fn open(store: &Store, connect: Option<ProfileId>) -> Result<String> {
     // returning the id straight away hands the service a connection that is not
     // in any snapshot yet — and "no such connection" is what it would say about
     // the one this command just opened.
-    store
+    let waited = store
         .dispatch_and_settle(
             Action::Connect { profile, conn },
             sqlake_api::DEFAULT_TIMEOUT,
             |s| s.connection_settled(conn),
         )
-        .await
-        .context("opening the connection")?;
-    Ok(conn.to_string())
+        .await;
+    Ok(match waited {
+        Ok(_) => Ok(conn.to_string()),
+        Err(sqlake_app::wait::WaitError::TimedOut) => Err(Failure::Timeout {
+            waited_ms: u64::try_from(sqlake_api::DEFAULT_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+        }),
+        Err(sqlake_app::wait::WaitError::Stopped) => Err(Failure::Driver {
+            message: "the session stopped while the connection was opening".to_owned(),
+        }),
+    })
 }
 
 /// Print the response, and say in the exit status whether it was a failure.
