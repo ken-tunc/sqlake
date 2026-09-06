@@ -93,9 +93,6 @@ pub const MIN_PANE_WIDTH: u16 = 12;
 /// Where the splitter sits before anyone moves it, as a fraction of the screen.
 const DEFAULT_EXPLORER_PERMILLE: u32 = 280;
 
-/// What a preview looked like when a page was last asked for.
-type PageMark = (usize, Option<String>, Option<sqlake_core::result::Sort>);
-
 /// How far above the last loaded row a scroll starts fetching.
 ///
 /// Above the last row rather than at it, so the fetch overlaps the scrolling
@@ -115,21 +112,18 @@ pub struct TreeUi {
 #[derive(Debug, Default)]
 pub struct GridUi {
     pub row_offset: usize,
-    /// The preview's state when this tab last asked for another page.
+    /// How many page requests had finished for this preview when this tab last
+    /// asked for another.
     ///
-    /// A description of the state rather than a boolean, because the store
-    /// announces none of the four things that make asking sensible again and
-    /// all four show up here. A page landed: `loaded_rows` grew. A page failed:
-    /// `last_error` is set, and asking again is a retry. And the end of the
-    /// relation is the one that needs no flag — a page that arrived empty
-    /// leaves everything unchanged, so there is nothing new to ask about,
-    /// which is exactly right.
-    ///
-    /// The ordering is in here because a sort is the case a row count cannot
-    /// see: `sort_preview` restarts the relation at page one, so the count
-    /// comes back to what it already was and the rows under it are different
-    /// ones. Without it, sorting stops paging for as long as the tab lives.
-    asked_at: Option<PageMark>,
+    /// A count of what came back, rather than a description of what the last
+    /// request left behind. That description cannot say whether a request was
+    /// made at all, and three cases needing different answers look identical
+    /// in it: a cancelled page changes nothing, a retry that fails the same
+    /// way leaves the same message, and the end of a relation changes nothing
+    /// either. The end is the one the store can actually tell — it knows what
+    /// it asked for — so `PreviewView::exhausted` says it, and this only has
+    /// to answer "has anything come back since I asked".
+    asked_after: Option<u64>,
     /// Horizontal position in whole columns. Per column rather than per cell:
     /// the wheel and the scrollbar both move in column steps, and a half-drawn
     /// leading column is worse than a hard edge.
@@ -495,28 +489,24 @@ impl UiState {
         if !matches!(preview.data, LoadState::Ready(_)) {
             return None;
         }
+        // The relation's end is the store's answer, not an inference from a
+        // request that changed nothing — which is also what a cancelled page
+        // and a repeat of the same failure leave behind.
+        if preview.exhausted {
+            return None;
+        }
         if self.offset(PaneId::Grid) + self.page(PaneId::Grid) + LOAD_MARGIN_ROWS
             < preview.loaded_rows
         {
             return None;
         }
 
-        // Compared field by field, so the common answer — "already asked" —
-        // costs no allocation on a path a wheel notch runs through.
+        let attempts = preview.attempts;
         let grid = self.grids.entry(id).or_default();
-        let asked = grid.asked_at.as_ref().is_some_and(|(rows, error, sort)| {
-            *rows == preview.loaded_rows
-                && error.as_deref() == preview.last_error.as_deref()
-                && *sort == preview.sort
-        });
-        if asked {
+        if grid.asked_after == Some(attempts) {
             return None;
         }
-        grid.asked_at = Some((
-            preview.loaded_rows,
-            preview.last_error.clone(),
-            preview.sort,
-        ));
+        grid.asked_after = Some(attempts);
         Some(Action::LoadMore {
             conn,
             table: self.tabs[at].table.clone(),
@@ -818,6 +808,8 @@ mod tests {
             }],
             explorer,
             previews: vec![PreviewView {
+                exhausted: false,
+                attempts: 0,
                 conn,
                 table: table(),
                 sort: None,

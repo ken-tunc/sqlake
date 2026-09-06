@@ -262,6 +262,23 @@ struct Preview {
     data: LoadState<Arc<PagedResult>>,
     loaded_rows: usize,
     last_error: Option<String>,
+    /// The driver answered with fewer rows than were asked for, so there are
+    /// no more.
+    ///
+    /// Recorded here because only the store knows what it asked for. Without
+    /// it the end of a relation is "the request changed nothing", which is
+    /// also what a cancelled request and a repeated identical failure look
+    /// like — and a front-end reading them as the same thing either stops
+    /// paging a relation that has more, or asks for a page past the end on
+    /// every scroll for ever.
+    exhausted: bool,
+    /// How many page requests have finished for this preview, however they
+    /// finished.
+    ///
+    /// A caller waiting for "something happened" cannot get that from the
+    /// state a request leaves: a cancellation leaves none, and a retry that
+    /// fails the same way leaves the same message.
+    attempts: u64,
 }
 
 struct Runtime {
@@ -583,6 +600,7 @@ impl Runtime {
                 existing.page = page;
                 existing.data = LoadState::Loading;
                 existing.loaded_rows = 0;
+                existing.exhausted = false;
                 self.fetch_page(conn_id, table, page, false);
             }
             return;
@@ -599,6 +617,8 @@ impl Runtime {
             data: LoadState::Loading,
             loaded_rows: 0,
             last_error: None,
+            exhausted: false,
+            attempts: 0,
         });
         self.fetch_page(conn_id, table, page, false);
     }
@@ -648,6 +668,7 @@ impl Runtime {
         preview.sort = Some(sort);
         preview.data = LoadState::Loading;
         preview.loaded_rows = 0;
+        preview.exhausted = false;
         // A new ordering invalidates every page already fetched.
         let page = PageRequest::first_of(self.page_size).with_sort(Some(sort));
         self.fetch_page(conn_id, table, page, false);
@@ -777,6 +798,10 @@ impl Runtime {
             BusyOwner::Preview { conn, table } => {
                 if let Some(preview) = self.preview_mut(*conn, table) {
                     preview.pending = None;
+                    // A cancellation is a request that finished. Left
+                    // uncounted, it is indistinguishable from the end of the
+                    // relation and the preview never pages again.
+                    preview.attempts = preview.attempts.saturating_add(1);
                     // An append that never lands leaves the rows already on
                     // screen perfectly usable.
                     if preview.data.ready().is_none() {
@@ -881,6 +906,7 @@ impl Runtime {
                 return;
             };
 
+            preview.attempts = preview.attempts.saturating_add(1);
             match result {
                 Ok(out) => {
                     let rows = if pending.append {
@@ -908,6 +934,11 @@ impl Runtime {
                         preview.last_error = None;
                         PagedResult::new(&out.result)
                     };
+                    // Short of what was asked for, so the relation has no more.
+                    // The driver is entitled to return fewer than the limit
+                    // only at the end — a page cut for any other reason would
+                    // make this wrong, and none of the drivers cuts one.
+                    preview.exhausted = out.result.rows.len() < page.limit as usize;
                     preview.page = page;
                     let rows = Arc::new(rows);
                     preview.columns = Some(rows.columns().len());
@@ -1017,6 +1048,8 @@ impl Runtime {
                     table: p.table.clone(),
                     sort: p.sort,
                     loaded_rows: p.loaded_rows,
+                    exhausted: p.exhausted,
+                    attempts: p.attempts,
                     data: p.data.clone(),
                     last_error: p.last_error.clone(),
                 })

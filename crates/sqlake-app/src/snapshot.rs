@@ -98,6 +98,18 @@ pub struct PreviewView {
     pub sort: Option<Sort>,
     /// Rows fetched so far. Paging appends, so this only grows.
     pub loaded_rows: usize,
+    /// The relation has no more rows: the last page came back short.
+    ///
+    /// The store's to know, because it issued the request and knows the limit.
+    /// A front-end inferring it from "the last request changed nothing" gets
+    /// it wrong twice over — a cancelled page and a retry that failed the same
+    /// way both change nothing either.
+    pub exhausted: bool,
+    /// Page requests that have finished, however they finished.
+    ///
+    /// The only way to tell "a request came back" from "no request was made",
+    /// which the state a request leaves behind cannot say.
+    pub attempts: u64,
     pub data: LoadState<Arc<PagedResult>>,
     /// A page that failed to extend `data`, without disturbing it.
     ///
@@ -309,6 +321,8 @@ mod tests {
                 table: table.clone(),
                 sort: None,
                 loaded_rows: 0,
+                exhausted: false,
+                attempts: 0,
                 data: LoadState::Loading,
                 last_error: None,
             }],

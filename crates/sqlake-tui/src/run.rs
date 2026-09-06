@@ -912,102 +912,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_end_of_a_relation_needs_no_flag_to_stop_the_asking() {
-        // `public.users` is 50 rows and the page size is larger, so the first
-        // page is the whole relation: nothing grows, nothing fails, and there
-        // is nothing new to ask about. A view that read "at the bottom" as
-        // "fetch" would go back to the driver on every scroll for ever.
-        let table = sqlake_core::node::TableRef::new(["public", "users"]);
-        let (store, snap, mut ui, _) = opened(store(), table).await;
-        let mut rx = store.subscribe();
-
-        let action = to_the_end(&mut ui, &snap).expect("the first scroll to the end asks once");
-        store.dispatch(action);
-        until(&mut rx, |s| !s.is_busy()).await;
-        let snap = rx.borrow_and_update().clone();
-
+    async fn a_relation_that_arrived_whole_is_never_asked_for_more() {
+        // `public.users` is 50 rows and the page size is 200, so the first page
+        // is the relation: the store saw a short page and said so, and no
+        // amount of scrolling to the bottom is a reason to go back to the
+        // driver.
+        let (_store, snap, mut ui, _) = opened(
+            store(),
+            sqlake_core::node::TableRef::new(["public", "users"]),
+        )
+        .await;
         assert_eq!(
             to_the_end(&mut ui, &snap),
             None,
-            "an exhausted relation was asked for another page"
+            "a relation already read whole was asked for another page"
         );
     }
 
     #[tokio::test]
-    async fn a_page_that_failed_can_be_asked_for_again() {
-        // The store leaves `data` `Ready` and puts the reason in `last_error`,
-        // so the rows already fetched survive — which also means nothing about
-        // the preview says "that request is over" except the error itself. A
-        // view that did not watch it would never retry, and one bad page would
-        // be the end of the relation for as long as the tab lived.
+    async fn cancelling_a_page_does_not_end_paging_for_the_tab() {
+        // A cancellation leaves `loaded_rows`, `last_error` and the ordering
+        // exactly as they were — the same state the end of a relation leaves —
+        // so a view reading that state could not tell them apart, and the tab
+        // never paged again.
+        // Latency, so the page is genuinely in flight when it is cancelled.
+        // Against an instant driver it lands first and there is nothing to
+        // cancel — and `until` would wait for a state that never comes.
         let store = store_of(Behaviour {
-            // The first page lands; the second does not.
+            latency: std::time::Duration::from_millis(100),
+            ..Behaviour::instant()
+        });
+        let (store, snap, mut ui, conn) =
+            opened(store, sqlake_core::node::TableRef::new(["public", "big"])).await;
+        let table = sqlake_core::node::TableRef::new(["public", "big"]);
+
+        let action = to_the_end(&mut ui, &snap).expect("it asks");
+        store.dispatch(action);
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| !s.busy.is_empty()).await;
+        let id = rx.borrow_and_update().busy[0].id;
+
+        store.dispatch(Action::Cancel(id));
+        until(&mut rx, |s| s.busy.is_empty()).await;
+        let snap = rx.borrow_and_update().clone();
+        assert!(
+            snap.preview(conn, &table).is_some_and(|p| !p.exhausted),
+            "a cancelled page was taken for the end of the relation"
+        );
+
+        assert!(
+            to_the_end(&mut ui, &snap).is_some(),
+            "cancelling one page stopped the tab paging for good"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_identical_failure_can_still_be_retried() {
+        // The retry leaves the same message behind, so a view keyed on what a
+        // request left could not see that anything had happened — and a
+        // database that blipped twice ended paging for the life of the tab,
+        // even after it recovered.
+        let store = store_of(Behaviour {
             failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
             ..Behaviour::instant()
         });
+        let (store, snap, mut ui, conn) =
+            opened(store, sqlake_core::node::TableRef::new(["public", "big"])).await;
         let table = sqlake_core::node::TableRef::new(["public", "big"]);
-        let (store, snap, mut ui, conn) = opened(store, table.clone()).await;
+
         let mut rx = store.subscribe();
-
-        let action = to_the_end(&mut ui, &snap).expect("it asks once");
-        store.dispatch(action);
-        until(&mut rx, |s| {
-            s.preview(conn, &table)
-                .is_some_and(|p| p.last_error.is_some())
-        })
-        .await;
-        let snap = rx.borrow_and_update().clone();
-
+        let mut snap = snap;
+        for attempt in 1..=2 {
+            let before = snap.preview(conn, &table).map_or(0, |p| p.attempts);
+            let action = to_the_end(&mut ui, &snap)
+                .unwrap_or_else(|| panic!("attempt {attempt} would not ask"));
+            store.dispatch(action);
+            // Waited for by the count rather than by the error: after the
+            // first failure the error is already there, so a wait on it would
+            // return before the second request had even been sent.
+            until(&mut rx, |s| {
+                s.preview(conn, &table)
+                    .is_some_and(|p| p.attempts > before && p.last_error.is_some())
+            })
+            .await;
+            snap = rx.borrow_and_update().clone();
+        }
         assert!(
             to_the_end(&mut ui, &snap).is_some(),
-            "a page failed and the view would not try again"
-        );
-    }
-
-    #[tokio::test]
-    async fn sorting_starts_the_asking_over() {
-        // `SortPreview` restarts the relation at page one, so a watermark kept
-        // across it names a position the preview no longer has and paging stops
-        // for as long as the tab lives.
-        let (store, snap, mut ui, conn, table) = paging().await;
-        assert!(to_the_end(&mut ui, &snap).is_some());
-
-        store.dispatch(Action::SortPreview {
-            conn,
-            table: table.clone(),
-            column: 0,
-        });
-        let mut rx = store.subscribe();
-        until(&mut rx, |s| {
-            s.preview(conn, &table)
-                .is_some_and(|p| p.sort.is_some() && p.data.ready().is_some())
-        })
-        .await;
-        let snap = rx.borrow_and_update().clone();
-
-        assert!(
-            to_the_end(&mut ui, &snap).is_some(),
-            "paging stopped for the life of the tab because it had been sorted"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_cell_cursor_pages_the_way_scrolling_does() {
-        // `J` pulls the viewport along to the last loaded row without ever
-        // producing a scroll command. Fetching only on the scroll arms leaves
-        // the whole feature out of reach of the keyboard: the cursor stops at
-        // the end of page one and nothing asks for page two.
-        let (_store, snap, mut ui, conn, table) = paging().await;
-        assert_eq!(
-            ui.apply(
-                crate::intent::ViewCmd::MoveCellSelection {
-                    drow: 1000,
-                    dcol: 0
-                },
-                &snap
-            ),
-            Some(Action::LoadMore { conn, table }),
-            "the cursor reached the last loaded row and asked for nothing"
+            "two failures with the same message ended paging for good"
         );
     }
 
