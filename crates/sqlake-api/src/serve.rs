@@ -382,15 +382,17 @@ fn expanded(snapshot: &Snapshot, conn: ConnId, node: &NodeRef) -> Result<(), Fai
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
+    use serde_json::Value as Json;
     use sqlake_app::store::Drivers;
     use sqlake_core::id::ProfileId;
     use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
     use super::*;
-    use crate::protocol::SortBy;
+    use crate::protocol::{ResponseKind, SortBy};
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
         service_of(MockDriver::new(behaviour)).await
@@ -429,6 +431,114 @@ mod tests {
             Response::Page(page) => page,
             other => panic!("expected a page, got {other:?}"),
         }
+    }
+
+    /// Every key in every response this session can produce.
+    ///
+    /// A1's fifth promise is that nothing crossing the socket carries a host, a
+    /// user, or anything derived from a credential — and everything crossing it
+    /// is a `Response`. Asserted as the whole key set rather than as the
+    /// absence of a list of bad names: a field added anywhere below a response
+    /// fails this and has to be looked at, which is the only version of the
+    /// check that keeps working.
+    #[tokio::test]
+    async fn no_response_carries_a_credential() {
+        fn keys(value: &Json, into: &mut BTreeSet<String>) {
+            match value {
+                Json::Object(members) => {
+                    for (key, nested) in members {
+                        into.insert(key.clone());
+                        keys(nested, into);
+                    }
+                }
+                Json::Array(items) => items.iter().for_each(|v| keys(v, into)),
+                _ => {}
+            }
+        }
+
+        let (service, conn) = service(Behaviour::instant()).await;
+        let mut responses = Vec::new();
+        for request in [
+            Request::Snapshot {},
+            Request::ConnectionList {},
+            Request::NamespaceList {
+                connection: conn.clone(),
+            },
+            Request::TableList {
+                connection: conn.clone(),
+                namespace: vec!["public".into()],
+            },
+            Request::TablePreview {
+                connection: conn.clone(),
+                table: vec!["public".into(), "users".into()],
+                sort: None,
+                limit: Some(1),
+            },
+            // A failure is a response too, and its message is the one place a
+            // driver's own words reach the wire.
+            Request::NamespaceList {
+                connection: "nope".into(),
+            },
+        ] {
+            responses.push(service.answer(&request).await);
+        }
+        // `schema` is left out of the key set on purpose: it is the protocol's
+        // own description, so its keys are every field name in this crate and
+        // it would swamp what this test is looking at.
+        responses.push(service.answer(&Request::Schema {}).await);
+
+        let covered: BTreeSet<_> = responses.iter().map(Response::kind).collect();
+        assert_eq!(
+            covered.len(),
+            ResponseKind::ALL.len(),
+            "a response this session can send is not exercised here"
+        );
+
+        let mut found = BTreeSet::new();
+        for response in &responses {
+            if matches!(response, Response::Schema(_)) {
+                continue;
+            }
+            keys(
+                &serde_json::to_value(response).expect("a response serialises"),
+                &mut found,
+            );
+        }
+
+        let expected: BTreeSet<String> = [
+            "cancel",
+            "capabilities",
+            "columns",
+            "connection",
+            "connections",
+            "cost_estimate",
+            "data",
+            "driver",
+            "error",
+            "free_preview",
+            "hierarchy",
+            "id",
+            "loaded",
+            "name",
+            "nullable",
+            "path",
+            "profile",
+            "profiles",
+            "relation_kind",
+            "response",
+            "returned",
+            "rows",
+            "sortable_preview",
+            "state",
+            "status",
+            "total",
+            "truncated",
+            "type_name",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        assert_eq!(found, expected);
     }
 
     #[tokio::test]

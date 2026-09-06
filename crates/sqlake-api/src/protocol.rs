@@ -205,6 +205,40 @@ pub enum Response {
     Failed(Failure),
 }
 
+/// Generates the response kinds and their list together, for the same reason
+/// [`RequestKind`] exists: a check over "every response" has to be able to name
+/// them all.
+macro_rules! response_kinds {
+    ($($name:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum ResponseKind {
+            $($name),*
+        }
+
+        impl ResponseKind {
+            pub const ALL: &'static [Self] = &[$(Self::$name),*];
+        }
+    };
+}
+
+response_kinds!(Snapshot, Schema, Connections, Nodes, Page, Failed);
+
+impl Response {
+    /// Exhaustive on purpose, so a new response cannot be added without the
+    /// check on what crosses the socket being told about it.
+    #[must_use]
+    pub const fn kind(&self) -> ResponseKind {
+        match self {
+            Self::Snapshot(_) => ResponseKind::Snapshot,
+            Self::Schema(_) => ResponseKind::Schema,
+            Self::Connections(_) => ResponseKind::Connections,
+            Self::Nodes(_) => ResponseKind::Nodes,
+            Self::Page(_) => ResponseKind::Page,
+            Self::Failed(_) => ResponseKind::Failed,
+        }
+    }
+}
+
 /// The request and response schema, generated from the types.
 ///
 /// Both under one root because a caller wants the pair: a schema for requests
