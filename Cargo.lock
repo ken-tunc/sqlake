@@ -3908,6 +3908,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
+ "sqlake-api",
  "sqlake-app",
  "sqlake-config",
  "sqlake-core",

@@ -1,5 +1,7 @@
 //! Argument parsing, dependency wiring, startup. Nothing else lives here.
 
+mod agent;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,11 +67,27 @@ struct Args {
     /// tidy exit path, and the only honest way to check that is to panic.
     #[arg(long, hide = true)]
     panic_test: bool,
+
+    /// Answer one request and exit, instead of opening the client.
+    ///
+    /// The agent surface's one-shot mode. Every other flag still applies:
+    /// `--mock` picks the built-in database, `--connect` picks a profile.
+    #[command(subcommand)]
+    command: Option<agent::Command>,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let args = Args::parse();
     let _log = init_logging(&args.log_level)?;
+
+    // Before the panic hook and the terminal guard: a subcommand never takes
+    // the screen, and installing a hook that restores a terminal nobody entered
+    // would leave a stray reset in the middle of a caller's JSON.
+    if let Some(command) = &args.command {
+        let (profiles, settings) = configuration(&args)?;
+        let connect = opening(&profiles, &args)?.into_iter().next();
+        return agent::run(command, drivers(), profiles, settings.page_size, connect);
+    }
 
     // Every mode change is undone by the guard's `Drop`, and the hook routes a
     // panic through the same function. Installed before the guard exists so a
@@ -117,7 +135,7 @@ fn main() -> Result<()> {
     // The guard restores the screen as it drops, which happens on the way out
     // of this function whether `result` is an error or not.
     result.context("the render loop stopped")?;
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Every driver this build can talk to.

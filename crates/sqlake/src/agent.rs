@@ -1,0 +1,367 @@
+//! The subcommands, and the one-shot run behind them.
+//!
+//! One-shot starts a store, opens one connection, answers one request and tears
+//! the store down. It is the mode that works in CI and in a fresh shell, and it
+//! is the simpler of the two, so it is the one built first — the socket reuses
+//! the same [`Service`] against a store somebody else started.
+//!
+//! JSON goes to stdout and nothing else does. Diagnostics go to stderr, so a
+//! caller can pipe stdout into a parser without filtering prose out of it.
+
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use clap::{Args as ClapArgs, Subcommand};
+use sqlake_api::{Failure, Request, Response, Service};
+use sqlake_app::action::Action;
+use sqlake_app::store::{Drivers, Store};
+use sqlake_core::id::{ConnId, ProfileId};
+use sqlake_core::profile::Profiles;
+
+/// What a caller can ask for from the command line.
+///
+/// Noun then verb, and one subcommand per [`Request`]. The mapping is
+/// deliberately dull: a subcommand that did more than name a request would be
+/// behaviour the socket does not have.
+#[derive(Debug, Subcommand)]
+pub(crate) enum Command {
+    /// The surface itself.
+    Api {
+        #[command(subcommand)]
+        what: ApiCommand,
+    },
+    /// Connections open in this session.
+    Connection {
+        #[command(subcommand)]
+        what: ConnectionCommand,
+    },
+    /// Namespaces — what a driver calls a schema or a dataset.
+    Schema {
+        #[command(subcommand)]
+        what: SchemaCommand,
+    },
+    /// Relations, and their contents.
+    Table {
+        #[command(subcommand)]
+        what: TableCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ApiCommand {
+    /// The session's connections and the profiles it could open.
+    Snapshot,
+    /// The request and response schema, generated from the protocol types.
+    Schema,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConnectionCommand {
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SchemaCommand {
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum TableCommand {
+    /// The relations in one namespace.
+    List {
+        #[command(flatten)]
+        path: Path,
+    },
+    /// A page of one relation.
+    Preview {
+        #[command(flatten)]
+        path: Path,
+        /// Sort by a column, by its index in the page's `columns`.
+        #[arg(long)]
+        sort: Option<usize>,
+        /// Fewer rows than the budget allows. It cannot ask for more.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+/// A path through the object tree.
+///
+/// Dotted, because `public.users` is what anybody types. A name that itself
+/// contains a dot is a real thing, though — the protocol carries whole paths
+/// rather than a joined name for exactly that reason — so `--part` gives a
+/// segment verbatim and is what to reach for when splitting would be wrong.
+#[derive(Debug, ClapArgs)]
+pub(crate) struct Path {
+    /// `public.users`, or `public` for a namespace.
+    #[arg(value_name = "PATH", required_unless_present = "part")]
+    dotted: Option<String>,
+
+    /// One segment, taken as written. Repeat it for a deeper path.
+    #[arg(long = "part", value_name = "SEGMENT", conflicts_with = "dotted")]
+    part: Vec<String>,
+}
+
+impl Path {
+    fn segments(&self) -> Vec<String> {
+        if self.part.is_empty() {
+            self.dotted
+                .iter()
+                .flat_map(|d| d.split('.'))
+                .map(str::to_owned)
+                .collect()
+        } else {
+            self.part.clone()
+        }
+    }
+}
+
+impl Command {
+    /// The request this subcommand names, against a connection the caller has
+    /// already opened.
+    fn request(&self, connection: String) -> Request {
+        match self {
+            Self::Api {
+                what: ApiCommand::Snapshot,
+            } => Request::Snapshot {},
+            Self::Api {
+                what: ApiCommand::Schema,
+            } => Request::Schema {},
+            Self::Connection {
+                what: ConnectionCommand::List,
+            } => Request::ConnectionList {},
+            Self::Schema {
+                what: SchemaCommand::List,
+            } => Request::NamespaceList { connection },
+            Self::Table {
+                what: TableCommand::List { path },
+            } => Request::TableList {
+                connection,
+                namespace: path.segments(),
+            },
+            Self::Table {
+                what: TableCommand::Preview { path, sort, limit },
+            } => Request::TablePreview {
+                connection,
+                table: path.segments(),
+                sort: sort.map(|column| sqlake_api::SortBy { column }),
+                limit: *limit,
+            },
+        }
+    }
+
+    /// Whether answering this needs a database at all.
+    ///
+    /// `api schema` describes the protocol, which is a fact about the build
+    /// rather than about a session. Opening a connection to print it would put
+    /// a keyring prompt in front of somebody asking what the commands are.
+    const fn needs_a_connection(&self) -> bool {
+        !matches!(
+            self,
+            Self::Api {
+                what: ApiCommand::Schema
+            }
+        )
+    }
+}
+
+/// Run one command against a store this process starts and stops.
+///
+/// The store is dropped at the end rather than shut down gracefully: nothing
+/// here has state worth flushing, and a connection whose profile is sitting on
+/// a keyring dialog would otherwise hold the exit open behind a window nobody
+/// is looking at.
+pub(crate) fn run(
+    command: &Command,
+    drivers: Drivers,
+    profiles: Arc<dyn Profiles>,
+    page_size: u32,
+    connect: Option<ProfileId>,
+) -> Result<std::process::ExitCode> {
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    let response = runtime.block_on(async {
+        let service = Service::new(Store::spawn(drivers, profiles, page_size));
+        let connection = if command.needs_a_connection() {
+            open(service.store(), connect).await?
+        } else {
+            String::new()
+        };
+        anyhow::Ok(service.answer(&command.request(connection)).await)
+    });
+    // The runtime goes without waiting for anything still resolving a profile,
+    // for the reason in the doc comment above.
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            runtime.shutdown_background();
+            return Err(error);
+        }
+    };
+    runtime.shutdown_background();
+
+    print(&response)
+}
+
+/// Open the one connection a one-shot command reads through.
+///
+/// One, not every configured profile: opening the rest would put a connection
+/// attempt and possibly a credential prompt in front of a caller that asked
+/// about a single table.
+async fn open(store: &Store, connect: Option<ProfileId>) -> Result<String> {
+    let profile = match connect {
+        Some(id) => id,
+        None => store
+            .snapshot()
+            .profiles
+            .first()
+            .map(|p| p.id.clone())
+            .context("no connection profiles are configured")?,
+    };
+    let conn = ConnId::new();
+    // Settled here rather than left to the request: `dispatch` only queues, so
+    // returning the id straight away hands the service a connection that is not
+    // in any snapshot yet — and "no such connection" is what it would say about
+    // the one this command just opened.
+    store
+        .dispatch_and_settle(
+            Action::Connect { profile, conn },
+            sqlake_api::DEFAULT_TIMEOUT,
+            |s| s.connection_settled(conn),
+        )
+        .await
+        .context("opening the connection")?;
+    Ok(conn.to_string())
+}
+
+/// Print the response, and say in the exit status whether it was a failure.
+///
+/// Both, rather than one or the other. The JSON is the whole answer, so it is
+/// printed for a failure too — a caller that reads stdout gets the reason
+/// rather than an empty stream. The status is there so a shell script can
+/// branch without a JSON parser, which is the thing `set -e` is already
+/// watching.
+fn print(response: &Response) -> Result<std::process::ExitCode> {
+    let json = serde_json::to_string_pretty(response).context("serialising the response")?;
+    println!("{json}");
+
+    if let Response::Failed(failure) = response {
+        eprintln!("{}", diagnostic(failure));
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The one-line version, for a person watching the terminal.
+fn diagnostic(failure: &Failure) -> String {
+    match failure {
+        Failure::NoSuchConnection { connection } => {
+            format!("no connection called `{connection}` is open")
+        }
+        Failure::NotFound { path } => format!("`{}` is not in this connection", path.join(".")),
+        Failure::Driver { message } => message.clone(),
+        Failure::Timeout { waited_ms } => {
+            format!(
+                "gave up after {waited_ms}ms. A profile that needs a prompt has to be opened in a session"
+            )
+        }
+        Failure::Unsupported { message } => message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+
+    /// Parses the way the real binary does, so the subcommand tree is checked
+    /// rather than described.
+    #[derive(Debug, clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    fn parse(args: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("sqlake").chain(args.iter().copied()))
+            .expect("the arguments parse")
+            .command
+    }
+
+    #[test]
+    fn a_dotted_path_is_a_path() {
+        let command = parse(&["table", "preview", "public.users"]);
+        assert_eq!(
+            command.request("c".into()),
+            Request::TablePreview {
+                connection: "c".into(),
+                table: vec!["public".into(), "users".into()],
+                sort: None,
+                limit: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_containing_a_dot_can_still_be_named() {
+        // The reason the protocol carries a path rather than a name to rejoin.
+        // Splitting `my.schema` would ask for a table in a namespace nobody
+        // has, and the answer would be a plausible-looking "not found".
+        let command = parse(&["table", "list", "--part", "my.schema"]);
+        assert_eq!(
+            command.request("c".into()),
+            Request::TableList {
+                connection: "c".into(),
+                namespace: vec!["my.schema".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_path_is_required_where_one_is_needed() {
+        assert!(Cli::try_parse_from(["sqlake", "table", "preview"]).is_err());
+    }
+
+    #[test]
+    fn the_two_ways_of_giving_a_path_cannot_be_mixed() {
+        assert!(
+            Cli::try_parse_from(["sqlake", "table", "list", "public", "--part", "x"]).is_err(),
+            "a path given twice would silently use one of them"
+        );
+    }
+
+    #[test]
+    fn every_subcommand_names_a_request() {
+        let commands = [
+            (parse(&["api", "snapshot"]), Request::Snapshot {}),
+            (parse(&["api", "schema"]), Request::Schema {}),
+            (parse(&["connection", "list"]), Request::ConnectionList {}),
+            (
+                parse(&["schema", "list"]),
+                Request::NamespaceList {
+                    connection: "c".into(),
+                },
+            ),
+        ];
+        for (command, expected) in commands {
+            assert_eq!(command.request("c".into()), expected);
+        }
+    }
+
+    #[test]
+    fn only_the_schema_is_answerable_without_a_database() {
+        assert!(!parse(&["api", "schema"]).needs_a_connection());
+        assert!(parse(&["api", "snapshot"]).needs_a_connection());
+        assert!(parse(&["connection", "list"]).needs_a_connection());
+        assert!(parse(&["table", "preview", "public.users"]).needs_a_connection());
+    }
+
+    #[test]
+    fn a_limit_reaches_the_request() {
+        let command = parse(&["table", "preview", "public.users", "--limit", "3"]);
+        assert!(matches!(
+            command.request("c".into()),
+            Request::TablePreview { limit: Some(3), .. }
+        ));
+    }
+}

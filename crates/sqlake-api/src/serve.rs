@@ -1,0 +1,540 @@
+//! Answering a [`Request`] from a store.
+//!
+//! The half both front-ends of the agent surface share: one-shot runs it
+//! against a store it started itself, and the socket server runs it against the
+//! store a person is already using. Neither knows anything the other does not,
+//! which is the point — an attached command and a one-shot command differ in
+//! where the store came from and nowhere else.
+//!
+//! Nothing here constructs a query. Every request becomes an `Action` the
+//! interactive client also sends, and a wait for the store to settle.
+
+use std::time::Duration;
+
+use sqlake_app::action::Action;
+use sqlake_app::snapshot::{LoadState, Snapshot};
+use sqlake_app::store::Store;
+use sqlake_app::wait::WaitError;
+use sqlake_core::id::ConnId;
+use sqlake_core::node::{NodeRef, TableRef};
+use sqlake_core::result::{Sort, SortDir};
+
+use crate::page::{Budget, Page};
+use crate::protocol::{Failure, Request, Response, schema};
+use crate::snapshot::{ConnectionInfo, NodeInfo, SessionInfo};
+
+/// How long a request waits for the store before giving up.
+///
+/// Generous, because the wait is for a database rather than for the process:
+/// a cold BigQuery connection or a `gcloud` token refresh can take seconds, and
+/// a caller that gave up at one would report a timeout for something that was
+/// about to work.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A store, and the policy for reading it.
+#[derive(Debug)]
+pub struct Service {
+    store: Store,
+    budget: Budget,
+    timeout: Duration,
+}
+
+impl Service {
+    #[must_use]
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            budget: Budget::DEFAULT,
+            timeout: DEFAULT_TIMEOUT,
+        }
+    }
+
+    #[must_use]
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Answer one request.
+    ///
+    /// Returns a [`Response`] for every outcome, including the failures: a
+    /// request that could not be answered was still delivered and understood,
+    /// and a caller distinguishing "no such table" from "the socket died" wants
+    /// the first as data.
+    pub async fn answer(&self, request: &Request) -> Response {
+        match request {
+            Request::Schema {} => Response::Schema(schema()),
+            Request::Snapshot {} => Response::Snapshot(SessionInfo::from(&*self.store.snapshot())),
+            Request::ConnectionList {} => Response::Connections(
+                self.store
+                    .snapshot()
+                    .connections
+                    .iter()
+                    .map(ConnectionInfo::from)
+                    .collect(),
+            ),
+            Request::NamespaceList { connection } => self
+                .namespaces(connection)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::TableList {
+                connection,
+                namespace,
+            } => self
+                .children(connection, namespace)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::TablePreview {
+                connection,
+                table,
+                sort,
+                ..
+            } => self
+                .preview(
+                    connection,
+                    table,
+                    sort.map(|s| s.column),
+                    request.budget(self.budget),
+                )
+                .await
+                .unwrap_or_else(Response::Failed),
+        }
+    }
+
+    /// The connection this request names, once it has finished opening.
+    ///
+    /// Resolved by comparing the id it prints rather than by parsing one: an id
+    /// that is well formed but not open and an id that is not an id at all are
+    /// the same answer to the caller, and only one of the two would survive a
+    /// parse.
+    async fn connection(&self, id: &str) -> Result<ConnId, Failure> {
+        let conn = self
+            .store
+            .snapshot()
+            .connections
+            .iter()
+            .find(|c| c.id.to_string() == id)
+            .map(|c| c.id)
+            .ok_or_else(|| Failure::NoSuchConnection {
+                connection: id.to_owned(),
+            })?;
+        let settled = self.settle(|s| s.connection_settled(conn)).await?;
+        match settled.connection(conn).map(|c| &c.status) {
+            Some(sqlake_app::snapshot::ConnStatus::Failed(why)) => Err(Failure::Driver {
+                message: why.clone(),
+            }),
+            _ => Ok(conn),
+        }
+    }
+
+    async fn namespaces(&self, connection: &str) -> Result<Response, Failure> {
+        let conn = self.connection(connection).await?;
+        // A connection's first level arrives with `Connect`, so this is a read
+        // rather than a fetch.
+        let snapshot = self.store.snapshot();
+        Ok(Response::Nodes(
+            snapshot
+                .objects(conn)
+                .filter(|n| n.node_ref.depth() == 1)
+                .map(NodeInfo::from)
+                .collect(),
+        ))
+    }
+
+    async fn children(&self, connection: &str, namespace: &[String]) -> Result<Response, Failure> {
+        let conn = self.connection(connection).await?;
+        // The node is taken from the tree rather than built from the path: its
+        // `NodeKind` is the driver's, and guessing one here would be this crate
+        // deciding whether a level is a schema or a dataset.
+        let node = self.resolve(conn, namespace).await?;
+        let settled = self
+            .dispatch_and_settle(
+                Action::ExpandNode {
+                    conn,
+                    node: node.clone(),
+                },
+                |s| s.node_settled(conn, &node),
+            )
+            .await?;
+        Ok(Response::Nodes(
+            settled
+                .objects(conn)
+                .filter(|n| n.node_ref.path.len() == namespace.len() + 1)
+                .filter(|n| n.node_ref.path.starts_with(namespace))
+                .map(NodeInfo::from)
+                .collect(),
+        ))
+    }
+
+    async fn preview(
+        &self,
+        connection: &str,
+        path: &[String],
+        sort: Option<usize>,
+        budget: Budget,
+    ) -> Result<Response, Failure> {
+        let conn = self.connection(connection).await?;
+        let table =
+            self.resolve(conn, path)
+                .await?
+                .as_table()
+                .ok_or_else(|| Failure::Unsupported {
+                    message: format!("{} is not a relation", path.join(".")),
+                })?;
+
+        let settled = self
+            .dispatch_and_settle(
+                Action::PreviewTable {
+                    conn,
+                    table: table.clone(),
+                },
+                |s| s.preview_settled(conn, &table),
+            )
+            .await?;
+        let settled = match sort {
+            Some(column) => self.sorted(conn, &table, column, settled).await?,
+            None => settled,
+        };
+
+        match settled.preview(conn, &table).map(|p| &p.data) {
+            Some(LoadState::Ready(result)) => Ok(Response::Page(Page::of(result, budget))),
+            Some(LoadState::Failed(why)) => Err(Failure::Driver {
+                message: why.clone(),
+            }),
+            // Settled but neither ready nor failed: the preview was forgotten
+            // under this caller, which on a shared session is a person closing
+            // the tab it was reading.
+            _ => Err(Failure::NotFound {
+                path: path.to_vec(),
+            }),
+        }
+    }
+
+    /// Sorting is a second action against a preview that already exists,
+    /// because `SortPreview` sorts what is loaded rather than fetching.
+    ///
+    /// The store toggles rather than taking a direction, so a request asking
+    /// for a column the preview is already sorted by would reverse it. Asked
+    /// for once, ascending is what a caller with no previous state means.
+    async fn sorted(
+        &self,
+        conn: ConnId,
+        table: &TableRef,
+        column: usize,
+        settled: std::sync::Arc<Snapshot>,
+    ) -> Result<std::sync::Arc<Snapshot>, Failure> {
+        if settled.preview(conn, table).and_then(|p| p.sort)
+            == Some(Sort::new(column, SortDir::Asc))
+        {
+            return Ok(settled);
+        }
+        self.dispatch_and_settle(
+            Action::SortPreview {
+                conn,
+                table: table.clone(),
+                column,
+            },
+            |s| s.preview_settled(conn, table),
+        )
+        .await
+    }
+
+    /// The node at this path, loading whatever has to be loaded to reach it.
+    ///
+    /// A caller names a path; it does not replay the clicks a person would have
+    /// made to bring that path onto a screen. Only the first level arrives with
+    /// `Connect`, so `public.users` is not in the tree until `public` has been
+    /// expanded — and requiring a `table_list` first would make every preview a
+    /// two-call sequence whose first call the caller does not want the answer
+    /// to.
+    ///
+    /// `ExpandNode` rather than `ToggleNode` is what makes this safe to repeat:
+    /// an ancestor somebody already opened stays open (D2).
+    async fn resolve(&self, conn: ConnId, path: &[String]) -> Result<NodeRef, Failure> {
+        for depth in 1..path.len() {
+            let ancestor = self.node(conn, &path[..depth])?;
+            self.dispatch_and_settle(
+                Action::ExpandNode {
+                    conn,
+                    node: ancestor.clone(),
+                },
+                |s| s.node_settled(conn, &ancestor),
+            )
+            .await?;
+        }
+        self.node(conn, path)
+    }
+
+    fn node(&self, conn: ConnId, path: &[String]) -> Result<NodeRef, Failure> {
+        self.store
+            .snapshot()
+            .objects(conn)
+            .find(|n| n.node_ref.path == path)
+            .map(|n| n.node_ref.clone())
+            .ok_or_else(|| Failure::NotFound {
+                path: path.to_vec(),
+            })
+    }
+
+    async fn settle(
+        &self,
+        done: impl Fn(&Snapshot) -> bool,
+    ) -> Result<std::sync::Arc<Snapshot>, Failure> {
+        self.store
+            .settle(self.timeout, done)
+            .await
+            .map_err(|e| self.waited(e))
+    }
+
+    async fn dispatch_and_settle(
+        &self,
+        action: Action,
+        done: impl Fn(&Snapshot) -> bool,
+    ) -> Result<std::sync::Arc<Snapshot>, Failure> {
+        self.store
+            .dispatch_and_settle(action, self.timeout, done)
+            .await
+            .map_err(|e| self.waited(e))
+    }
+
+    fn waited(&self, error: WaitError) -> Failure {
+        match error {
+            WaitError::TimedOut => Failure::Timeout {
+                waited_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+            },
+            WaitError::Stopped => Failure::Driver {
+                message: "the session has stopped".to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sqlake_core::id::ProfileId;
+    use sqlake_core::result::PageRequest;
+    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
+
+    use super::*;
+    use crate::protocol::SortBy;
+
+    async fn service(behaviour: Behaviour) -> (Service, String) {
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
+            Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
+        );
+        let conn = ConnId::new();
+        store
+            .dispatch_and_settle(
+                Action::Connect {
+                    profile: ProfileId::parse("mock").expect("a usable id"),
+                    conn,
+                },
+                DEFAULT_TIMEOUT,
+                |s| s.connection_settled(conn),
+            )
+            .await
+            .expect("the connection settles");
+        (Service::new(store), conn.to_string())
+    }
+
+    use sqlake_app::store::Drivers;
+
+    fn nodes(response: &Response) -> &[NodeInfo] {
+        match response {
+            Response::Nodes(nodes) => nodes,
+            other => panic!("expected nodes, got {other:?}"),
+        }
+    }
+
+    fn page(response: &Response) -> &Page {
+        match response {
+            Response::Page(page) => page,
+            other => panic!("expected a page, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_schema_needs_no_connection() {
+        let (service, _) = service(Behaviour::instant()).await;
+        let answer = service.answer(&Request::Schema {}).await;
+        assert!(matches!(answer, Response::Schema(_)));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_connection_is_a_failure_rather_than_a_wait() {
+        let (service, _) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::NamespaceList {
+                connection: "not-an-id".into(),
+            })
+            .await;
+        assert_eq!(
+            answer,
+            Response::Failed(Failure::NoSuchConnection {
+                connection: "not-an-id".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_namespaces_are_the_first_level_whatever_the_driver_calls_it() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::NamespaceList { connection: conn })
+            .await;
+        let names: Vec<&str> = nodes(&answer).iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"public"), "{names:?}");
+        assert!(
+            nodes(&answer).iter().all(|n| n.path.len() == 1),
+            "a deeper node was reported as a namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_a_namespace_fetches_it() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TableList {
+                connection: conn,
+                namespace: vec!["public".into()],
+            })
+            .await;
+        let names: Vec<&str> = nodes(&answer).iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"users"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_namespace_that_is_not_there_is_not_a_timeout() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TableList {
+                connection: conn,
+                namespace: vec!["nowhere".into()],
+            })
+            .await;
+        assert_eq!(
+            answer,
+            Response::Failed(Failure::NotFound {
+                path: vec!["nowhere".into()]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_reads_a_page() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TablePreview {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                sort: None,
+                limit: None,
+            })
+            .await;
+        let page = page(&answer);
+        assert!(!page.rows.is_empty());
+        assert_eq!(page.returned, page.rows.len());
+    }
+
+    #[tokio::test]
+    async fn a_preview_needs_no_listing_first() {
+        // Only the first level arrives with `Connect`, so `public.users` is not
+        // in the tree until `public` is expanded. Requiring the caller to ask
+        // for a listing it does not want makes every preview two calls, and the
+        // failure without it looks like the table is missing.
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TablePreview {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                sort: None,
+                limit: Some(1),
+            })
+            .await;
+        assert!(!page(&answer).rows.is_empty(), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn a_limit_cuts_the_page_and_the_page_says_so() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TablePreview {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                sort: None,
+                limit: Some(3),
+            })
+            .await;
+        let page = page(&answer);
+        assert_eq!(page.returned, 3);
+        assert!(page.truncated, "a cut page did not say it was cut");
+        assert!(page.loaded > 3, "nothing was actually left out");
+    }
+
+    #[tokio::test]
+    async fn a_sort_asked_for_once_is_ascending() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let request = Request::TablePreview {
+            connection: conn,
+            table: vec!["public".into(), "users".into()],
+            sort: Some(SortBy { column: 1 }),
+            limit: Some(5),
+        };
+        let first = page(&service.answer(&request).await).clone();
+        // Asked for again, it must not toggle: the store sorts by toggling, and
+        // a caller with no previous state means "ascending" both times.
+        let again = page(&service.answer(&request).await).clone();
+        assert_eq!(first.rows, again.rows);
+    }
+
+    #[tokio::test]
+    async fn previewing_something_that_is_not_a_relation_says_so() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TablePreview {
+                connection: conn,
+                table: vec!["public".into()],
+                sort: None,
+                limit: None,
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Unsupported { .. })),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_fails_reports_its_message_rather_than_timing_out() {
+        let (service, conn) = service(Behaviour {
+            failing_nodes: vec![vec!["restricted".to_owned()]],
+            ..Behaviour::instant()
+        })
+        .await;
+        let answer = service
+            .answer(&Request::TableList {
+                connection: conn,
+                namespace: vec!["restricted".into()],
+            })
+            .await;
+        // The node settles into `Failed`, and its error travels as the node's
+        // rather than as the request's: the request was answered.
+        let nodes = nodes(&answer);
+        assert!(nodes.is_empty(), "a failed expansion produced children");
+    }
+}
