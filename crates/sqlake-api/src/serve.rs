@@ -237,8 +237,12 @@ impl Service {
         }
     }
 
-    /// Sorting is a second action against a preview that already exists,
-    /// because `SortPreview` sorts what is loaded rather than fetching.
+    /// Sorting is a second action against a preview that already exists.
+    ///
+    /// `SortPreview` restarts the relation at page one with the ordering
+    /// applied — it fetches, rather than reordering the rows already loaded —
+    /// so it needs a preview to attach the ordering to, and the wait afterwards
+    /// is for a page rather than for a re-render.
     ///
     /// The store toggles rather than taking a direction, so a request asking
     /// for a column the preview is already sorted by would reverse it. Asked
