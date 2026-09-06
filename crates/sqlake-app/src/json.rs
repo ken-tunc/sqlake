@@ -1,5 +1,15 @@
 //! `Value` as the JSON that loses least.
 //!
+//! Here rather than in either front-end because both want it and neither may
+//! depend on the other: `sqlake-api` writes it onto a socket, and `sqlake-tui`
+//! writes it onto the clipboard when somebody copies cells as JSON. Two copies
+//! would be two answers to one question, and the one that drifted would be the
+//! one nobody was reading at the time.
+//!
+//! It does not break the rule that keeps display decisions out of this crate.
+//! There are no widths here, no glyphs and no elision — JSON is what a value
+//! *is* once it leaves the process, and the abbreviating is the front-ends'.
+//!
 //! Not the JSON that looks best, and emphatically not what the TUI draws. The
 //! terminal's rules are all wrong here: `∅` does not parse as null, a document
 //! collapsed to `{2 keys}` destroys exactly what was asked for, and a newline

@@ -67,6 +67,17 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
             dirty = false;
         }
 
+        // After the frame, through the terminal's own writer. The alternate
+        // screen is up, so a second thing reaching for stdout would corrupt
+        // it — and OSC 52 is the one escape sequence here that is not the
+        // renderer's.
+        if let Some(sequence) = ui.take_copy() {
+            use std::io::Write as _;
+            let backend = terminal.backend_mut();
+            backend.write_all(sequence.as_bytes())?;
+            backend.flush()?;
+        }
+
         if snapshot.should_quit {
             return Ok(());
         }
@@ -1166,6 +1177,82 @@ mod tests {
             ui.grid(id).expect("a grid").selected_cells(None),
             None,
             "moving the cursor left the old anchor behind"
+        );
+    }
+
+    async fn copyable() -> (Arc<Snapshot>, UiState) {
+        let (_store, snap, mut ui, _) = opened(
+            store(),
+            sqlake_core::node::TableRef::new(["public", "users"]),
+        )
+        .await;
+        let _ = ui.apply(crate::intent::ViewCmd::FocusPane(PaneId::Grid), &snap);
+        (snap, ui)
+    }
+
+    #[tokio::test]
+    async fn copying_the_selection_sends_a_sequence_and_says_what_it_sent() {
+        let (snap, mut ui) = copyable().await;
+        let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
+        let _ = ui.apply(
+            crate::intent::ViewCmd::ExtendCellSelection { drow: 2, dcol: 1 },
+            &snap,
+        );
+        let _ = ui.apply(
+            crate::intent::ViewCmd::Copy {
+                format: crate::copy::Format::Csv,
+                all: false,
+            },
+            &snap,
+        );
+
+        let sequence = ui.take_copy().expect("a sequence to write");
+        assert!(sequence.starts_with("\u{1b}]52;c;"), "{sequence:?}");
+        assert!(
+            ui.toasts.iter().any(|t| t.text.contains("6 cells")),
+            "{:?}",
+            ui.toasts
+        );
+        assert!(
+            ui.take_copy().is_none(),
+            "the same sequence would be written on the next frame too"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_is_reported_is_what_was_sent_and_not_that_it_arrived() {
+        // OSC 52 has no reply, and a terminal with clipboard writes off
+        // swallows it. "Copied" would be a claim nothing here can check.
+        let (snap, mut ui) = copyable().await;
+        let _ = ui.apply(
+            crate::intent::ViewCmd::Copy {
+                format: crate::copy::Format::Csv,
+                all: false,
+            },
+            &snap,
+        );
+        let said = ui.toasts.last().expect("a toast").text.clone();
+        assert!(said.contains("sent"), "{said}");
+        assert!(!said.contains("copied"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn copying_everything_takes_the_whole_result_rather_than_the_selection() {
+        let (snap, mut ui) = copyable().await;
+        let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
+        let _ = ui.apply(
+            crate::intent::ViewCmd::Copy {
+                format: crate::copy::Format::Json,
+                all: true,
+            },
+            &snap,
+        );
+        assert!(ui.take_copy().is_some());
+        // `public.users` is 50 rows of 8 columns.
+        assert!(
+            ui.toasts.iter().any(|t| t.text.contains("400 cells")),
+            "{:?}",
+            ui.toasts
         );
     }
 

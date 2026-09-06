@@ -214,6 +214,15 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::ToggleDetail,
     },
     KeyBinding {
+        // `y` for the selection and `Y` for the whole result, which is the pair
+        // vi already taught; `c` and `C` are the same two as JSON. `Ctrl-c` is
+        // not available — it is the terminal's interrupt, and taking it would
+        // mean a grid somebody cannot get out of.
+        keys: &[key('y'), key('Y'), key('c'), key('C')],
+        context: Context::Grid,
+        kind: IntentKind::Copy,
+    },
+    KeyBinding {
         keys: &[KeyCombo::new(KeyCode::Esc)],
         context: Context::Modal,
         kind: IntentKind::DismissModal,
@@ -804,6 +813,19 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         // Nothing to show in full when there is no grid to have chosen a cell
         // in, and a pane opening onto "no cell selected" is a gesture that
         // appeared to do something.
+        IntentKind::Copy => {
+            // Two axes on one gesture: the case says how much, and the letter
+            // says which format.
+            let all = matches!(event.code, KeyCode::Char('Y' | 'C'));
+            let format = if matches!(event.code, KeyCode::Char('c' | 'C')) {
+                crate::copy::Format::Json
+            } else {
+                crate::copy::Format::Csv
+            };
+            ctx.active_tab
+                .map(|_| vec![ViewCmd::Copy { format, all }.into()])
+                .unwrap_or_default()
+        }
         IntentKind::ToggleDetail => ctx
             .active_tab
             .map(|_| vec![ViewCmd::ToggleDetail.into()])

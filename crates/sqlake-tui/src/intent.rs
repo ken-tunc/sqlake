@@ -103,6 +103,15 @@ pub enum ViewCmd {
 
     /// Open or close the pane that shows one cell in full.
     ToggleDetail,
+    /// Put the selection on the clipboard.
+    ///
+    /// The scope is the selection: one cell is a rectangle of one, and
+    /// `CopyAll` is the separate answer for the whole result because "extend
+    /// the selection over two hundred thousand rows first" is not one.
+    Copy {
+        format: crate::copy::Format,
+        all: bool,
+    },
     DismissModal,
 
     /// A relation now has a tab open for it, focused — raising the existing
@@ -153,6 +162,7 @@ intent_kinds! {
     MoveSplit          => "move the split between panes",
     EvenSplit          => "reset the split",
     ToggleDetail       => "show a cell in full",
+    Copy               => "copy cells to the clipboard",
     DismissModal       => "close the dialog",
     Filter             => "search the explorer",
 
@@ -197,6 +207,7 @@ impl IntentKind {
                 ViewCmd::MoveSplit { .. } => Self::MoveSplit,
                 ViewCmd::EvenSplit(_) => Self::EvenSplit,
                 ViewCmd::ToggleDetail => Self::ToggleDetail,
+                ViewCmd::Copy { .. } => Self::Copy,
                 ViewCmd::DismissModal => Self::DismissModal,
                 // Paired with `Action::PreviewTable`: one capability,
                 // "open a relation", not two.
