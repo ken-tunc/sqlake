@@ -56,6 +56,12 @@ const MAX_PATH: usize = 100;
 /// If neither a runtime directory nor a home directory can be found, or if the
 /// path that gives is longer than a Unix socket can be named by.
 pub fn socket_path(session: &str) -> io::Result<PathBuf> {
+    if !is_a_name(session) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{session}` is not a session name: one path component, and not `.` or `..`"),
+        ));
+    }
     let dir = sqlake_config::paths::runtime_dir().map_err(io::Error::other)?;
     let path = dir.join(format!("{session}.sock"));
     if path.as_os_str().len() > MAX_PATH {
@@ -69,6 +75,18 @@ pub fn socket_path(session: &str) -> io::Result<PathBuf> {
         ));
     }
     Ok(path)
+}
+
+/// Whether a name can be one component of the runtime directory and nothing
+/// more.
+///
+/// Checked, because a name is typed by hand and exported by shell profiles, so
+/// `$SQLAKE_SESSION=$PWD` is an ordinary mistake rather than an attack. A name
+/// holding a `/` puts the socket outside the directory whose `0700` is what
+/// keeps other users out — and [`Listener::bind`] would have created and
+/// chmodded whatever directory it landed in on the way.
+fn is_a_name(session: &str) -> bool {
+    !session.is_empty() && session != "." && session != ".." && !session.contains(['/', '\0'])
 }
 
 /// A bound socket, which is removed when this is dropped.
@@ -106,6 +124,18 @@ impl Listener {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     format!("a session is already listening on {}", path.display()),
+                ));
+            }
+            // Only a socket is a dead session. Anything else at this path was
+            // put there by something that is not sqlake, and unlinking it
+            // would be this deleting a file on a guess.
+            if !is_a_socket(&path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} is not a socket, and will not be removed to make room for one",
+                        path.display()
+                    ),
                 ));
             }
             std::fs::remove_file(&path)?;
@@ -150,7 +180,14 @@ impl Listener {
                 // Accept failing is not a reason to stop answering: a single
                 // client hitting a file-descriptor limit would otherwise take
                 // the session's socket down with it.
-                Err(error) => tracing::warn!(%error, "accepting an agent connection"),
+                Err(error) => {
+                    tracing::warn!(%error, "accepting an agent connection");
+                    // The failures that matter here are the ones that persist
+                    // — the process out of descriptors — and they fail
+                    // instantly, so a bare retry would spin a core and fill
+                    // the log file for as long as the condition lasted.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
         }
     }
@@ -250,7 +287,12 @@ impl Client {
             })),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                let _ = std::fs::remove_file(path);
+                // Refused is also what connecting to a plain file gives, and
+                // that file is somebody else's. Only a socket is a session
+                // that died.
+                if is_a_socket(path) {
+                    let _ = std::fs::remove_file(path);
+                }
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -277,6 +319,17 @@ impl Client {
         }
         serde_json::from_str(&self.line).map_err(io::Error::other)
     }
+}
+
+/// Whether the path itself is a socket.
+///
+/// `symlink_metadata`, not `metadata`: a symlink pointing at a socket is not
+/// the socket, and following one would answer about a file that is not the one
+/// about to be unlinked.
+fn is_a_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
 }
 
 /// Owner-only, which on a path holding live credentials is the whole point.
@@ -370,13 +423,43 @@ mod tests {
     async fn a_socket_nothing_answers_on_is_not_a_session() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("stale.sock");
-        // What a crash leaves behind: the file, with nothing behind it.
-        std::fs::write(&path, b"").expect("a stale file");
+        // What a crash leaves behind: a real socket, with nothing behind it.
+        drop(
+            std::os::unix::net::UnixListener::bind(&path).expect("a socket with nothing behind it"),
+        );
 
         assert!(
             Listener::bind(path.clone()).await.is_ok(),
-            "a stale file made the session unstartable until somebody deleted it"
+            "a stale socket made the session unstartable until somebody deleted it"
         );
+    }
+
+    #[tokio::test]
+    async fn something_that_is_not_a_socket_is_not_unlinked() {
+        // The path is only ever sqlake's once the name is checked, but the
+        // removal is a deletion and it should never rest on a guess.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("not-a-socket.sock");
+        std::fs::write(&path, b"somebody else's").expect("a plain file");
+
+        assert!(Listener::bind(path.clone()).await.is_err());
+        // Whatever the platform makes of connecting to one — Linux refuses
+        // it, macOS calls it ENOTSOCK — the file is not this to delete.
+        drop(Client::attach(&path).await);
+        assert!(path.exists(), "a file that was not a socket was deleted");
+    }
+
+    #[test]
+    fn a_session_name_is_one_path_component() {
+        // `$SQLAKE_SESSION=$PWD` is the mistake this is for: it would put the
+        // socket outside the directory whose `0700` keeps other users out,
+        // after `bind` had chmodded whatever directory it landed in.
+        for bad in ["", ".", "..", "a/b", "../escape", "/tmp/absolute"] {
+            assert!(!is_a_name(bad), "`{bad}` was taken as a name");
+            assert!(socket_path(bad).is_err(), "`{bad}` named a socket");
+        }
+        assert!(is_a_name("work"));
+        assert!(is_a_name("my-project.2"));
     }
 
     #[tokio::test]

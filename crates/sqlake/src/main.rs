@@ -104,16 +104,27 @@ fn main() -> Result<std::process::ExitCode> {
             )
         } else {
             let (profiles, settings) = configuration(&args)?;
-            let connect = opening(&profiles, &args)?;
+            let named = opening(&profiles, &args)?;
             // One request, one connection. A second `--connect` is a caller
             // expecting an answer that covers both, and silently dropping it
             // answers about the first as though it had asked for only that.
             anyhow::ensure!(
-                connect.len() <= 1,
+                named.len() <= 1,
                 "--connect: a subcommand opens one connection, and {} were named",
-                connect.len()
+                named.len()
             );
-            (profiles, settings.page_size, connect.into_iter().next())
+            // Only a profile the caller actually named is a choice. `opening`
+            // falls back to the first configured profile, which one-shot would
+            // have picked anyway — but passing it on as a choice would make an
+            // attached command demand *that* profile of a session that has a
+            // different database open, and fail against a session it could
+            // have read through.
+            let connect = if args.connect.is_empty() {
+                None
+            } else {
+                named.into_iter().next()
+            };
+            (profiles, settings.page_size, connect)
         };
         // Resolved even for a command that starts its own store: attaching is
         // tried first, and a session that is running is always the better
@@ -123,10 +134,13 @@ fn main() -> Result<std::process::ExitCode> {
                 Ok(path) => Some(path),
                 // Not fatal: a path that cannot name a socket means no session can
                 // be reached, and the command runs its own store. Said out loud on
-                // stderr, because a caller that passed `--session` expected to
-                // attach and would otherwise see a slower answer and no reason.
+                // stderr, because a caller that named a session expected to attach
+                // and would otherwise see a slower answer and no reason — and said
+                // only then, since a caller that named none was never attaching.
                 Err(why) => {
-                    eprintln!("not attaching: {why}");
+                    if args.session.is_some() || std::env::var_os("SQLAKE_SESSION").is_some() {
+                        eprintln!("not attaching: {why}");
+                    }
                     None
                 }
             };

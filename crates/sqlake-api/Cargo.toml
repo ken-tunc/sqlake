@@ -19,7 +19,7 @@ sqlake-app.workspace = true
 sqlake-config.workspace = true
 sqlake-core.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

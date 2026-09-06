@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::{Args as ClapArgs, Subcommand};
-use sqlake_api::{ConnectionInfo, Failure, Request, Response, Service};
+use sqlake_api::{ConnectionInfo, Failure, Request, Response, Service, Status};
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
 use sqlake_core::id::{ConnId, ProfileId};
@@ -225,7 +225,13 @@ pub(crate) fn run(
         // socket exists: its connections, its tunnels and its already-answered
         // credential prompts are what a fresh store would have to pay for
         // again — and for a profile that needs a person, cannot.
-        if let Some(path) = session
+        //
+        // Not for a command that needs nothing: `api schema` is generated from
+        // this build's types, so asking a session would describe whichever
+        // binary happens to be running it, and would hang behind a session
+        // that is wedged — for an answer this process already has.
+        if command.needs() != Needs::Nothing
+            && let Some(path) = session
             && let Some(mut client) = sqlake_api::Client::attach(&path)
                 .await
                 .with_context(|| format!("reaching the session at {}", path.display()))?
@@ -284,12 +290,16 @@ async fn attached(
 /// Split from the asking so the decision is testable without a socket: the
 /// asking is one request, and the choosing is the part with rules.
 fn choose(open: &[ConnectionInfo], connect: Option<&ProfileId>) -> Result<String, Failure> {
-    let chosen = match connect {
-        Some(profile) => open.iter().find(|c| c.profile == profile.as_str()),
-        // The first, not "the only": a session with two connections open is
-        // ordinary, and picking one is what `--connect` is for.
-        None => open.first(),
-    };
+    // Everything when nothing was named: a session with two connections open
+    // is ordinary, and narrowing that is what `--connect` is for.
+    let asked_for = |c: &&ConnectionInfo| connect.is_none_or(|p| c.profile == p.as_str());
+    // A ready one ahead of the rest, because a session whose first connection
+    // failed to open still has a working second: taking one by position alone
+    // would answer with that failure instead of with the database.
+    let chosen = open
+        .iter()
+        .find(|c| asked_for(c) && c.status == Status::Ready)
+        .or_else(|| open.iter().find(asked_for));
     chosen.map(|c| c.id.clone()).ok_or_else(|| match connect {
         // The id a caller could have meant is the profile it named, so that is
         // what the failure carries. Which connections *are* open is one
@@ -529,6 +539,18 @@ mod tests {
                 connection: "prod".into()
             })
         );
+    }
+
+    #[test]
+    fn a_connection_that_failed_to_open_is_not_the_one_to_read_through() {
+        // A session opened with two profiles where the first could not
+        // connect: reading through it would answer with that failure, and the
+        // database next to it is right there.
+        let mut open = open(&["staging", "prod"]);
+        open[0].status = Status::Failed {
+            reason: "no route to host".into(),
+        };
+        assert_eq!(choose(&open, None), Ok("id-1".into()));
     }
 
     #[test]
