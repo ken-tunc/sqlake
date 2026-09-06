@@ -327,14 +327,13 @@ impl InputContext<'_> {
     /// The header keeps its hit target and the click is simply not read.
     /// Dropping the target would let the click fall through to the pane
     /// beneath and focus the grid, which reads as a header that was never a
-    /// target; greying it out would say the data is unavailable rather than
-    /// the ordering.
+    /// target. What the click cannot do is said in how `datagrid` draws the
+    /// header, off the same capability.
     fn sortable_preview(&self) -> Option<(ConnId, TableRef)> {
         let (conn, table) = self.active_preview()?;
         self.snapshot
             .connection(conn)?
-            .capabilities?
-            .sortable_preview
+            .can_sort_preview()
             .then_some((conn, table))
     }
 

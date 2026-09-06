@@ -88,6 +88,17 @@ impl ConnectionView {
     pub fn is_ready(&self) -> bool {
         self.status == ConnStatus::Ready
     }
+
+    /// Whether a preview of this connection can be ordered by a column.
+    ///
+    /// False while the capabilities are unknown, so the answer is one a caller
+    /// can act on before the connection is open: nothing can be sorted yet
+    /// either way, and an `Option` would only push the same decision outwards
+    /// to be made differently in each front-end.
+    #[must_use]
+    pub fn can_sort_preview(&self) -> bool {
+        self.capabilities.is_some_and(|c| c.sortable_preview)
+    }
 }
 
 /// A relation's data, as far as it has been fetched.

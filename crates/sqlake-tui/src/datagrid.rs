@@ -50,6 +50,7 @@ pub fn render(
     area: Rect,
     tab: &PreviewView,
     ui: &mut GridUi,
+    sortable: bool,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -73,7 +74,7 @@ pub fn render(
                 // its headers reads as "nothing here", and one without reads
                 // as "nothing happened". The header goes down first so the
                 // message lands under it rather than being painted over.
-                header(frame, hits, area, grid, ui, tab.sort);
+                header(frame, hits, area, grid, ui, tab.sort, sortable);
                 if area.height > 1 {
                     let below = Rect::new(
                         area.x,
@@ -85,7 +86,7 @@ pub fn render(
                 }
                 return;
             }
-            body(frame, hits, area, grid, ui, tab.sort);
+            body(frame, hits, area, grid, ui, tab.sort, sortable);
         }
     }
 }
@@ -125,6 +126,15 @@ const fn arrow(dir: SortDir) -> &'static str {
     }
 }
 
+/// The header row.
+///
+/// `sortable` is drawn rather than acted on: the hit target goes down either
+/// way, because the hit map is about where things are and the decision about
+/// what a click means already lives in `input`. What changes is that a header
+/// nothing can sort does not look like a control — on BigQuery every click on
+/// one would otherwise do nothing with no reason on screen, and a preview that
+/// cannot be ordered is a fact about the connection worth knowing before the
+/// click rather than after it.
 fn header(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
@@ -132,6 +142,7 @@ fn header(
     grid: &RenderedGrid,
     ui: &GridUi,
     sort: Option<Sort>,
+    sortable: bool,
 ) {
     let row = Rect::new(area.x, area.y, area.width, 1);
     frame.render_widget(Paragraph::new("").style(Style::new().bg(Color::Black)), row);
@@ -158,15 +169,22 @@ fn header(
                 Span::raw(text),
                 Span::styled(marker, Style::new().fg(Color::Cyan)),
             ]))
-            .style(
+            .style(if sortable {
                 Style::new()
                     .fg(if sorted.is_some() {
                         Color::Cyan
                     } else {
                         Color::Gray
                     })
-                    .add_modifier(Modifier::BOLD),
-            ),
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // Recessed by colour and by weight, and deliberately not
+                // `DIM`: dimmed dark grey is what a `NULL` cell is drawn in,
+                // and a column name borrowing that would say the value is
+                // missing rather than that the ordering is. Two axes rather
+                // than one because a terminal is free to ignore either.
+                Style::new().fg(Color::DarkGray)
+            }),
             rect,
         );
 
@@ -191,6 +209,7 @@ fn body(
     grid: &RenderedGrid,
     ui: &GridUi,
     sort: Option<Sort>,
+    sortable: bool,
 ) {
     // One column is left for the scrollbar so a wide value is cut rather than
     // hidden behind the thumb.
@@ -201,7 +220,7 @@ fn body(
         area
     };
 
-    header(frame, hits, content, grid, ui, sort);
+    header(frame, hits, content, grid, ui, sort, sortable);
 
     let rows_area = Rect::new(
         content.x,
@@ -330,10 +349,20 @@ mod tests {
         w: u16,
         h: u16,
     ) -> (Vec<String>, HitMap, ratatui::buffer::Buffer) {
+        draw_as(tab, ui, w, h, true)
+    }
+
+    fn draw_as(
+        tab: &PreviewView,
+        ui: &mut GridUi,
+        w: u16,
+        h: u16,
+        sortable: bool,
+    ) -> (Vec<String>, HitMap, ratatui::buffer::Buffer) {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), tab, ui))
+            .draw(|frame| render(frame, &mut hits, Rect::new(0, 0, w, h), tab, ui, sortable))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let rows = (0..h)
@@ -344,6 +373,45 @@ mod tests {
             })
             .collect();
         (rows, hits, buffer)
+    }
+
+    #[test]
+    fn a_header_nothing_can_sort_does_not_look_like_a_control() {
+        // On BigQuery every click on a header does nothing, and `input`'s
+        // capability gate is the reason. Drawn the same as a sortable one, the
+        // only way to discover that is to click and watch nothing happen.
+        let tab = tab(LoadState::Ready(numbers(3, 2)), None);
+        let (_, _, sortable) = draw_as(&tab, &mut GridUi::default(), 40, 6, true);
+        let (_, _, fixed) = draw_as(&tab, &mut GridUi::default(), 40, 6, false);
+
+        let style = |b: &ratatui::buffer::Buffer| (b[(0, 0)].fg, b[(0, 0)].modifier);
+        assert_ne!(
+            style(&sortable),
+            style(&fixed),
+            "a header that cannot be sorted is drawn as one that can"
+        );
+        // And not the null palette. `DarkGray` + `DIM` is what a missing value
+        // is drawn in, and a column name borrowing it says the wrong thing —
+        // what is unavailable is the ordering, not the data.
+        let null = style_for(CellKind::Null, false);
+        let cell = &fixed[(0, 0)];
+        assert!(
+            Some(cell.fg) != null.fg || cell.modifier != null.add_modifier,
+            "an unsortable header is drawn in the style that means NULL"
+        );
+    }
+
+    #[test]
+    fn the_header_is_a_hit_target_either_way() {
+        // The hit map says where things are; what a click there means is
+        // `input`'s to decide. Dropping the target on an unsortable connection
+        // would put the capability in two places.
+        let tab = tab(LoadState::Ready(numbers(3, 2)), None);
+        let (_, hits, _) = draw_as(&tab, &mut GridUi::default(), 40, 6, false);
+        assert!(matches!(
+            hits.at(Position::new(0, 0)),
+            Some(Target::GridHeader { col: 0 })
+        ));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
-use sqlake_app::snapshot::{ConnStatus, Snapshot};
+use sqlake_app::snapshot::{ConnStatus, ConnectionView, Snapshot};
 use sqlake_app::store::Store;
 use tokio::sync::watch;
 
@@ -315,7 +315,13 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     if let Some((id, conn, table)) = active
         && let Some(preview) = snapshot.preview(conn, &table)
     {
-        datagrid::render(frame, hits, grid, preview, ui.grid_mut(id));
+        // A driver that cannot order a preview — BigQuery — makes the header
+        // not a control, and that is the front-end's rendering of a
+        // capability rather than a branch on which driver it is.
+        let sortable = snapshot
+            .connection(conn)
+            .is_some_and(ConnectionView::can_sort_preview);
+        datagrid::render(frame, hits, grid, preview, ui.grid_mut(id), sortable);
     }
 
     chrome::status_bar(frame, hits, frames.status_bar, snapshot);
