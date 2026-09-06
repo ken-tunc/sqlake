@@ -232,6 +232,9 @@ fn body(
     let page = rows_area.height as usize;
     let last = grid.row_count().min(ui.row_offset.saturating_add(page));
 
+    // The whole rectangle, resolved once rather than per cell.
+    let (top, left, bottom, right) = ui.selection(sort);
+
     for (line, index) in (ui.row_offset..last).enumerate() {
         let y = rows_area.y + u16::try_from(line).unwrap_or(u16::MAX);
         for &(col, x, width) in &columns {
@@ -241,7 +244,10 @@ fn body(
             // Formatted here and nowhere else: this is the call the whole lazy
             // arrangement exists to keep down to what is on screen.
             let cell = grid.cell(index, col);
-            let selected = ui.row == index && ui.col == col;
+            // Inside the rectangle, not just the cursor cell: a selection the
+            // status bar counts and the grid does not draw is one somebody has
+            // to take on trust.
+            let selected = (top..=bottom).contains(&index) && (left..=right).contains(&col);
             let align = grid.columns().get(col).map_or(Align::Left, |c| c.align);
 
             frame.render_widget(

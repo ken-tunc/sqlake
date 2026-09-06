@@ -32,10 +32,21 @@ pub enum Gesture {
     /// drag or double-click meaning, so there is nothing to wait for.
     MiddleClick,
     /// Movement since the last report, while a button is held.
+    ///
+    /// Reported against the target the drag *started* on, which is what a
+    /// splitter and a column edge want: the thing being dragged does not change
+    /// because the pointer left it.
     DragBy {
         dx: i16,
         dy: i16,
     },
+    /// The pointer is over this target, with a button held.
+    ///
+    /// The other question a drag answers, and a different one: extending a
+    /// selection needs the cell under the pointer now, not the cell it started
+    /// from. Emitted alongside [`Gesture::DragBy`] rather than instead of it,
+    /// because the two have different consumers.
+    DragOver,
     /// Vertical wheel. Positive scrolls towards the end of the content.
     Scroll(i8),
     /// Horizontal wheel. Positive scrolls right.
@@ -109,7 +120,7 @@ impl MouseState {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.down(position, map),
             MouseEventKind::Up(MouseButton::Left) => self.up(position, now),
-            MouseEventKind::Drag(MouseButton::Left) => self.drag(position),
+            MouseEventKind::Drag(MouseButton::Left) => self.drag(position, map),
             MouseEventKind::Down(MouseButton::Right) => map
                 .at(position)
                 .map(|t| vec![(t, Gesture::RightClick)])
@@ -143,7 +154,7 @@ impl MouseState {
         vec![(target, Gesture::Down)]
     }
 
-    fn drag(&mut self, position: Position) -> Vec<(Target, Gesture)> {
+    fn drag(&mut self, position: Position, map: &HitMap) -> Vec<(Target, Gesture)> {
         let Some(press) = self.pressed.as_mut() else {
             return Vec::new();
         };
@@ -154,13 +165,19 @@ impl MouseState {
             return Vec::new();
         }
         press.moved = true;
-        vec![(
+        let mut gestures = vec![(
             press.target,
             Gesture::DragBy {
                 dx: narrow(dx),
                 dy: narrow(dy),
             },
-        )]
+        )];
+        // The target under the pointer now, which is not the one the drag
+        // started on once it has left it.
+        if let Some(over) = map.at(position) {
+            gestures.push((over, Gesture::DragOver));
+        }
+        gestures
     }
 
     fn up(&mut self, position: Position, now: Instant) -> Vec<(Target, Gesture)> {
@@ -379,18 +396,45 @@ mod tests {
         let (map, mut s, t) = (map(), MouseState::new(), t0());
         s.feed(down(30, 0), &map, t);
         assert_eq!(
-            s.feed(drag(33, 0), &map, t),
-            [(
-                Target::GridColEdge { col: 2 },
-                Gesture::DragBy { dx: 3, dy: 0 }
-            )]
+            dragged_by(&s.feed(drag(33, 0), &map, t)),
+            Some((Target::GridColEdge { col: 2 }, 3, 0))
         );
         assert_eq!(
-            s.feed(drag(31, 2), &map, t),
-            [(
-                Target::GridColEdge { col: 2 },
-                Gesture::DragBy { dx: -2, dy: 2 }
-            )]
+            dragged_by(&s.feed(drag(31, 2), &map, t)),
+            Some((Target::GridColEdge { col: 2 }, -2, 2))
+        );
+    }
+
+    /// The `DragBy` half, which is the one about movement.
+    fn dragged_by(gestures: &[(Target, Gesture)]) -> Option<(Target, i16, i16)> {
+        gestures.iter().find_map(|(target, gesture)| match gesture {
+            Gesture::DragBy { dx, dy } => Some((*target, *dx, *dy)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_drag_reports_where_it_started_and_what_it_is_over() {
+        // Two different questions. A splitter is still the thing being dragged
+        // once the pointer has left it; a selection being extended is over the
+        // cell the pointer is on now.
+        let (map, mut s, t) = (map(), MouseState::new(), t0());
+        s.feed(down(30, 0), &map, t);
+        let gestures = s.feed(drag(5, 1), &map, t);
+
+        let by = gestures
+            .iter()
+            .find(|(_, g)| matches!(g, Gesture::DragBy { .. }));
+        let over = gestures.iter().find(|(_, g)| *g == Gesture::DragOver);
+        assert_eq!(
+            by.map(|(t, _)| *t),
+            Some(Target::GridColEdge { col: 2 }),
+            "the drag stopped being about the thing it grabbed"
+        );
+        assert_eq!(
+            over.map(|(t, _)| *t),
+            Some(Target::TreeRow { index: 1 }),
+            "the pointer moved elsewhere and nothing said so: {gestures:?}"
         );
     }
 

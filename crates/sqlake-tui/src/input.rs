@@ -50,12 +50,29 @@ impl KeyCombo {
         }
     }
 
-    /// Shift is ignored on purpose: terminals report it inconsistently for
-    /// characters that are already shifted, so `G` is matched by its character
-    /// rather than by a modifier.
+    #[must_use]
+    pub const fn shift(code: KeyCode) -> Self {
+        Self {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+        }
+    }
+
+    /// Shift counts on a key that is not a character, and not on one that is.
+    ///
+    /// A terminal reports shift inconsistently for a character that is already
+    /// shifted — `G` arrives as `Char('G')` with or without the modifier
+    /// depending on the terminal — so a binding on `G` is matched by its
+    /// character. An arrow has no shifted form to arrive as instead, so shift
+    /// on one is reported and is the only way to say `Shift-Down`.
     fn matches(self, event: KeyEvent) -> bool {
-        const RELEVANT: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
-        self.code == event.code && (self.modifiers & RELEVANT) == (event.modifiers & RELEVANT)
+        const BASE: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
+        let relevant = if matches!(self.code, KeyCode::Char(_)) {
+            BASE
+        } else {
+            BASE.union(KeyModifiers::SHIFT)
+        };
+        self.code == event.code && (self.modifiers & relevant) == (event.modifiers & relevant)
     }
 }
 
@@ -147,6 +164,20 @@ pub const KEYMAP: &[KeyBinding] = &[
         keys: &[key('J'), key('K')],
         context: Context::Grid,
         kind: IntentKind::GridSelection,
+    },
+    KeyBinding {
+        // Shift with the arrows, which is what every grid does. All four,
+        // because the pair above already learned that binding one axis leaves
+        // the other reachable by mouse and not by keyboard — and the coverage
+        // sweep cannot see that, both axes being one capability.
+        keys: &[
+            KeyCombo::shift(KeyCode::Up),
+            KeyCombo::shift(KeyCode::Down),
+            KeyCombo::shift(KeyCode::Left),
+            KeyCombo::shift(KeyCode::Right),
+        ],
+        context: Context::Grid,
+        kind: IntentKind::ExtendSelection,
     },
     KeyBinding {
         keys: &[key('H'), key('L')],
@@ -394,6 +425,11 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
             vec![scroll(PaneId::Explorer, delta)]
         }
 
+        // The cell under the pointer, not the one the drag started on — that
+        // one is the anchor, and it is already where the selection began.
+        (Target::GridCell { row, col }, Gesture::DragOver) => {
+            vec![ViewCmd::ExtendCellSelectionTo { row, col }.into()]
+        }
         (Target::GridCell { row, col }, Gesture::Click) => vec![
             ViewCmd::FocusPane(PaneId::Grid).into(),
             ViewCmd::SelectCell { row, col }.into(),
@@ -708,6 +744,17 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         ],
         IntentKind::TreeSelection => {
             vec![ViewCmd::MoveTreeSelection(if backwards { -1 } else { 1 }).into()]
+        }
+        IntentKind::ExtendSelection => {
+            let step = if backwards { -1 } else { 1 };
+            let sideways = matches!(event.code, KeyCode::Left | KeyCode::Right);
+            vec![
+                ViewCmd::ExtendCellSelection {
+                    drow: if sideways { 0 } else { step },
+                    dcol: if sideways { step } else { 0 },
+                }
+                .into(),
+            ]
         }
         IntentKind::GridSelection => {
             let step = if backwards { -1 } else { 1 };
@@ -1894,6 +1941,7 @@ mod tests {
         Gesture::RightClick => [Gesture::RightClick],
         Gesture::MiddleClick => [Gesture::MiddleClick],
         Gesture::DragBy { .. } => [Gesture::DragBy { dx: 1, dy: 1 }, Gesture::DragBy { dx: -1, dy: -1 }],
+        Gesture::DragOver => [Gesture::DragOver],
         Gesture::Scroll(_) => [Gesture::Scroll(1), Gesture::Scroll(-1)],
         Gesture::ScrollX(_) => [Gesture::ScrollX(1), Gesture::ScrollX(-1)],
         Gesture::HoverEnter => [Gesture::HoverEnter],

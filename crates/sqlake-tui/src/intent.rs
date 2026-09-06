@@ -76,6 +76,16 @@ pub enum ViewCmd {
         row: usize,
         col: usize,
     },
+    /// Move the far corner of the selection, keeping the anchor.
+    ExtendCellSelection {
+        drow: i32,
+        dcol: i32,
+    },
+    /// Drag the far corner onto a cell.
+    ExtendCellSelectionTo {
+        row: usize,
+        col: usize,
+    },
     MoveCellSelection {
         drow: i32,
         dcol: i32,
@@ -138,6 +148,7 @@ intent_kinds! {
     ScrollHorizontally => "scroll the grid sideways",
     TreeSelection      => "select a node in the explorer",
     GridSelection      => "select a cell",
+    ExtendSelection    => "select a range of cells",
     ResizeColumn       => "change a column's width",
     MoveSplit          => "move the split between panes",
     EvenSplit          => "reset the split",
@@ -178,6 +189,9 @@ impl IntentKind {
                 ViewCmd::SetFilter(_) => Self::Filter,
                 ViewCmd::SelectCell { .. } | ViewCmd::MoveCellSelection { .. } => {
                     Self::GridSelection
+                }
+                ViewCmd::ExtendCellSelection { .. } | ViewCmd::ExtendCellSelectionTo { .. } => {
+                    Self::ExtendSelection
                 }
                 ViewCmd::ResizeColumn { .. } => Self::ResizeColumn,
                 ViewCmd::MoveSplit { .. } => Self::MoveSplit,
