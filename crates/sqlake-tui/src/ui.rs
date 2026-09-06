@@ -334,8 +334,11 @@ impl UiState {
             .map(|t| t.id)
             .collect();
         for id in closed {
-            // Closing a tab fetches nothing; only scrolling does.
-            debug_assert!(self.apply(ViewCmd::CloseTab(id), snapshot).is_none());
+            // Bound rather than asserted in place: `debug_assert!` does not
+            // evaluate its argument in a release build, so closing the tab
+            // would happen only in tests.
+            let fetch = self.apply(ViewCmd::CloseTab(id), snapshot);
+            debug_assert!(fetch.is_none(), "closing a tab fetches nothing");
         }
     }
 
@@ -351,11 +354,10 @@ impl UiState {
 
     /// Apply a view command, synchronously and without touching the store.
     ///
-    /// Returns the one action a view command can cause: scrolling towards the
-    /// end of a preview asks for the next page. It stays a return value rather
-    /// than a dispatch from in here so that this type still has no way to reach
-    /// the store, and so the caller can see that scrolling is the only thing
-    /// that fetches.
+    /// Returns the one action a view command can cause: moving towards the end
+    /// of a preview asks for the next page. It stays a return value rather than
+    /// a dispatch from in here so that this type still has no way to reach the
+    /// store, and so the caller can see which commands fetch.
     #[must_use]
     pub fn apply(&mut self, cmd: ViewCmd, snapshot: &Snapshot) -> Option<Action> {
         match cmd {
@@ -400,10 +402,17 @@ impl UiState {
                 self.select_tree_row(to, snapshot);
             }
 
-            ViewCmd::SelectCell { row, col } => self.select_cell(row, col, snapshot),
+            // The cursor drags the viewport along with it, so `J` reaches the
+            // last loaded row exactly as a scroll does. Left out, the whole
+            // feature is missing from the keyboard.
+            ViewCmd::SelectCell { row, col } => {
+                self.select_cell(row, col, snapshot);
+                return self.wants_a_page(PaneId::Grid, snapshot);
+            }
             ViewCmd::MoveCellSelection { drow, dcol } => {
                 let (row, col) = self.active_grid().map_or((0, 0), |g| (g.row, g.col));
                 self.select_cell(step(row, drow), step(col, dcol), snapshot);
+                return self.wants_a_page(PaneId::Grid, snapshot);
             }
 
             ViewCmd::ResizeColumn { col, delta } => {
@@ -466,9 +475,9 @@ impl UiState {
         None
     }
 
-    /// Whether this scroll should fetch, and the action if so.
+    /// Whether this move should fetch, and the action if so.
     ///
-    /// Only reached from a scroll somebody made. A predicate the render loop
+    /// Only reached from a move somebody made. A predicate the render loop
     /// checked each frame would fetch on its own: `page_size` goes down to a
     /// single row, so a viewport taller than a page is still "near the end" the
     /// moment the page lands, and a relation would walk itself to the end with
@@ -478,30 +487,39 @@ impl UiState {
             return None;
         }
         let id = self.active_tab?;
-        let tab = self.tabs.iter().find(|t| t.id == id)?.clone();
-        let preview = snapshot.preview(tab.conn, &tab.table)?;
+        let at = self.tabs.iter().position(|t| t.id == id)?;
+        let conn = self.tabs[at].conn;
+        let preview = snapshot.preview(conn, &self.tabs[at].table)?;
         // A first page still in flight is not something to hurry along, and its
         // `loaded_rows` of zero would otherwise read as "at the end".
         if !matches!(preview.data, LoadState::Ready(_)) {
             return None;
         }
+        if self.offset(PaneId::Grid) + self.page(PaneId::Grid) + LOAD_MARGIN_ROWS
+            < preview.loaded_rows
+        {
+            return None;
+        }
 
-        let state: PageMark = (
+        // Compared field by field, so the common answer — "already asked" —
+        // costs no allocation on a path a wheel notch runs through.
+        let grid = self.grids.entry(id).or_default();
+        let asked = grid.asked_at.as_ref().is_some_and(|(rows, error, sort)| {
+            *rows == preview.loaded_rows
+                && error.as_deref() == preview.last_error.as_deref()
+                && *sort == preview.sort
+        });
+        if asked {
+            return None;
+        }
+        grid.asked_at = Some((
             preview.loaded_rows,
             preview.last_error.clone(),
             preview.sort,
-        );
-        let near_the_end = self.offset(PaneId::Grid) + self.page(PaneId::Grid) + LOAD_MARGIN_ROWS
-            >= preview.loaded_rows;
-
-        let grid = self.grids.entry(id).or_default();
-        if !near_the_end || grid.asked_at.as_ref() == Some(&state) {
-            return None;
-        }
-        grid.asked_at = Some(state);
+        ));
         Some(Action::LoadMore {
-            conn: tab.conn,
-            table: tab.table,
+            conn,
+            table: self.tabs[at].table.clone(),
         })
     }
 

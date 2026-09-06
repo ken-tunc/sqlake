@@ -814,18 +814,18 @@ mod tests {
         assert!(ui.tabs.is_empty(), "a tab outlived its own connection");
     }
 
-    /// Opens `public.big` (200,000 rows, paged), scrolls to the end, and hands
-    /// back everything a paging test needs to look at.
-    async fn paging() -> (
-        Store,
-        Arc<Snapshot>,
-        UiState,
-        ConnId,
-        sqlake_core::node::TableRef,
-    ) {
-        let (store, snap) = connected().await;
+    /// Connects, previews `table`, and opens it in a tab with a frame drawn.
+    ///
+    /// Drawn, because the grid's viewport comes from the frame: without one
+    /// the scroll clamp works with a page of zero and puts the offset past the
+    /// last row, a position no rendered grid ever reaches — so the margin the
+    /// fetch actually turns on would go untested.
+    async fn opened(
+        store: Store,
+        table: sqlake_core::node::TableRef,
+    ) -> (Store, Arc<Snapshot>, UiState, ConnId) {
+        let (store, snap) = connected_to(store).await;
         let conn = snap.connections[0].id;
-        let table = sqlake_core::node::TableRef::new(["public", "big"]);
         store.dispatch(Action::PreviewTable {
             conn,
             table: table.clone(),
@@ -839,14 +839,22 @@ mod tests {
         let snap = rx.borrow_and_update().clone();
 
         let mut ui = UiState::new();
-        ui.set_screen(ratatui::layout::Rect::new(0, 0, 120, 40));
-        let _ = ui.apply(
-            crate::intent::ViewCmd::OpenTab {
-                conn,
-                table: table.clone(),
-            },
-            &snap,
-        );
+        let _ = ui.apply(crate::intent::ViewCmd::OpenTab { conn, table }, &snap);
+        let _ = render(&snap, &mut ui, 120, 40);
+        (store, snap, ui, conn)
+    }
+
+    /// Opens `public.big` (200,000 rows, paged) and hands back everything a
+    /// paging test needs to look at.
+    async fn paging() -> (
+        Store,
+        Arc<Snapshot>,
+        UiState,
+        ConnId,
+        sqlake_core::node::TableRef,
+    ) {
+        let table = sqlake_core::node::TableRef::new(["public", "big"]);
+        let (store, snap, ui, conn) = opened(store(), table.clone()).await;
         (store, snap, ui, conn, table)
     }
 
@@ -909,30 +917,9 @@ mod tests {
         // page is the whole relation: nothing grows, nothing fails, and there
         // is nothing new to ask about. A view that read "at the bottom" as
         // "fetch" would go back to the driver on every scroll for ever.
-        let (store, snap) = connected().await;
-        let conn = snap.connections[0].id;
         let table = sqlake_core::node::TableRef::new(["public", "users"]);
-        store.dispatch(Action::PreviewTable {
-            conn,
-            table: table.clone(),
-        });
+        let (store, snap, mut ui, _) = opened(store(), table).await;
         let mut rx = store.subscribe();
-        until(&mut rx, |s| {
-            s.preview(conn, &table)
-                .is_some_and(|p| p.data.ready().is_some())
-        })
-        .await;
-        let snap = rx.borrow_and_update().clone();
-
-        let mut ui = UiState::new();
-        ui.set_screen(ratatui::layout::Rect::new(0, 0, 120, 40));
-        let _ = ui.apply(
-            crate::intent::ViewCmd::OpenTab {
-                conn,
-                table: table.clone(),
-            },
-            &snap,
-        );
 
         let action = to_the_end(&mut ui, &snap).expect("the first scroll to the end asks once");
         store.dispatch(action);
@@ -958,30 +945,9 @@ mod tests {
             failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
             ..Behaviour::instant()
         });
-        let (store, snap) = connected_to(store).await;
-        let conn = snap.connections[0].id;
         let table = sqlake_core::node::TableRef::new(["public", "big"]);
-        store.dispatch(Action::PreviewTable {
-            conn,
-            table: table.clone(),
-        });
+        let (store, snap, mut ui, conn) = opened(store, table.clone()).await;
         let mut rx = store.subscribe();
-        until(&mut rx, |s| {
-            s.preview(conn, &table)
-                .is_some_and(|p| p.data.ready().is_some())
-        })
-        .await;
-        let snap = rx.borrow_and_update().clone();
-
-        let mut ui = UiState::new();
-        ui.set_screen(ratatui::layout::Rect::new(0, 0, 120, 40));
-        let _ = ui.apply(
-            crate::intent::ViewCmd::OpenTab {
-                conn,
-                table: table.clone(),
-            },
-            &snap,
-        );
 
         let action = to_the_end(&mut ui, &snap).expect("it asks once");
         store.dispatch(action);
@@ -1022,6 +988,26 @@ mod tests {
         assert!(
             to_the_end(&mut ui, &snap).is_some(),
             "paging stopped for the life of the tab because it had been sorted"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cell_cursor_pages_the_way_scrolling_does() {
+        // `J` pulls the viewport along to the last loaded row without ever
+        // producing a scroll command. Fetching only on the scroll arms leaves
+        // the whole feature out of reach of the keyboard: the cursor stops at
+        // the end of page one and nothing asks for page two.
+        let (_store, snap, mut ui, conn, table) = paging().await;
+        assert_eq!(
+            ui.apply(
+                crate::intent::ViewCmd::MoveCellSelection {
+                    drow: 1000,
+                    dcol: 0
+                },
+                &snap
+            ),
+            Some(Action::LoadMore { conn, table }),
+            "the cursor reached the last loaded row and asked for nothing"
         );
     }
 
