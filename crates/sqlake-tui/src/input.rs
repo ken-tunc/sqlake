@@ -58,16 +58,20 @@ impl KeyCombo {
         }
     }
 
-    /// Shift counts on a key that is not a character, and not on one that is.
+    /// Shift counts on a key that has no shifted form of its own, and not on
+    /// one that has.
     ///
-    /// A terminal reports shift inconsistently for a character that is already
+    /// A terminal reports shift inconsistently for a key that already arrives
     /// shifted — `G` arrives as `Char('G')` with or without the modifier
-    /// depending on the terminal — so a binding on `G` is matched by its
-    /// character. An arrow has no shifted form to arrive as instead, so shift
-    /// on one is reported and is the only way to say `Shift-Down`.
+    /// depending on the terminal, and `BackTab` *is* `Shift-Tab`, which
+    /// crossterm hands over carrying `SHIFT` on every platform. Both are
+    /// matched by their code alone; reading the modifier on them would leave
+    /// `Shift-Tab` bound to nothing. An arrow has no shifted form to arrive as
+    /// instead, so shift on one is reported and is the only way to say
+    /// `Shift-Down`.
     fn matches(self, event: KeyEvent) -> bool {
         const BASE: KeyModifiers = KeyModifiers::CONTROL.union(KeyModifiers::ALT);
-        let relevant = if matches!(self.code, KeyCode::Char(_)) {
+        let relevant = if matches!(self.code, KeyCode::Char(_) | KeyCode::BackTab) {
             BASE
         } else {
             BASE.union(KeyModifiers::SHIFT)
@@ -425,9 +429,24 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
             vec![scroll(PaneId::Explorer, delta)]
         }
 
+        // The press, not the release: the first motion extends from wherever
+        // the cursor is, so a drag that began on a cell has to have moved it
+        // there already. Waiting for the click would anchor the rectangle on
+        // whatever was selected before and sweep it across everything between.
+        (Target::GridCell { row, col }, Gesture::Down) => vec![
+            ViewCmd::FocusPane(PaneId::Grid).into(),
+            ViewCmd::SelectCell { row, col }.into(),
+        ],
         // The cell under the pointer, not the one the drag started on — that
         // one is the anchor, and it is already where the selection began.
-        (Target::GridCell { row, col }, Gesture::DragOver) => {
+        // Only for a drag that began on a cell: a splitter or a column edge
+        // dragged past the grid puts the pointer over cells it is not about.
+        (
+            Target::GridCell { row, col },
+            Gesture::DragOver {
+                from: Target::GridCell { .. },
+            },
+        ) => {
             vec![ViewCmd::ExtendCellSelectionTo { row, col }.into()]
         }
         (Target::GridCell { row, col }, Gesture::Click) => vec![
@@ -1239,6 +1258,66 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_that_began_elsewhere_does_not_select_the_cells_it_crosses() {
+        // The splitter's grab area is three cells wide and the whole height of
+        // the screen, so moving it sweeps the pointer across the grid beside
+        // it. Read as a selection, resizing the panes drags the highlight over
+        // everything on the way.
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
+        for from in [
+            Target::Splitter(SplitId::Explorer),
+            Target::GridColEdge { col: 0 },
+            Target::Scrollbar {
+                pane: PaneId::Grid,
+                part: ScrollPart::Thumb,
+            },
+        ] {
+            assert!(
+                on_mouse(
+                    Target::GridCell { row: 7, col: 2 },
+                    Gesture::DragOver { from },
+                    &c,
+                )
+                .is_empty(),
+                "{from:?}"
+            );
+        }
+        assert_eq!(
+            on_mouse(
+                Target::GridCell { row: 7, col: 2 },
+                Gesture::DragOver {
+                    from: Target::GridCell { row: 3, col: 1 }
+                },
+                &c,
+            ),
+            [Intent::View(ViewCmd::ExtendCellSelectionTo {
+                row: 7,
+                col: 2
+            })]
+        );
+    }
+
+    #[test]
+    fn a_press_on_a_cell_is_where_a_drag_selection_starts() {
+        // The anchor is the cursor, and the first motion event is already too
+        // late to put it under the press: it would stretch the rectangle from
+        // whatever was selected before.
+        let f = fixture();
+        assert_eq!(
+            on_mouse(
+                Target::GridCell { row: 9, col: 3 },
+                Gesture::Down,
+                &f.ctx(PaneId::Explorer),
+            ),
+            [
+                Intent::View(ViewCmd::FocusPane(PaneId::Grid)),
+                Intent::View(ViewCmd::SelectCell { row: 9, col: 3 }),
+            ]
+        );
+    }
+
+    #[test]
     fn clicking_the_track_pages_towards_the_click() {
         let f = fixture();
         let c = f.ctx(PaneId::Grid);
@@ -1560,6 +1639,13 @@ mod tests {
         );
         assert_eq!(
             on_key(press(KeyCode::BackTab), &c),
+            [Intent::View(ViewCmd::FocusPrevPane)]
+        );
+        // How a terminal actually sends it: `BackTab` *is* `Shift-Tab`, and
+        // crossterm hands it over carrying the modifier. Read as a modifier
+        // that has to be asked for, the binding matches nothing.
+        assert_eq!(
+            on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &c),
             [Intent::View(ViewCmd::FocusPrevPane)]
         );
         assert_eq!(
@@ -1941,7 +2027,10 @@ mod tests {
         Gesture::RightClick => [Gesture::RightClick],
         Gesture::MiddleClick => [Gesture::MiddleClick],
         Gesture::DragBy { .. } => [Gesture::DragBy { dx: 1, dy: 1 }, Gesture::DragBy { dx: -1, dy: -1 }],
-        Gesture::DragOver => [Gesture::DragOver],
+        Gesture::DragOver { .. } => [
+            Gesture::DragOver { from: Target::GridCell { row: 0, col: 0 } },
+            Gesture::DragOver { from: Target::Splitter(SplitId::Explorer) },
+        ],
         Gesture::Scroll(_) => [Gesture::Scroll(1), Gesture::Scroll(-1)],
         Gesture::ScrollX(_) => [Gesture::ScrollX(1), Gesture::ScrollX(-1)],
         Gesture::HoverEnter => [Gesture::HoverEnter],

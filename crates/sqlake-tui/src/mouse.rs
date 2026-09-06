@@ -40,13 +40,22 @@ pub enum Gesture {
         dx: i16,
         dy: i16,
     },
-    /// The pointer is over this target, with a button held.
+    /// The pointer is over this target, with a button held, in a drag that
+    /// began on `from`.
     ///
     /// The other question a drag answers, and a different one: extending a
     /// selection needs the cell under the pointer now, not the cell it started
     /// from. Emitted alongside [`Gesture::DragBy`] rather than instead of it,
     /// because the two have different consumers.
-    DragOver,
+    ///
+    /// `from` rides along because "the pointer is here" is not on its own a
+    /// gesture anyone asked for: a splitter dragged sideways sweeps the pointer
+    /// across the cells beside it, and a consumer that read those would extend
+    /// a selection nobody started. Only the handler knows which origins its
+    /// gesture is about.
+    DragOver {
+        from: Target,
+    },
     /// Vertical wheel. Positive scrolls towards the end of the content.
     Scroll(i8),
     /// Horizontal wheel. Positive scrolls right.
@@ -175,7 +184,7 @@ impl MouseState {
         // The target under the pointer now, which is not the one the drag
         // started on once it has left it.
         if let Some(over) = map.at(position) {
-            gestures.push((over, Gesture::DragOver));
+            gestures.push((over, Gesture::DragOver { from: press.target }));
         }
         gestures
     }
@@ -425,11 +434,20 @@ mod tests {
         let by = gestures
             .iter()
             .find(|(_, g)| matches!(g, Gesture::DragBy { .. }));
-        let over = gestures.iter().find(|(_, g)| *g == Gesture::DragOver);
+        let over = gestures
+            .iter()
+            .find(|(_, g)| matches!(g, Gesture::DragOver { .. }));
         assert_eq!(
             by.map(|(t, _)| *t),
             Some(Target::GridColEdge { col: 2 }),
             "the drag stopped being about the thing it grabbed"
+        );
+        assert_eq!(
+            over.map(|(_, g)| *g),
+            Some(Gesture::DragOver {
+                from: Target::GridColEdge { col: 2 }
+            }),
+            "a drag over one thing has to say which drag it is"
         );
         assert_eq!(
             over.map(|(t, _)| *t),
