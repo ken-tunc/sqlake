@@ -7,12 +7,13 @@
 //! renderings of one `PagedResult` is what makes them peers rather than one
 //! reusing the other's formatter.
 //!
-//! Three values have no JSON of their own, and each gets a one-key object whose
-//! key starts with `$`. The alternative — a bare string — is worse in the way
-//! that matters: an agent cannot tell it from a column that really is text, so
-//! it quotes base64 back as if it were the value. A `$` key can collide with a
-//! real key inside a `Json` column, which is why the marker is a whole object
-//! and never a field added to one.
+//! Three values have no JSON of their own, and a fourth case — a formatter
+//! that cannot render its input — has nothing truthful to put in the cell at
+//! all. Each gets a one-key object whose key starts with `$`. The alternative
+//! — a bare string — is worse in the way that matters: an agent cannot tell it
+//! from a column that really is text, so it quotes base64 back as if it were
+//! the value. A `$` key can collide with a real key inside a `Json` column,
+//! which is why the marker is a whole object and never a field added to one.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -26,6 +27,7 @@ use time::macros::format_description;
 const BYTES: &str = "$base64";
 const OPAQUE: &str = "$opaque";
 const NONFINITE: &str = "$float";
+const ERROR: &str = "$error";
 
 #[must_use]
 pub fn to_json(value: &Value) -> Json {
@@ -103,14 +105,15 @@ fn float(f: f64) -> Json {
         .unwrap_or_else(|| marker(NONFINITE, Json::String(f.to_string())))
 }
 
-/// A formatter that cannot render its own input is a bug here rather than
-/// something to report per row: every one of these types is in range by
-/// construction. Falling back to the debug form keeps a whole page from being
-/// lost to one cell if that is ever wrong.
+/// Wrapped rather than returned bare, because a formatter's message is an
+/// English sentence and a bare string is what a `text` column looks like — an
+/// agent would read "the year component cannot be formatted" as the cell's
+/// data. `Rfc3339` rejects any year outside `0..=9999`, so a BC timestamp
+/// reaches this from a real driver rather than only in theory.
 fn stringify(formatted: Result<String, time::error::Format>) -> Json {
     match formatted {
         Ok(text) => Json::String(text),
-        Err(err) => Json::String(err.to_string()),
+        Err(err) => marker(ERROR, Json::String(err.to_string())),
     }
 }
 
@@ -139,6 +142,19 @@ mod tests {
             to_json(&Value::Decimal(exact.to_owned())),
             json!(exact),
             "the precision the driver preserved was rounded away"
+        );
+    }
+
+    #[test]
+    fn a_value_the_formatter_cannot_render_is_not_mistaken_for_text() {
+        // `Rfc3339` rejects any year outside `0..=9999`, and a BC timestamp
+        // reaches this from Postgres. Bare, the message reads as the column's
+        // data: an agent quotes an English sentence back as the value.
+        let bc = datetime!(-0044-03-15 01:02:03 UTC);
+        let json = to_json(&Value::TimestampTz(bc));
+        assert!(
+            json.get(ERROR).is_some(),
+            "a formatting failure was emitted as a value: {json}"
         );
     }
 
