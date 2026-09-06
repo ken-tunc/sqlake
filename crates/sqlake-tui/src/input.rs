@@ -340,8 +340,14 @@ pub struct InputContext<'a> {
     pub grid_column: Option<usize>,
     /// Where the pointer is, for a gesture that opens something at it.
     pub pointer: (u16, u16),
-    /// Whether more than one cell is selected, which the menu's labels follow.
-    pub ranged_selection: bool,
+    /// The selected rectangle, `(top, left, bottom, right)` inclusive.
+    ///
+    /// The whole rectangle rather than "is it more than one cell", because a
+    /// right-click has to know whether it landed *inside* the selection: on it,
+    /// the menu is about the selection; anywhere else, it is about the cell
+    /// that was clicked, and leaving the selection where it was would act on a
+    /// cell nobody pointed at.
+    pub selection: Option<(usize, usize, usize, usize)>,
     /// The open context menu, so a click on one of its lines can be resolved to
     /// the intent that line carries.
     pub menu: Option<&'a crate::menu::Menu>,
@@ -423,6 +429,13 @@ impl InputContext<'_> {
             .then_some((conn, table))
     }
 
+    /// Whether the selection covers more than one cell.
+    #[must_use]
+    fn ranged(&self) -> bool {
+        self.selection
+            .is_some_and(|(top, left, bottom, right)| top != bottom || left != right)
+    }
+
     /// The context a keystroke is read in. A modal takes the keyboard over
     /// entirely, which is why `Esc` can mean two different things without
     /// being ambiguous.
@@ -450,12 +463,25 @@ impl InputContext<'_> {
 /// What a gesture on a target means.
 #[must_use]
 pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec<Intent> {
-    // A click anywhere but the menu closes it, and still does what it was a
-    // click on. A menu that stayed open would have to be dismissed before
+    // A gesture anywhere but the menu closes it, and still does what it was a
+    // gesture on. A menu that stayed open would have to be dismissed before
     // anything else worked, which is a mode nobody asked for.
+    //
+    // The press as well as the click, because a drag on the grid starts on the
+    // press: without it a rectangle is swept out under a menu that is still
+    // sitting on top of it. The wheel too — the menu is placed in screen
+    // coordinates, so content scrolling beneath leaves it pointing at a cell
+    // that has moved.
     if ctx.menu.is_some()
-        && matches!(gesture, Gesture::Click | Gesture::RightClick)
-        && !matches!(target, Target::MenuItem { .. })
+        && matches!(
+            gesture,
+            Gesture::Click
+                | Gesture::RightClick
+                | Gesture::Down
+                | Gesture::Scroll(_)
+                | Gesture::ScrollX(_)
+        )
+        && !matches!(target, Target::MenuItem { .. } | Target::Menu)
     {
         let mut intents = vec![ViewCmd::CloseMenu.into()];
         intents.extend(mouse_intents(target, gesture, ctx));
@@ -488,17 +514,27 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
             vec![scroll(PaneId::Explorer, delta)]
         }
 
-        // The press, not the release: the first motion extends from wherever
-        // the cursor is, so a drag that began on a cell has to have moved it
-        // there already. Waiting for the click would anchor the rectangle on
-        // whatever was selected before and sweep it across everything between.
-        (Target::GridCell { .. }, Gesture::RightClick) => vec![
-            ViewCmd::OpenMenu {
-                at: ctx.pointer,
-                ranged: ctx.ranged_selection,
+        (Target::GridCell { row, col }, Gesture::RightClick) => {
+            let inside = ctx.selection.is_some_and(|(top, left, bottom, right)| {
+                (top..=bottom).contains(&row) && (left..=right).contains(&col)
+            });
+            let mut intents = Vec::new();
+            if !inside {
+                // Outside it, the click moves the selection first: a menu whose
+                // "Copy cell" copies a cell somewhere else on screen is worse
+                // than no menu.
+                intents.push(ViewCmd::FocusPane(PaneId::Grid).into());
+                intents.push(ViewCmd::SelectCell { row, col }.into());
             }
-            .into(),
-        ],
+            intents.push(
+                ViewCmd::OpenMenu {
+                    at: Some(ctx.pointer),
+                    ranged: inside && ctx.ranged(),
+                }
+                .into(),
+            );
+            intents
+        }
         // Choosing an entry is the entry's own intent. That is what makes
         // `every_menu_entry_has_a_key_binding` a check rather than a
         // convention: the menu cannot offer anything the keyboard cannot.
@@ -508,7 +544,15 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
             .filter(|entry| entry.enabled)
             .map(|entry| vec![ViewCmd::CloseMenu.into(), entry.intent.clone()])
             .unwrap_or_default(),
-        (Target::MenuItem { .. }, _) => Vec::new(),
+        // Everything else on the menu is swallowed rather than passed down: it
+        // covers the grid, and a gesture on it is not a gesture on the cell it
+        // is covering.
+        (Target::MenuItem { .. } | Target::Menu, _) => Vec::new(),
+
+        // The press, not the release: the first motion extends from wherever
+        // the cursor is, so a drag that began on a cell has to have moved it
+        // there already. Waiting for the click would anchor the rectangle on
+        // whatever was selected before and sweep it across everything between.
         (Target::GridCell { row, col }, Gesture::Down) => vec![
             ViewCmd::FocusPane(PaneId::Grid).into(),
             ViewCmd::SelectCell { row, col }.into(),
@@ -878,16 +922,22 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         ],
         IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
         IntentKind::Menu => {
-            // Position zero: the view puts it over the selected cell, which is
-            // where a keyboard user is pointing. A key press has no coordinates
-            // to give it, and inventing some here would put the menu wherever
-            // the mouse last was.
+            // The same key closes it. Nothing else on the keyboard can: `Esc`
+            // in the grid is `DismissToast`, and shadowing that to reach a
+            // menu would be the hazard `KEYMAP` warns about. Without the
+            // toggle the one gesture that opens a menu on a terminal with no
+            // right-click leaves it on screen with no way out.
+            if ctx.menu.is_some() {
+                return vec![ViewCmd::CloseMenu.into()];
+            }
+            // No coordinates to give: `None` asks the view to place it, which
+            // is the only thing that knows where the grid was drawn.
             ctx.active_tab
                 .map(|_| {
                     vec![
                         ViewCmd::OpenMenu {
-                            at: (0, 0),
-                            ranged: false,
+                            at: None,
+                            ranged: ctx.ranged(),
                         }
                         .into(),
                     ]
@@ -1110,7 +1160,7 @@ mod tests {
                 tree_selection: Some(0),
                 grid_column: Some(2),
                 pointer: (0, 0),
-                ranged_selection: false,
+                selection: None,
                 menu: None,
                 tabs: &self.tabs,
                 active_tab: None,
@@ -2000,7 +2050,7 @@ mod tests {
             tree_selection: None,
             grid_column: None,
             pointer: (0, 0),
-            ranged_selection: false,
+            selection: None,
             menu: None,
             tabs: &[],
             active_tab: None,
@@ -2127,6 +2177,7 @@ mod tests {
         ],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],
+        Target::Menu => [Target::Menu],
         Target::Backdrop => [Target::Backdrop],
         Target::Modal => [Target::Modal],
     }
@@ -2208,6 +2259,108 @@ mod tests {
                 .any(|i| matches!(i, Intent::View(ViewCmd::OpenMenu { .. }))),
             "{intents:?}"
         );
+    }
+
+    #[test]
+    fn the_key_that_opens_the_menu_closes_it_again() {
+        // The only way out on the keyboard. `Esc` in the grid is
+        // `DismissToast`, so without this the one gesture that reaches the menu
+        // on a terminal with no right-click leaves it on screen for good.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), false);
+        let mut c = f.ctx(PaneId::Grid);
+        assert!(matches!(
+            on_key(press(KeyCode::Char('.')), &c)[..],
+            [Intent::View(ViewCmd::OpenMenu { .. })]
+        ));
+        c.menu = Some(&menu);
+        assert_eq!(
+            on_key(press(KeyCode::Char('.')), &c),
+            [ViewCmd::CloseMenu.into()]
+        );
+    }
+
+    #[test]
+    fn a_right_click_outside_the_selection_moves_it_there_first() {
+        // Otherwise the menu's "Copy cell" copies a cell somewhere else on
+        // screen — the one that happened to be selected before.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.selection = Some((0, 0, 2, 2));
+
+        let intents = on_mouse(Target::GridCell { row: 9, col: 4 }, Gesture::RightClick, &c);
+        assert!(
+            intents.contains(&ViewCmd::SelectCell { row: 9, col: 4 }.into()),
+            "{intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::OpenMenu { ranged: false, .. }))),
+            "a click outside the selection still called the menu after it: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_right_click_inside_the_selection_keeps_it() {
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.selection = Some((0, 0, 2, 2));
+
+        let intents = on_mouse(Target::GridCell { row: 1, col: 1 }, Gesture::RightClick, &c);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::SelectCell { .. }))),
+            "right-clicking inside the selection collapsed it: {intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::OpenMenu { ranged: true, .. }))),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_menu_is_named_after_the_selection_too() {
+        // Not hard-coded to one cell: `.` with a rectangle selected would
+        // otherwise offer to "copy cell" and copy the whole rectangle.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.selection = Some((0, 0, 2, 2));
+        assert!(matches!(
+            on_key(press(KeyCode::Char('.')), &c)[..],
+            [Intent::View(ViewCmd::OpenMenu { ranged: true, .. })]
+        ));
+    }
+
+    #[test]
+    fn a_press_on_the_grid_closes_the_menu_before_it_drags() {
+        // The press is where a drag-selection starts, so a menu that waited for
+        // the click would have a rectangle swept out underneath it.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
+        let mut c = f.ctx(PaneId::Grid);
+        c.menu = Some(&menu);
+
+        let intents = on_mouse(Target::GridCell { row: 2, col: 1 }, Gesture::Down, &c);
+        assert!(intents.contains(&ViewCmd::CloseMenu.into()), "{intents:?}");
+    }
+
+    #[test]
+    fn the_menu_swallows_what_lands_on_it_rather_than_its_lines() {
+        // The border, and any line too far down to be drawn. Without a target
+        // of its own the gesture reaches the cell underneath and moves the
+        // selection the menu was opened about.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
+        let mut c = f.ctx(PaneId::Grid);
+        c.menu = Some(&menu);
+
+        for gesture in [Gesture::Down, Gesture::Click] {
+            assert_eq!(on_mouse(Target::Menu, gesture, &c), Vec::new());
+        }
     }
 
     #[test]

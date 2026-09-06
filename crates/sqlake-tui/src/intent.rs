@@ -103,7 +103,10 @@ pub enum ViewCmd {
 
     /// Open the context menu over a cell.
     OpenMenu {
-        at: (u16, u16),
+        /// Where to put it, or `None` for a gesture with no coordinates to
+        /// give: a key press has none, and the view is the only thing that
+        /// knows where the grid ended up on this frame.
+        at: Option<(u16, u16)>,
         /// Whether more than one cell is selected, which is what the copy
         /// entries are called after.
         ranged: bool,

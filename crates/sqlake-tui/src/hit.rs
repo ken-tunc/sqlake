@@ -123,12 +123,18 @@ pub enum Target {
     /// A transient message. Clicking it dismisses it.
     Toast(ToastId),
 
-    /// Everything behind a modal. Clicking it dismisses the modal instead of
-    /// reaching what is underneath.
     /// One line of the open context menu.
     MenuItem {
         index: usize,
     },
+    /// The menu's own area, outside its lines: the border, and any line too
+    /// far down to be drawn. It swallows the gesture for the same reason
+    /// [`Target::Modal`] does — without it a press on the frame reaches the
+    /// cell underneath and moves the selection the menu was opened about.
+    Menu,
+
+    /// Everything behind a modal. Clicking it dismisses the modal instead of
+    /// reaching what is underneath.
     Backdrop,
     /// The dialog's own body.
     ///

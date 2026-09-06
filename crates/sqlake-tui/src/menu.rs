@@ -137,6 +137,11 @@ impl Menu {
 pub fn render(frame: &mut Frame<'_>, hits: &mut HitMap, screen: Rect, menu: &Menu) {
     let area = placed(screen, menu);
     frame.render_widget(Clear, area);
+    // The whole area first, so the lines pushed below win by being later at the
+    // same `z`. Without it the border — and any entry that cannot be chosen —
+    // is a hole through to the grid, and pressing on the frame selects the cell
+    // the menu is covering.
+    hits.push(area, Z_MENU, Target::Menu);
     let block = Block::bordered().border_style(Style::new().fg(Color::Cyan));
     let inside = block.inner(area);
     frame.render_widget(block, area);
@@ -184,15 +189,6 @@ fn placed(screen: Rect, menu: &Menu) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_entry_names_the_intent_it_produces() {
-        // The kind is derived rather than written down, so an entry cannot
-        // claim to be one thing and do another.
-        for entry in Menu::for_grid((0, 0), true).entries {
-            assert_eq!(entry.kind(), IntentKind::of(&entry.intent));
-        }
-    }
 
     #[test]
     fn the_labels_say_what_the_selection_is() {

@@ -135,8 +135,8 @@ impl MouseState {
         map: &HitMap,
         now: Instant,
     ) -> Vec<(Target, Gesture)> {
-        self.at = Position::new(event.column, event.row);
         let position = Position::new(event.column, event.row);
+        self.at = position;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.down(position, map),
             MouseEventKind::Up(MouseButton::Left) => self.up(position, now),
