@@ -143,8 +143,8 @@ The UI shows a confirmation dialog on `NeedsApproval` and calls the same use cas
 
 ## 5. Screen layout
 
-Where the layout is heading. Today's is the left half of it: one tree pane and one grid pane,
-with the cell-detail pane arriving in M3 and the SQL and definition tabs in M4 and M5.
+Where the layout is heading. Today's is most of it — a tree pane, a grid pane and the
+cell-detail pane under it — with the SQL and definition tabs arriving in M4 and M5.
 
 ```
 ┌ sqlake ── [● prod-pg] [○ bq-analytics] [+] ─────────────────────── ⚙ ─┐
@@ -164,20 +164,21 @@ with the cell-detail pane arriving in M3 and the SQL and definition tabs in M4 a
 
 ## 6. Mouse and keyboard
 
-`KEYMAP` in `crates/sqlake-tui/src/input.rs` is the list of bindings, and the two coverage
-tests beside it are what keep it complete: one asserts that every capability reachable with
-the mouse has a key, the other that the key produces the capability it names. Adding a target
-or a gesture stops the crate compiling until it has a sample.
+`KEYMAP` in `crates/sqlake-tui/src/input.rs` is the list of bindings, and the coverage tests
+beside it are what keep it complete: one asserts that every capability reachable with the
+mouse has a key, another that the key produces the capability it names. Adding a target or a
+gesture stops the crate compiling until it has a sample.
 
-What that mechanism does not cover, because it has not been built:
+What that mechanism does not cover:
 
-- Mouse capture takes native text selection away from the terminal. The plan is a permanent
-  hint in the status bar ("Shift — or Option — + drag to select") plus **OSC 52 copy** of a
-  cell, a row or a whole result, which works over SSH (M3). `--no-mouse` disables capture
-  entirely and exists today.
+- Mouse capture takes native text selection away from the terminal, so the status bar carries
+  the hint "Shift (or Option) + drag to select text" whenever there is room for it, and
+  **OSC 52 copy** puts a cell, a selection or a whole result on the clipboard through the
+  terminal, which is what works over SSH. `--no-mouse` disables capture entirely.
 - Some terminals and tmux configurations cannot deliver right-click, so every context menu
-  entry (M3) also needs a key binding. The coverage test enforces that only once the menu is a
-  hit target.
+  entry needs a key binding, and the menu itself does too — for those terminals it does not
+  exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
+  cannot, because it only ever clicks the menu's first line.
 - Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M4).
 
 ---
@@ -325,7 +326,7 @@ masking lives in exactly one function and never reaches the log.
 - **`RECORD` and `REPEATED` are flattened for display only.** The driver decodes them as
   `Value::Struct` and `Value::Array`, because `sqlake-api` hands an agent the same values and
   a document is what it asked for. Dotted column names (`user.name`) and the nesting in the
-  detail popover are the front-end's rendering of that, and belong with M3's cell detail.
+  detail pane are the front-end's rendering of that.
 
 ---
 
@@ -405,7 +406,7 @@ asks about — the reasoning is in `tests/conformance.rs`.
 | **M0 — Foundation** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M1 — Connection management** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M2 — Table list** ✅ | — | Done. `crates/` and `git log` are the record |
-| **M3** | Table preview (feature 3) — [design-m3.md](design-m3.md) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
+| **M3 — Table preview** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
 | **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
@@ -431,7 +432,7 @@ Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 �
 | --- | --- | --- |
 | Terminal state corrupted after returning from the external editor | unusable | One restore path, shared with the panic hook (`TerminalGuard`) |
 | `$EDITOR` is a GUI editor and returns immediately | annoyance | `editor_args` can supply a `--wait` equivalent; warn when the editor exits instantly |
-| Mouse capture steals native text selection | annoyance | OSC 52 copy as standard, a permanent hint about shift-drag, and `--no-mouse` |
+| Mouse capture steals native text selection | annoyance | OSC 52 copy as standard, a hint about shift-drag whenever the status bar has room, and `--no-mouse` |
 | Terminals and tmux configurations without right-click or hover | missing features | Every feature has a key binding, enforced by the coverage tests (§6) |
 | Too many staged types make the code verbose | velocity | Keep to the pipelines listed in §4.1; add a stage only when skipping it would cause a real accident |
 | BigQuery billing accident | real cost | `tabledata.list` for preview; `ApprovedQuery` enforced by the type system; `maximumBytesBilled` |
