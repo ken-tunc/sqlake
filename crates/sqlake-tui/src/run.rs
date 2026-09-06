@@ -119,7 +119,12 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                 // notch that went through the store would arrive a round trip
                 // later than the hand that turned it.
                 Intent::View(cmd) => {
-                    ui.apply(cmd, &snapshot);
+                    // A view command is applied here, on this thread — but
+                    // scrolling towards the end of a preview is also a reason
+                    // to fetch, and that part does go to the store.
+                    if let Some(action) = ui.apply(cmd, &snapshot) {
+                        store.dispatch(action);
+                    }
                     dirty = true;
                 }
                 Intent::App(action) => {
@@ -374,15 +379,22 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
+        store_of(Behaviour::instant())
+    }
+
+    fn store_of(behaviour: Behaviour) -> Store {
         Store::spawn(
-            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
             PageRequest::DEFAULT_LIMIT,
         )
     }
 
     async fn connected() -> (Store, Arc<Snapshot>) {
-        let store = store();
+        connected_to(store()).await
+    }
+
+    async fn connected_to(store: Store) -> (Store, Arc<Snapshot>) {
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect {
             profile: mock_summary("mock").id,
@@ -475,7 +487,7 @@ mod tests {
         let _ = render(&snap, &mut ui, 100, 30);
         let whole = ui.viewport(PaneId::Explorer).height;
 
-        ui.apply(
+        let _ = ui.apply(
             crate::intent::ViewCmd::SetFilter(Some(crate::ui::Filter::opening())),
             &snap,
         );
@@ -755,7 +767,7 @@ mod tests {
 
         // What the input layer would have applied alongside the action: the
         // tab this test then selects a cell in.
-        ui.apply(
+        let _ = ui.apply(
             crate::intent::ViewCmd::OpenTab {
                 conn,
                 table: table.clone(),
@@ -763,7 +775,7 @@ mod tests {
             &snap,
         );
         render(&snap, &mut ui, 100, 30);
-        ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 3 }, &snap);
+        let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 3 }, &snap);
         // Sorting and resizing act on the selected column, so the context has
         // to carry it or every key press means column zero.
         assert_eq!(context(&ui, &snap).grid_column, Some(3));
@@ -791,7 +803,7 @@ mod tests {
         let mut snap = rx.borrow_and_update().clone();
 
         let mut ui = UiState::new();
-        ui.apply(crate::intent::ViewCmd::OpenTab { conn, table }, &snap);
+        let _ = ui.apply(crate::intent::ViewCmd::OpenTab { conn, table }, &snap);
         assert_eq!(ui.tabs.len(), 1);
 
         store.dispatch(Action::Disconnect(conn));
@@ -800,6 +812,227 @@ mod tests {
 
         ui.close_disconnected_tabs(&snap);
         assert!(ui.tabs.is_empty(), "a tab outlived its own connection");
+    }
+
+    /// Opens `public.big` (200,000 rows, paged), scrolls to the end, and hands
+    /// back everything a paging test needs to look at.
+    async fn paging() -> (
+        Store,
+        Arc<Snapshot>,
+        UiState,
+        ConnId,
+        sqlake_core::node::TableRef,
+    ) {
+        let (store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let table = sqlake_core::node::TableRef::new(["public", "big"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.set_screen(ratatui::layout::Rect::new(0, 0, 120, 40));
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenTab {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+        (store, snap, ui, conn, table)
+    }
+
+    fn to_the_end(ui: &mut UiState, snap: &Arc<Snapshot>) -> Option<Action> {
+        ui.apply(crate::intent::ViewCmd::ScrollToEnd(PaneId::Grid), snap)
+    }
+
+    #[tokio::test]
+    async fn scrolling_to_the_end_asks_for_another_page() {
+        let (_store, snap, mut ui, conn, table) = paging().await;
+        assert_eq!(
+            to_the_end(&mut ui, &snap),
+            Some(Action::LoadMore { conn, table }),
+            "reaching the end of a paged relation did not fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_in_flight_is_not_asked_for_twice() {
+        // The store drops a second `LoadMore` for the same preview, but leaning
+        // on that would make this crate's correctness a fact about the store's
+        // deduplication.
+        let (_store, snap, mut ui, _, _) = paging().await;
+        assert!(to_the_end(&mut ui, &snap).is_some());
+        assert_eq!(
+            to_the_end(&mut ui, &snap),
+            None,
+            "the same page was asked for twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_that_landed_leaves_the_view_able_to_ask_again() {
+        let (store, snap, mut ui, _, table) = paging().await;
+        let conn = snap.connections[0].id;
+        let before = snap
+            .preview(conn, &table)
+            .map(|p| p.loaded_rows)
+            .expect("a preview");
+        let action = to_the_end(&mut ui, &snap).expect("it asks");
+        store.dispatch(action);
+
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.loaded_rows > before)
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        assert!(
+            to_the_end(&mut ui, &snap).is_some(),
+            "a page landed and the view still would not ask for the next"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_relation_needs_no_flag_to_stop_the_asking() {
+        // `public.users` is 50 rows and the page size is larger, so the first
+        // page is the whole relation: nothing grows, nothing fails, and there
+        // is nothing new to ask about. A view that read "at the bottom" as
+        // "fetch" would go back to the driver on every scroll for ever.
+        let (store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let table = sqlake_core::node::TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.set_screen(ratatui::layout::Rect::new(0, 0, 120, 40));
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenTab {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+
+        let action = to_the_end(&mut ui, &snap).expect("the first scroll to the end asks once");
+        store.dispatch(action);
+        until(&mut rx, |s| !s.is_busy()).await;
+        let snap = rx.borrow_and_update().clone();
+
+        assert_eq!(
+            to_the_end(&mut ui, &snap),
+            None,
+            "an exhausted relation was asked for another page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_that_failed_can_be_asked_for_again() {
+        // The store leaves `data` `Ready` and puts the reason in `last_error`,
+        // so the rows already fetched survive — which also means nothing about
+        // the preview says "that request is over" except the error itself. A
+        // view that did not watch it would never retry, and one bad page would
+        // be the end of the relation for as long as the tab lived.
+        let store = store_of(Behaviour {
+            // The first page lands; the second does not.
+            failing_after: vec![(vec!["public".to_owned(), "big".to_owned()], 1)],
+            ..Behaviour::instant()
+        });
+        let (store, snap) = connected_to(store).await;
+        let conn = snap.connections[0].id;
+        let table = sqlake_core::node::TableRef::new(["public", "big"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        ui.set_screen(ratatui::layout::Rect::new(0, 0, 120, 40));
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenTab {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+
+        let action = to_the_end(&mut ui, &snap).expect("it asks once");
+        store.dispatch(action);
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.last_error.is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        assert!(
+            to_the_end(&mut ui, &snap).is_some(),
+            "a page failed and the view would not try again"
+        );
+    }
+
+    #[tokio::test]
+    async fn sorting_starts_the_asking_over() {
+        // `SortPreview` restarts the relation at page one, so a watermark kept
+        // across it names a position the preview no longer has and paging stops
+        // for as long as the tab lives.
+        let (store, snap, mut ui, conn, table) = paging().await;
+        assert!(to_the_end(&mut ui, &snap).is_some());
+
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 0,
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.sort.is_some() && p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        assert!(
+            to_the_end(&mut ui, &snap).is_some(),
+            "paging stopped for the life of the tab because it had been sorted"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_grid_pages() {
+        let (_store, snap, mut ui, _, _) = paging().await;
+        assert_eq!(
+            ui.apply(crate::intent::ViewCmd::ScrollToEnd(PaneId::Explorer), &snap),
+            None,
+            "scrolling the tree fetched a page"
+        );
     }
 
     // ── screens ────────────────────────────────────────────────────────────
@@ -900,7 +1133,7 @@ mod tests {
         let mut ui = UiState::new();
         ui.focus = PaneId::Grid;
         // What the input layer would have applied alongside the action.
-        ui.apply(
+        let _ = ui.apply(
             crate::intent::ViewCmd::OpenTab {
                 conn,
                 table: table.clone(),
@@ -910,7 +1143,7 @@ mod tests {
         // Drawn first, the way the loop does it: an intent applied before any
         // frame exists is measured against a viewport of zero.
         let _ = render(&snap, &mut ui, 100, 30);
-        ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
+        let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
         insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
     }
 
@@ -928,7 +1161,7 @@ mod tests {
 
         let mut ui = UiState::new();
         let _ = render(&snap, &mut ui, 100, 30);
-        ui.apply(crate::intent::ViewCmd::SelectTreeRow(1), &snap);
+        let _ = ui.apply(crate::intent::ViewCmd::SelectTreeRow(1), &snap);
         insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
     }
 

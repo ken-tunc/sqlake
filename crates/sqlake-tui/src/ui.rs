@@ -21,7 +21,8 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
-use sqlake_app::snapshot::{ConnStatus, Snapshot};
+use sqlake_app::action::Action;
+use sqlake_app::snapshot::{ConnStatus, LoadState, Snapshot};
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_app::tree::VisibleNode;
@@ -92,6 +93,17 @@ pub const MIN_PANE_WIDTH: u16 = 12;
 /// Where the splitter sits before anyone moves it, as a fraction of the screen.
 const DEFAULT_EXPLORER_PERMILLE: u32 = 280;
 
+/// What a preview looked like when a page was last asked for.
+type PageMark = (usize, Option<String>, Option<sqlake_core::result::Sort>);
+
+/// How far above the last loaded row a scroll starts fetching.
+///
+/// Above the last row rather than at it, so the fetch overlaps the scrolling
+/// instead of stopping it. A constant rather than the viewport's height: on a
+/// tall terminal that would exceed a page and ask before the previous page had
+/// anywhere to go.
+const LOAD_MARGIN_ROWS: usize = 20;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TreeUi {
     pub offset: usize,
@@ -103,6 +115,21 @@ pub struct TreeUi {
 #[derive(Debug, Default)]
 pub struct GridUi {
     pub row_offset: usize,
+    /// The preview's state when this tab last asked for another page.
+    ///
+    /// A description of the state rather than a boolean, because the store
+    /// announces none of the four things that make asking sensible again and
+    /// all four show up here. A page landed: `loaded_rows` grew. A page failed:
+    /// `last_error` is set, and asking again is a retry. And the end of the
+    /// relation is the one that needs no flag — a page that arrived empty
+    /// leaves everything unchanged, so there is nothing new to ask about,
+    /// which is exactly right.
+    ///
+    /// The ordering is in here because a sort is the case a row count cannot
+    /// see: `sort_preview` restarts the relation at page one, so the count
+    /// comes back to what it already was and the rows under it are different
+    /// ones. Without it, sorting stops paging for as long as the tab lives.
+    asked_at: Option<PageMark>,
     /// Horizontal position in whole columns. Per column rather than per cell:
     /// the wheel and the scrollbar both move in column steps, and a half-drawn
     /// leading column is worse than a hard edge.
@@ -307,7 +334,8 @@ impl UiState {
             .map(|t| t.id)
             .collect();
         for id in closed {
-            self.apply(ViewCmd::CloseTab(id), snapshot);
+            // Closing a tab fetches nothing; only scrolling does.
+            debug_assert!(self.apply(ViewCmd::CloseTab(id), snapshot).is_none());
         }
     }
 
@@ -322,7 +350,14 @@ impl UiState {
     }
 
     /// Apply a view command, synchronously and without touching the store.
-    pub fn apply(&mut self, cmd: ViewCmd, snapshot: &Snapshot) {
+    ///
+    /// Returns the one action a view command can cause: scrolling towards the
+    /// end of a preview asks for the next page. It stays a return value rather
+    /// than a dispatch from in here so that this type still has no way to reach
+    /// the store, and so the caller can see that scrolling is the only thing
+    /// that fetches.
+    #[must_use]
+    pub fn apply(&mut self, cmd: ViewCmd, snapshot: &Snapshot) -> Option<Action> {
         match cmd {
             ViewCmd::FocusPane(pane) => self.focus = pane,
             ViewCmd::FocusNextPane => self.cycle_focus(1),
@@ -331,14 +366,19 @@ impl UiState {
             ViewCmd::ScrollBy { pane, delta } => {
                 let offset = self.offset(pane);
                 self.set_offset(pane, step(offset, delta), snapshot);
+                return self.wants_a_page(pane, snapshot);
             }
             ViewCmd::ScrollToRatio { pane, permille } => {
                 let span = self.scrollable(pane, snapshot);
                 let target = span * usize::from(permille.min(1000)) / 1000;
                 self.set_offset(pane, target, snapshot);
+                return self.wants_a_page(pane, snapshot);
             }
             ViewCmd::ScrollToStart(pane) => self.set_offset(pane, 0, snapshot),
-            ViewCmd::ScrollToEnd(pane) => self.set_offset(pane, usize::MAX, snapshot),
+            ViewCmd::ScrollToEnd(pane) => {
+                self.set_offset(pane, usize::MAX, snapshot);
+                return self.wants_a_page(pane, snapshot);
+            }
             ViewCmd::ScrollXBy { delta } => {
                 let columns = self.column_count(snapshot);
                 if let Some(grid) = self.active_grid_mut() {
@@ -423,6 +463,46 @@ impl UiState {
             }
             ViewCmd::DismissToast(id) => self.toasts.retain(|t| t.id != id),
         }
+        None
+    }
+
+    /// Whether this scroll should fetch, and the action if so.
+    ///
+    /// Only reached from a scroll somebody made. A predicate the render loop
+    /// checked each frame would fetch on its own: `page_size` goes down to a
+    /// single row, so a viewport taller than a page is still "near the end" the
+    /// moment the page lands, and a relation would walk itself to the end with
+    /// nobody touching the wheel.
+    fn wants_a_page(&mut self, pane: PaneId, snapshot: &Snapshot) -> Option<Action> {
+        if pane != PaneId::Grid {
+            return None;
+        }
+        let id = self.active_tab?;
+        let tab = self.tabs.iter().find(|t| t.id == id)?.clone();
+        let preview = snapshot.preview(tab.conn, &tab.table)?;
+        // A first page still in flight is not something to hurry along, and its
+        // `loaded_rows` of zero would otherwise read as "at the end".
+        if !matches!(preview.data, LoadState::Ready(_)) {
+            return None;
+        }
+
+        let state: PageMark = (
+            preview.loaded_rows,
+            preview.last_error.clone(),
+            preview.sort,
+        );
+        let near_the_end = self.offset(PaneId::Grid) + self.page(PaneId::Grid) + LOAD_MARGIN_ROWS
+            >= preview.loaded_rows;
+
+        let grid = self.grids.entry(id).or_default();
+        if !near_the_end || grid.asked_at.as_ref() == Some(&state) {
+            return None;
+        }
+        grid.asked_at = Some(state);
+        Some(Action::LoadMore {
+            conn: tab.conn,
+            table: tab.table,
+        })
     }
 
     fn cycle_focus(&mut self, delta: i32) {
@@ -753,7 +833,7 @@ mod tests {
         ui.set_screen(Rect::new(0, 0, 82, 12));
         ui.set_viewport(PaneId::Explorer, Rect::new(0, 1, 20, 10));
         ui.set_viewport(PaneId::Grid, Rect::new(21, 1, 60, 10));
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::OpenTab {
                 conn,
                 table: table(),
@@ -770,14 +850,14 @@ mod tests {
         // its old number lands on a node the user never pointed at — and then
         // `Enter` opens it.
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(ViewCmd::SelectTreeRow(17), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(17), &snap);
         assert_eq!(
             ui.visible_node(&snap, 17).map(|n| n.label.clone()),
             Some("n17".to_owned())
         );
 
         // `n17` is the only row left, so it is row zero now.
-        ui.apply(ViewCmd::SetFilter(Some(search("n17"))), &snap);
+        let _ = ui.apply(ViewCmd::SetFilter(Some(search("n17"))), &snap);
         assert_eq!(ui.tree.selected, Some(0));
         assert_eq!(
             ui.visible_node(&snap, 0).map(|n| n.label.clone()),
@@ -786,7 +866,7 @@ mod tests {
 
         // And back again: clearing restores the tree, and the selection goes
         // with the node rather than staying at zero.
-        ui.apply(ViewCmd::SetFilter(None), &snap);
+        let _ = ui.apply(ViewCmd::SetFilter(None), &snap);
         assert_eq!(ui.tree.selected, Some(17));
     }
 
@@ -795,8 +875,8 @@ mod tests {
         // There is nothing to follow, and the first row is where a search
         // leaves you anyway.
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(ViewCmd::SelectTreeRow(17), &snap);
-        ui.apply(ViewCmd::SetFilter(Some(search("n2"))), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(17), &snap);
+        let _ = ui.apply(ViewCmd::SetFilter(Some(search("n2"))), &snap);
         assert_eq!(ui.tree.selected, Some(0));
         assert_eq!(
             ui.visible_node(&snap, 0).map(|n| n.label.clone()),
@@ -807,8 +887,8 @@ mod tests {
     #[test]
     fn a_filter_that_matches_nothing_selects_nothing() {
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(ViewCmd::SelectTreeRow(3), &snap);
-        ui.apply(ViewCmd::SetFilter(Some(search("zzz"))), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(3), &snap);
+        let _ = ui.apply(ViewCmd::SetFilter(Some(search("zzz"))), &snap);
         assert_eq!(ui.tree.selected, None);
     }
 
@@ -817,9 +897,9 @@ mod tests {
         // The clamp reads the visible count, not the tree's: otherwise `G`
         // runs off the end of a filtered list into rows that are not drawn.
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(ViewCmd::SetFilter(Some(search("n1"))), &snap);
+        let _ = ui.apply(ViewCmd::SetFilter(Some(search("n1"))), &snap);
         // n1, n10..n19 — eleven rows.
-        ui.apply(ViewCmd::MoveTreeSelection(1000), &snap);
+        let _ = ui.apply(ViewCmd::MoveTreeSelection(1000), &snap);
         assert_eq!(ui.tree.selected, Some(10));
         assert_eq!(
             ui.visible_node(&snap, 10).map(|n| n.label.clone()),
@@ -830,7 +910,7 @@ mod tests {
     #[test]
     fn scrolling_stops_at_the_last_screenful() {
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::ScrollBy {
                 pane: PaneId::Explorer,
                 delta: 1000,
@@ -845,7 +925,7 @@ mod tests {
     fn scrolling_the_grid_continues_from_where_it_was() {
         let (snap, mut ui) = setup(0, 50, 2);
         for _ in 0..3 {
-            ui.apply(
+            let _ = ui.apply(
                 ViewCmd::ScrollBy {
                     pane: PaneId::Grid,
                     delta: 3,
@@ -861,14 +941,14 @@ mod tests {
     #[test]
     fn content_shorter_than_the_pane_never_scrolls() {
         let (snap, mut ui) = setup(3, 0, 0);
-        ui.apply(ViewCmd::ScrollToEnd(PaneId::Explorer), &snap);
+        let _ = ui.apply(ViewCmd::ScrollToEnd(PaneId::Explorer), &snap);
         assert_eq!(ui.tree.offset, 0, "there is nothing below to reach");
     }
 
     #[test]
     fn a_track_click_lands_proportionally() {
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::ScrollToRatio {
                 pane: PaneId::Explorer,
                 permille: 500,
@@ -881,13 +961,13 @@ mod tests {
     #[test]
     fn the_selection_pulls_the_viewport_with_it() {
         let (snap, mut ui) = setup(30, 0, 0);
-        ui.apply(ViewCmd::SelectTreeRow(25), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(25), &snap);
         assert_eq!(ui.tree.selected, Some(25));
         // Just far enough that row 25 is the last visible row, not a jump that
         // puts it in the middle and loses the reader's place.
         assert_eq!(ui.tree.offset, 16);
 
-        ui.apply(ViewCmd::SelectTreeRow(2), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(2), &snap);
         assert_eq!(ui.tree.offset, 2);
     }
 
@@ -895,30 +975,30 @@ mod tests {
     fn the_first_move_selects_the_first_row() {
         let (snap, mut ui) = setup(30, 0, 0);
         assert_eq!(ui.tree.selected, None);
-        ui.apply(ViewCmd::MoveTreeSelection(1), &snap);
+        let _ = ui.apply(ViewCmd::MoveTreeSelection(1), &snap);
         assert_eq!(ui.tree.selected, Some(0), "not row one");
     }
 
     #[test]
     fn selection_cannot_leave_the_content() {
         let (snap, mut ui) = setup(3, 0, 0);
-        ui.apply(ViewCmd::MoveTreeSelection(-5), &snap);
+        let _ = ui.apply(ViewCmd::MoveTreeSelection(-5), &snap);
         assert_eq!(ui.tree.selected, Some(0));
-        ui.apply(ViewCmd::SelectTreeRow(99), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(99), &snap);
         assert_eq!(ui.tree.selected, Some(2));
     }
 
     #[test]
     fn an_empty_tree_has_nothing_selected() {
         let (snap, mut ui) = setup(0, 0, 0);
-        ui.apply(ViewCmd::SelectTreeRow(0), &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(0), &snap);
         assert_eq!(ui.tree.selected, None);
     }
 
     #[test]
     fn the_cell_cursor_stays_inside_the_result() {
         let (snap, mut ui) = setup(0, 50, 4);
-        ui.apply(ViewCmd::SelectCell { row: 99, col: 99 }, &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 99, col: 99 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
         assert_eq!((grid.row, grid.col), (49, 3));
     }
@@ -926,8 +1006,8 @@ mod tests {
     #[test]
     fn moving_the_cell_cursor_scrolls_the_grid() {
         let (snap, mut ui) = setup(0, 50, 4);
-        ui.apply(ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
-        ui.apply(ViewCmd::MoveCellSelection { drow: 20, dcol: 0 }, &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
+        let _ = ui.apply(ViewCmd::MoveCellSelection { drow: 20, dcol: 0 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
         assert_eq!(grid.row, 20);
         assert_eq!(grid.row_offset, 11);
@@ -938,7 +1018,7 @@ mod tests {
         // Sixty columns of at least the minimum width: the cursor cannot reach
         // column fifty without the grid scrolling after it.
         let (snap, mut ui) = setup(0, 10, 60);
-        ui.apply(ViewCmd::SelectCell { row: 0, col: 50 }, &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 0, col: 50 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
         assert_eq!(grid.col, 50);
         assert!(
@@ -947,14 +1027,14 @@ mod tests {
             grid.col_offset
         );
 
-        ui.apply(ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 0, col: 0 }, &snap);
         assert_eq!(ui.grid(TabId::new(1)).unwrap().col_offset, 0, "and back");
     }
 
     #[test]
     fn a_grid_with_no_rows_ignores_the_cursor() {
         let (snap, mut ui) = setup(0, 0, 0);
-        ui.apply(ViewCmd::SelectCell { row: 3, col: 3 }, &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 3, col: 3 }, &snap);
         assert!(ui.grid(TabId::new(1)).is_none_or(|g| g.row == 0));
     }
 
@@ -965,7 +1045,7 @@ mod tests {
             let rows = ui.rows_of(&snap).unwrap().clone();
             ui.grid_mut(TabId::new(1)).grid(&rows).columns()[1].natural_width
         };
-        ui.apply(ViewCmd::ResizeColumn { col: 1, delta: 5 }, &snap);
+        let _ = ui.apply(ViewCmd::ResizeColumn { col: 1, delta: 5 }, &snap);
         let grid = ui.grid(TabId::new(1)).unwrap();
         assert_eq!(grid.width(1, natural), natural + 5);
         assert_eq!(grid.width(0, natural), natural, "only the one column moved");
@@ -974,7 +1054,7 @@ mod tests {
     #[test]
     fn a_column_cannot_be_dragged_to_nothing() {
         let (snap, mut ui) = setup(0, 10, 3);
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::ResizeColumn {
                 col: 0,
                 delta: -500,
@@ -997,26 +1077,26 @@ mod tests {
     fn focus_cycles_between_the_two_panes() {
         let (snap, mut ui) = setup(0, 0, 0);
         assert_eq!(ui.focus, PaneId::Explorer);
-        ui.apply(ViewCmd::FocusNextPane, &snap);
+        let _ = ui.apply(ViewCmd::FocusNextPane, &snap);
         assert_eq!(ui.focus, PaneId::Grid);
-        ui.apply(ViewCmd::FocusNextPane, &snap);
+        let _ = ui.apply(ViewCmd::FocusNextPane, &snap);
         assert_eq!(ui.focus, PaneId::Explorer);
-        ui.apply(ViewCmd::FocusPrevPane, &snap);
+        let _ = ui.apply(ViewCmd::FocusPrevPane, &snap);
         assert_eq!(ui.focus, PaneId::Grid);
     }
 
     #[test]
     fn focus_from_outside_the_cycle_enters_it() {
         let (snap, mut ui) = setup(0, 0, 0);
-        ui.apply(ViewCmd::FocusPane(PaneId::StatusBar), &snap);
-        ui.apply(ViewCmd::FocusNextPane, &snap);
+        let _ = ui.apply(ViewCmd::FocusPane(PaneId::StatusBar), &snap);
+        let _ = ui.apply(ViewCmd::FocusNextPane, &snap);
         assert_eq!(ui.focus, PaneId::Explorer);
     }
 
     #[test]
     fn the_splitter_leaves_both_panes_usable() {
         let (snap, mut ui) = setup(0, 0, 0);
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::MoveSplit {
                 split: SplitId::Explorer,
                 delta: -500,
@@ -1025,7 +1105,7 @@ mod tests {
         );
         assert_eq!(ui.explorer_width(80), MIN_PANE_WIDTH);
 
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::MoveSplit {
                 split: SplitId::Explorer,
                 delta: 500,
@@ -1049,7 +1129,7 @@ mod tests {
         ui.set_viewport(PaneId::Grid, Rect::new(30, 2, 68, 26));
 
         let before = ui.explorer_width(100);
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::MoveSplit {
                 split: SplitId::Explorer,
                 delta: 1,
@@ -1063,7 +1143,7 @@ mod tests {
     fn evening_the_split_returns_to_a_fraction_of_the_screen() {
         let (snap, mut ui) = setup(0, 0, 0);
         let default = ui.explorer_width(100);
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::MoveSplit {
                 split: SplitId::Explorer,
                 delta: 10,
@@ -1071,7 +1151,7 @@ mod tests {
             &snap,
         );
         assert_ne!(ui.explorer_width(100), default);
-        ui.apply(ViewCmd::EvenSplit(SplitId::Explorer), &snap);
+        let _ = ui.apply(ViewCmd::EvenSplit(SplitId::Explorer), &snap);
         assert_eq!(ui.explorer_width(100), default);
         // And it follows the terminal rather than being frozen.
         assert!(ui.explorer_width(200) > default);
@@ -1087,11 +1167,11 @@ mod tests {
     #[test]
     fn closing_a_tab_releases_its_view_state() {
         let (snap, mut ui) = setup(0, 10, 2);
-        ui.apply(ViewCmd::SelectCell { row: 1, col: 1 }, &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 1, col: 1 }, &snap);
         let tab = ui.active_tab.unwrap();
         assert!(ui.grid(tab).is_some());
 
-        ui.apply(ViewCmd::CloseTab(tab), &snap);
+        let _ = ui.apply(ViewCmd::CloseTab(tab), &snap);
         assert!(ui.grid(tab).is_none(), "the cached grid goes with it");
     }
 
@@ -1103,7 +1183,7 @@ mod tests {
 
         // A second tab, so the first is no longer active — reopening it must
         // find it rather than assume it is still in front.
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::OpenTab {
                 conn: ConnId::new(),
                 table: TableRef::new(["public", "orders"]),
@@ -1112,7 +1192,7 @@ mod tests {
         );
         assert_ne!(ui.active_tab, Some(first));
 
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::OpenTab {
                 conn,
                 table: table(),
@@ -1127,7 +1207,7 @@ mod tests {
     fn closing_a_tab_selects_its_neighbour() {
         let (snap, mut ui) = setup(0, 0, 0);
         let first = ui.active_tab.unwrap();
-        ui.apply(
+        let _ = ui.apply(
             ViewCmd::OpenTab {
                 conn: ConnId::new(),
                 table: TableRef::new(["public", "orders"]),
@@ -1135,7 +1215,7 @@ mod tests {
             &snap,
         );
 
-        ui.apply(ViewCmd::CloseTab(first), &snap);
+        let _ = ui.apply(ViewCmd::CloseTab(first), &snap);
         assert_eq!(ui.tabs.len(), 1);
         assert_eq!(ui.active_tab, Some(ui.tabs[0].id));
     }
@@ -1144,7 +1224,7 @@ mod tests {
     fn closing_the_last_tab_leaves_nothing_selected() {
         let (snap, mut ui) = setup(0, 0, 0);
         let tab = ui.active_tab.unwrap();
-        ui.apply(ViewCmd::CloseTab(tab), &snap);
+        let _ = ui.apply(ViewCmd::CloseTab(tab), &snap);
         assert!(ui.tabs.is_empty());
         assert_eq!(ui.active_tab, None);
     }
