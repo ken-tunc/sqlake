@@ -70,6 +70,16 @@ struct Args {
     #[arg(long, hide = true)]
     panic_test: bool,
 
+    /// Listen on a named socket, so an agent can drive this session.
+    ///
+    /// Opt-in. A socket is a way into a process holding live connections and
+    /// resolved credentials, so it is opened because somebody asked for it and
+    /// not because the client started. `$SQLAKE_SESSION` names one too, which
+    /// is what makes per-project addressing a shell convention rather than a
+    /// feature this has to know about.
+    #[arg(long, value_name = "NAME", global = true)]
+    session: Option<String>,
+
     /// Answer one request and exit, instead of opening the client.
     ///
     /// The agent surface's one-shot mode. Every other flag still applies:
@@ -86,7 +96,13 @@ fn main() -> Result<std::process::ExitCode> {
     // the screen, and installing a hook that restores a terminal nobody entered
     // would leave a stray reset in the middle of a caller's JSON.
     if let Some(command) = &args.command {
-        let (profiles, page_size, connect) = if command.needs_a_connection() {
+        let (profiles, page_size, connect) = if command.needs() == agent::Needs::Nothing {
+            (
+                Arc::new(agent::NoProfiles) as Arc<dyn Profiles>,
+                Settings::default().page_size,
+                None,
+            )
+        } else {
             let (profiles, settings) = configuration(&args)?;
             let connect = opening(&profiles, &args)?;
             // One request, one connection. A second `--connect` is a caller
@@ -98,14 +114,23 @@ fn main() -> Result<std::process::ExitCode> {
                 connect.len()
             );
             (profiles, settings.page_size, connect.into_iter().next())
-        } else {
-            (
-                Arc::new(agent::NoProfiles) as Arc<dyn Profiles>,
-                Settings::default().page_size,
-                None,
-            )
         };
-        return agent::run(command, drivers(), profiles, page_size, connect);
+        // Resolved even for a command that starts its own store: attaching is
+        // tried first, and a session that is running is always the better
+        // answer than a second store opening the same database again.
+        let session =
+            match sqlake_api::socket_path(&sqlake_api::session_name(args.session.as_deref())) {
+                Ok(path) => Some(path),
+                // Not fatal: a path that cannot name a socket means no session can
+                // be reached, and the command runs its own store. Said out loud on
+                // stderr, because a caller that passed `--session` expected to
+                // attach and would otherwise see a slower answer and no reason.
+                Err(why) => {
+                    eprintln!("not attaching: {why}");
+                    None
+                }
+            };
+        return agent::run(command, drivers(), profiles, page_size, connect, session);
     }
 
     // Every mode change is undone by the guard's `Drop`, and the hook routes a
@@ -133,6 +158,15 @@ fn main() -> Result<std::process::ExitCode> {
         store
     });
 
+    // Opt-in, and bound before the screen is taken: a name already in use is a
+    // message on a terminal somebody can read, rather than an error raised into
+    // a client that has taken the display over. The listener is held until the
+    // client exits, and removes its socket on the way out.
+    let _listening = match &args.session {
+        Some(name) => Some(listen(&runtime, name, &store)?),
+        None => None,
+    };
+
     let (_guard, mut terminal) = TerminalGuard::enter(!args.no_mouse)?;
     assert!(
         !args.panic_test,
@@ -155,6 +189,24 @@ fn main() -> Result<std::process::ExitCode> {
     // of this function whether `result` is an error or not.
     result.context("the render loop stopped")?;
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Answer the agent surface on this session's socket, alongside the client.
+///
+/// The same store the person is using, not a second one: reusing their
+/// connections — and the credential prompts they have already answered — is
+/// the whole reason to attach rather than start a store of one's own.
+fn listen(
+    runtime: &tokio::runtime::Runtime,
+    name: &str,
+    store: &Store,
+) -> Result<sqlake_api::ListenerHandle> {
+    let path = sqlake_api::socket_path(name).context("finding somewhere to put the socket")?;
+    let listener = runtime
+        .block_on(sqlake_api::Listener::bind(path.clone()))
+        .with_context(|| format!("listening on {}", path.display()))?;
+    tracing::info!(session = name, path = %path.display(), "answering the agent surface");
+    Ok(listener.spawn_on(runtime, Arc::new(sqlake_api::Service::new(store.clone()))))
 }
 
 /// Every driver this build can talk to.

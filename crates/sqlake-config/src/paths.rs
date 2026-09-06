@@ -28,6 +28,21 @@ pub fn state_dir() -> Result<PathBuf, ConfigError> {
     resolve(env("XDG_STATE_HOME"), env("HOME"), ".local/state").ok_or(ConfigError::NoHome)
 }
 
+/// `$XDG_RUNTIME_DIR/sqlake`, or `$XDG_STATE_HOME/sqlake/run`.
+///
+/// A session's socket goes here. The runtime directory is the right home for
+/// it — it is cleaned when the user logs out, which is exactly the lifetime of
+/// a socket whose process is gone — but macOS sets no `XDG_RUNTIME_DIR`, so
+/// the state directory has to be able to hold one too. A stale file there is
+/// handled rather than prevented: a socket outlives the process that made it
+/// either way.
+pub fn runtime_dir() -> Result<PathBuf, ConfigError> {
+    if let Some(dir) = env("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(dir).join(APP));
+    }
+    state_dir().map(|dir| dir.join("run"))
+}
+
 /// Settings that are not about a particular connection.
 #[must_use]
 pub fn settings_file(config_dir: &Path) -> PathBuf {

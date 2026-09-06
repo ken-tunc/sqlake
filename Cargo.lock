@@ -3932,10 +3932,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlake-app",
+ "sqlake-config",
  "sqlake-core",
  "sqlake-driver-mock",
+ "tempfile",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

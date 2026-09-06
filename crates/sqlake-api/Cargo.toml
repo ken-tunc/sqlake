@@ -16,9 +16,13 @@ schemars.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 sqlake-app.workspace = true
+sqlake-config.workspace = true
 sqlake-core.workspace = true
 time.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+tracing.workspace = true
 
 [dev-dependencies]
 sqlake-driver-mock.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
