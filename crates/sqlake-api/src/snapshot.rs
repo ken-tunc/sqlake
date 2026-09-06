@@ -6,13 +6,14 @@
 //! status, and the socket is the one place where an accidental field would
 //! leave the process.
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sqlake_app::snapshot::{ConnStatus, ConnectionView, Snapshot};
 use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::capability::Capabilities;
 use sqlake_core::id::ConnId;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum Status {
     Connecting,
@@ -39,7 +40,7 @@ impl From<&ConnStatus> for Status {
 /// Only the answers a read-only caller can act on. The hierarchy is here
 /// because it is what tells an agent whether a path is `schema.table` or
 /// `project.dataset.table` without it having to know which driver it reached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct CapabilityInfo {
     pub hierarchy: Vec<String>,
     pub sortable_preview: bool,
@@ -60,7 +61,7 @@ impl From<&Capabilities> for CapabilityInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct ConnectionInfo {
     pub id: String,
     /// Which configured profile it came from. A name in a file the user wrote,
@@ -70,7 +71,7 @@ pub struct ConnectionInfo {
     pub driver: String,
     #[serde(flatten)]
     pub status: Status,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilityInfo>,
 }
 
@@ -92,14 +93,14 @@ impl From<&ConnectionView> for ConnectionInfo {
 /// The colour a profile carries is left out: it is the TUI's way of making a
 /// production connection not look like a scratch one, and means nothing to a
 /// caller with no screen.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct ProfileInfo {
     pub id: String,
     pub name: String,
     pub driver: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeStatus {
     /// Has no children at all.
@@ -116,15 +117,15 @@ pub enum NodeStatus {
 /// rather than as a name that has to be joined back together — a namespace
 /// containing a dot is a real thing, and rebuilding `public.my.table` from
 /// pieces is where that goes wrong.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct NodeInfo {
     pub path: Vec<String>,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation_kind: Option<String>,
     pub status: NodeStatus,
     /// Present only on a failure, and is the driver's message.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -150,7 +151,7 @@ impl From<&VisibleNode> for NodeInfo {
 }
 
 /// The session as a caller sees it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct SessionInfo {
     pub connections: Vec<ConnectionInfo>,
     pub profiles: Vec<ProfileInfo>,

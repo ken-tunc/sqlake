@@ -47,6 +47,10 @@ ratatui = "0.30"
 rust_decimal = { version = "1", features = ["db-postgres"] }
 rustls-native-certs = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The protocol schema is generated from the types rather than written by hand:
+# a second description of the protocol is one nothing checks, and it keeps
+# describing a call after the call changes.
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
