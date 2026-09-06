@@ -91,6 +91,8 @@ pub enum ViewCmd {
     },
     EvenSplit(SplitId),
 
+    /// Open or close the pane that shows one cell in full.
+    ToggleDetail,
     DismissModal,
 
     /// A relation now has a tab open for it, focused — raising the existing
@@ -139,6 +141,7 @@ intent_kinds! {
     ResizeColumn       => "change a column's width",
     MoveSplit          => "move the split between panes",
     EvenSplit          => "reset the split",
+    ToggleDetail       => "show a cell in full",
     DismissModal       => "close the dialog",
     Filter             => "search the explorer",
 
@@ -179,6 +182,7 @@ impl IntentKind {
                 ViewCmd::ResizeColumn { .. } => Self::ResizeColumn,
                 ViewCmd::MoveSplit { .. } => Self::MoveSplit,
                 ViewCmd::EvenSplit(_) => Self::EvenSplit,
+                ViewCmd::ToggleDetail => Self::ToggleDetail,
                 ViewCmd::DismissModal => Self::DismissModal,
                 // Paired with `Action::PreviewTable`: one capability,
                 // "open a relation", not two.
