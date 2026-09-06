@@ -19,6 +19,7 @@ pub mod grid;
 pub mod hit;
 pub mod input;
 pub mod intent;
+pub mod menu;
 pub mod mouse;
 pub mod overlay;
 pub mod run;

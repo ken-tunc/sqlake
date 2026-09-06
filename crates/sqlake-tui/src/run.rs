@@ -171,6 +171,11 @@ fn raise_connection_failure(snapshot: &Snapshot, ui: &mut UiState) {
         return;
     };
     ui.reported_failures.insert(id);
+    // The menu sits above the modal — `Z_MENU` is higher than `Z_MODAL`, which
+    // is what keeps a click on it from reaching the cell underneath — so a
+    // menu left open would float over the dialog and stay clickable, which is
+    // the fall-through the backdrop exists to prevent.
+    ui.menu = None;
     ui.modal = Some(overlay::Modal::error(
         format!("{name} could not be opened"),
         why,
@@ -226,14 +231,21 @@ fn from_event(
     snapshot: &Snapshot,
     mouse_enabled: bool,
 ) -> Vec<Intent> {
-    let ctx = context(ui, snapshot);
+    let mut ctx = context(ui, snapshot);
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => input::on_key(key, &ctx),
-        Event::Mouse(event) if mouse_enabled => mouse
-            .feed(event, hits, Instant::now())
-            .into_iter()
-            .flat_map(|(target, gesture)| input::on_mouse(target, gesture, &ctx))
-            .collect(),
+        Event::Mouse(event) if mouse_enabled => {
+            let gestures = mouse.feed(event, hits, Instant::now());
+            // After the event, not before it: a right-click *is* how the
+            // pointer arrives at a cell on a terminal that reports no motion,
+            // and reading a position recorded on the previous event would open
+            // the menu wherever the mouse was last heard from.
+            ctx.pointer = mouse.position();
+            gestures
+                .into_iter()
+                .flat_map(|(target, gesture)| input::on_mouse(target, gesture, &ctx))
+                .collect()
+        }
         // A resize redraws by falling out of the loop; the layout is computed
         // from the frame each time and has nothing to invalidate.
         _ => Vec::new(),
@@ -245,6 +257,14 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         snapshot,
         focus: ui.focus,
         modal_open: ui.modal.is_some(),
+        // Overwritten from the pointer's own position on a mouse event; a key
+        // press has no pointer and does not read it.
+        pointer: (0, 0),
+        selection: ui
+            .active_tab
+            .and_then(|id| ui.grid(id))
+            .map(|g| g.selection(ui.active_sort(snapshot))),
+        menu: ui.menu.as_ref(),
         // The selected row's connection, falling back to the first: with
         // several open, `D` has to disconnect the one being looked at.
         connection: ui
@@ -379,6 +399,11 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     overlay::toasts(frame, hits, body_of(frames), &ui.toasts);
     if let Some(dialog) = ui.modal.clone() {
         overlay::modal(frame, hits, area, &dialog);
+    }
+    // Last, and at `Z_MENU`: a menu covers what it was opened over, and a click
+    // on it must not fall through to the cell underneath.
+    if let Some(menu) = ui.menu.clone() {
+        crate::menu::render(frame, hits, area, &menu);
     }
 }
 

@@ -226,6 +226,16 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::ToggleDetail,
     },
     KeyBinding {
+        // The menu itself needs a key, not only its entries: a terminal that
+        // cannot deliver a right-click would otherwise have no way to see what
+        // is on offer. `.` because it is free in every context and reads as
+        // "and the rest" — `m` is `LoadMore` here, and taking it would have
+        // been the `c` mistake again.
+        keys: &[key('.')],
+        context: Context::Grid,
+        kind: IntentKind::Menu,
+    },
+    KeyBinding {
         // The letter says how much and the case says which format: `y` yanks
         // what is selected, `a` takes it all, and shift on either asks for
         // JSON instead of CSV.
@@ -328,6 +338,19 @@ pub struct InputContext<'a> {
     /// only thing that makes them equivalent: without it every key press would
     /// sort and resize column zero whatever the user had selected.
     pub grid_column: Option<usize>,
+    /// Where the pointer is, for a gesture that opens something at it.
+    pub pointer: (u16, u16),
+    /// The selected rectangle, `(top, left, bottom, right)` inclusive.
+    ///
+    /// The whole rectangle rather than "is it more than one cell", because a
+    /// right-click has to know whether it landed *inside* the selection: on it,
+    /// the menu is about the selection; anywhere else, it is about the cell
+    /// that was clicked, and leaving the selection where it was would act on a
+    /// cell nobody pointed at.
+    pub selection: Option<(usize, usize, usize, usize)>,
+    /// The open context menu, so a click on one of its lines can be resolved to
+    /// the intent that line carries.
+    pub menu: Option<&'a crate::menu::Menu>,
     /// Which relation a tab points at is what turns a click on a header into
     /// a `SortPreview` for the right table.
     pub tabs: &'a [OpenTab],
@@ -406,6 +429,13 @@ impl InputContext<'_> {
             .then_some((conn, table))
     }
 
+    /// Whether the selection covers more than one cell.
+    #[must_use]
+    fn ranged(&self) -> bool {
+        self.selection
+            .is_some_and(|(top, left, bottom, right)| top != bottom || left != right)
+    }
+
     /// The context a keystroke is read in. A modal takes the keyboard over
     /// entirely, which is why `Esc` can mean two different things without
     /// being ambiguous.
@@ -433,6 +463,34 @@ impl InputContext<'_> {
 /// What a gesture on a target means.
 #[must_use]
 pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec<Intent> {
+    // A gesture anywhere but the menu closes it, and still does what it was a
+    // gesture on. A menu that stayed open would have to be dismissed before
+    // anything else worked, which is a mode nobody asked for.
+    //
+    // The press as well as the click, because a drag on the grid starts on the
+    // press: without it a rectangle is swept out under a menu that is still
+    // sitting on top of it. The wheel too — the menu is placed in screen
+    // coordinates, so content scrolling beneath leaves it pointing at a cell
+    // that has moved.
+    if ctx.menu.is_some()
+        && matches!(
+            gesture,
+            Gesture::Click
+                | Gesture::RightClick
+                | Gesture::Down
+                | Gesture::Scroll(_)
+                | Gesture::ScrollX(_)
+        )
+        && !matches!(target, Target::MenuItem { .. } | Target::Menu)
+    {
+        let mut intents = vec![ViewCmd::CloseMenu.into()];
+        intents.extend(mouse_intents(target, gesture, ctx));
+        return intents;
+    }
+    mouse_intents(target, gesture, ctx)
+}
+
+fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec<Intent> {
     match (target, gesture) {
         (Target::Pane(pane), Gesture::Click) => vec![ViewCmd::FocusPane(pane).into()],
         // The wheel over the part of a pane its content does not fill. Without
@@ -455,6 +513,41 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
         (Target::TreeRow { .. } | Target::TreeToggle { .. }, Gesture::Scroll(delta)) => {
             vec![scroll(PaneId::Explorer, delta)]
         }
+
+        (Target::GridCell { row, col }, Gesture::RightClick) => {
+            let inside = ctx.selection.is_some_and(|(top, left, bottom, right)| {
+                (top..=bottom).contains(&row) && (left..=right).contains(&col)
+            });
+            let mut intents = Vec::new();
+            if !inside {
+                // Outside it, the click moves the selection first: a menu whose
+                // "Copy cell" copies a cell somewhere else on screen is worse
+                // than no menu.
+                intents.push(ViewCmd::FocusPane(PaneId::Grid).into());
+                intents.push(ViewCmd::SelectCell { row, col }.into());
+            }
+            intents.push(
+                ViewCmd::OpenMenu {
+                    at: Some(ctx.pointer),
+                    ranged: inside && ctx.ranged(),
+                }
+                .into(),
+            );
+            intents
+        }
+        // Choosing an entry is the entry's own intent. That is what makes
+        // `every_menu_entry_has_a_key_binding` a check rather than a
+        // convention: the menu cannot offer anything the keyboard cannot.
+        (Target::MenuItem { index }, Gesture::Click) => ctx
+            .menu
+            .and_then(|menu| menu.entries.get(index))
+            .filter(|entry| entry.enabled)
+            .map(|entry| vec![ViewCmd::CloseMenu.into(), entry.intent.clone()])
+            .unwrap_or_default(),
+        // Everything else on the menu is swallowed rather than passed down: it
+        // covers the grid, and a gesture on it is not a gesture on the cell it
+        // is covering.
+        (Target::MenuItem { .. } | Target::Menu, _) => Vec::new(),
 
         // The press, not the release: the first motion extends from wherever
         // the cursor is, so a drag that began on a cell has to have moved it
@@ -828,6 +921,29 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .into(),
         ],
         IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
+        IntentKind::Menu => {
+            // The same key closes it. Nothing else on the keyboard can: `Esc`
+            // in the grid is `DismissToast`, and shadowing that to reach a
+            // menu would be the hazard `KEYMAP` warns about. Without the
+            // toggle the one gesture that opens a menu on a terminal with no
+            // right-click leaves it on screen with no way out.
+            if ctx.menu.is_some() {
+                return vec![ViewCmd::CloseMenu.into()];
+            }
+            // No coordinates to give: `None` asks the view to place it, which
+            // is the only thing that knows where the grid was drawn.
+            ctx.active_tab
+                .map(|_| {
+                    vec![
+                        ViewCmd::OpenMenu {
+                            at: None,
+                            ranged: ctx.ranged(),
+                        }
+                        .into(),
+                    ]
+                })
+                .unwrap_or_default()
+        }
         IntentKind::Copy => {
             // Two axes on one gesture: the letter says how much, the case
             // says which format.
@@ -1043,6 +1159,9 @@ mod tests {
                 connection: self.snapshot.connections.first().map(|c| c.id),
                 tree_selection: Some(0),
                 grid_column: Some(2),
+                pointer: (0, 0),
+                selection: None,
+                menu: None,
                 tabs: &self.tabs,
                 active_tab: None,
                 toasts: &self.toasts,
@@ -1930,6 +2049,9 @@ mod tests {
             connection: None,
             tree_selection: None,
             grid_column: None,
+            pointer: (0, 0),
+            selection: None,
+            menu: None,
             tabs: &[],
             active_tab: None,
             toasts: &[],
@@ -2054,6 +2176,8 @@ mod tests {
             Target::Button(ButtonId::DismissModal),
         ],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
+        Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],
+        Target::Menu => [Target::Menu],
         Target::Backdrop => [Target::Backdrop],
         Target::Modal => [Target::Modal],
     }
@@ -2077,17 +2201,208 @@ mod tests {
         Gesture::HoverLeave => [Gesture::HoverLeave],
     }
 
+    /// The menu's own half of "nothing is mouse-only".
+    ///
+    /// Asserted here as well as through the sweep, because the sweep proves a
+    /// *reachable* kind is bound and this proves every entry is one of them —
+    /// an entry the sweep's contexts happened not to resolve would otherwise
+    /// slip through.
+    #[test]
+    fn choosing_an_entry_does_what_the_entry_says() {
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
+        let mut c = f.ctx(PaneId::Grid);
+        c.menu = Some(&menu);
+
+        for (index, entry) in menu.entries.iter().enumerate() {
+            let intents = on_mouse(Target::MenuItem { index }, Gesture::Click, &c);
+            assert!(
+                intents.contains(&entry.intent),
+                "line {index} (`{}`) produced {intents:?}",
+                entry.label
+            );
+            assert!(
+                intents.contains(&ViewCmd::CloseMenu.into()),
+                "the menu stayed open after a choice"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_outside_the_menu_closes_it_and_still_lands() {
+        // A menu that had to be dismissed before anything else worked would be
+        // a mode, and this one is not.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
+        let mut c = f.ctx(PaneId::Grid);
+        c.menu = Some(&menu);
+
+        let intents = on_mouse(Target::GridCell { row: 2, col: 1 }, Gesture::Click, &c);
+        assert!(intents.contains(&ViewCmd::CloseMenu.into()), "{intents:?}");
+        assert!(
+            intents.contains(&ViewCmd::SelectCell { row: 2, col: 1 }.into()),
+            "the click that closed the menu was swallowed: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_a_cell_opens_the_menu() {
+        let f = fixture();
+        let intents = on_mouse(
+            Target::GridCell { row: 0, col: 0 },
+            Gesture::RightClick,
+            &f.ctx(PaneId::Grid),
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::OpenMenu { .. }))),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    fn the_key_that_opens_the_menu_closes_it_again() {
+        // The only way out on the keyboard. `Esc` in the grid is
+        // `DismissToast`, so without this the one gesture that reaches the menu
+        // on a terminal with no right-click leaves it on screen for good.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), false);
+        let mut c = f.ctx(PaneId::Grid);
+        assert!(matches!(
+            on_key(press(KeyCode::Char('.')), &c)[..],
+            [Intent::View(ViewCmd::OpenMenu { .. })]
+        ));
+        c.menu = Some(&menu);
+        assert_eq!(
+            on_key(press(KeyCode::Char('.')), &c),
+            [ViewCmd::CloseMenu.into()]
+        );
+    }
+
+    #[test]
+    fn a_right_click_outside_the_selection_moves_it_there_first() {
+        // Otherwise the menu's "Copy cell" copies a cell somewhere else on
+        // screen — the one that happened to be selected before.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.selection = Some((0, 0, 2, 2));
+
+        let intents = on_mouse(Target::GridCell { row: 9, col: 4 }, Gesture::RightClick, &c);
+        assert!(
+            intents.contains(&ViewCmd::SelectCell { row: 9, col: 4 }.into()),
+            "{intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::OpenMenu { ranged: false, .. }))),
+            "a click outside the selection still called the menu after it: {intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_right_click_inside_the_selection_keeps_it() {
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.selection = Some((0, 0, 2, 2));
+
+        let intents = on_mouse(Target::GridCell { row: 1, col: 1 }, Gesture::RightClick, &c);
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::SelectCell { .. }))),
+            "right-clicking inside the selection collapsed it: {intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::OpenMenu { ranged: true, .. }))),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_menu_is_named_after_the_selection_too() {
+        // Not hard-coded to one cell: `.` with a rectangle selected would
+        // otherwise offer to "copy cell" and copy the whole rectangle.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.selection = Some((0, 0, 2, 2));
+        assert!(matches!(
+            on_key(press(KeyCode::Char('.')), &c)[..],
+            [Intent::View(ViewCmd::OpenMenu { ranged: true, .. })]
+        ));
+    }
+
+    #[test]
+    fn a_press_on_the_grid_closes_the_menu_before_it_drags() {
+        // The press is where a drag-selection starts, so a menu that waited for
+        // the click would have a rectangle swept out underneath it.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
+        let mut c = f.ctx(PaneId::Grid);
+        c.menu = Some(&menu);
+
+        let intents = on_mouse(Target::GridCell { row: 2, col: 1 }, Gesture::Down, &c);
+        assert!(intents.contains(&ViewCmd::CloseMenu.into()), "{intents:?}");
+    }
+
+    #[test]
+    fn the_menu_swallows_what_lands_on_it_rather_than_its_lines() {
+        // The border, and any line too far down to be drawn. Without a target
+        // of its own the gesture reaches the cell underneath and moves the
+        // selection the menu was opened about.
+        let f = fixture();
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
+        let mut c = f.ctx(PaneId::Grid);
+        c.menu = Some(&menu);
+
+        for gesture in [Gesture::Down, Gesture::Click] {
+            assert_eq!(on_mouse(Target::Menu, gesture, &c), Vec::new());
+        }
+    }
+
+    #[test]
+    fn every_menu_entry_has_a_key_binding() {
+        // Bindings that actually carry a key: an entry in `KEYMAP` with none is
+        // a kind nothing can press, and counting it would make this pass on a
+        // menu whose entries are unreachable.
+        let bound: BTreeSet<_> = KEYMAP
+            .iter()
+            .filter(|b| !b.keys.is_empty())
+            .map(|b| b.kind)
+            .collect();
+        for ranged in [false, true] {
+            for entry in crate::menu::Menu::for_grid((0, 0), ranged).entries {
+                assert!(
+                    bound.contains(&entry.kind()),
+                    "the menu offers `{}` and the keyboard cannot reach {:?}",
+                    entry.label,
+                    entry.kind()
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_capability_reachable_with_the_mouse_has_a_key_binding() {
         // This is the mechanical form of "nothing is mouse-only". The reverse
         // is deliberately not required: keyboard-only capabilities are fine.
         let f = fixture();
+        // An open menu, because a `MenuItem` sample resolves to nothing without
+        // one: the sweep would walk over every entry and find no intents, and
+        // pass while proving nothing about the menu at all.
+        let menu = crate::menu::Menu::for_grid((0, 0), true);
         let mut contexts = Vec::new();
         for focus in [PaneId::Explorer, PaneId::Grid] {
             for selection in [Some(0), Some(1)] {
-                let mut c = f.ctx(focus);
-                c.tree_selection = selection;
-                contexts.push(c);
+                for open in [None, Some(&menu)] {
+                    let mut c = f.ctx(focus);
+                    c.tree_selection = selection;
+                    c.menu = open;
+                    contexts.push(c);
+                }
             }
         }
 
@@ -2100,6 +2415,11 @@ mod tests {
                     }
                 }
             }
+        }
+        // And every entry, not only the first: one sample per `Target` means
+        // the sweep only ever clicks line zero.
+        for entry in &menu.entries {
+            reachable.insert(entry.kind());
         }
         assert!(!reachable.is_empty(), "the sweep found nothing at all");
 
