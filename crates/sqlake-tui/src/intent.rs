@@ -103,11 +103,11 @@ pub enum ViewCmd {
 
     /// Open or close the pane that shows one cell in full.
     ToggleDetail,
-    /// Put the selection on the clipboard.
+    /// Put the selection — or, with `all`, the whole result — on the clipboard.
     ///
-    /// The scope is the selection: one cell is a rectangle of one, and
-    /// `CopyAll` is the separate answer for the whole result because "extend
-    /// the selection over two hundred thousand rows first" is not one.
+    /// One cell is a rectangle of one. `all` is there because "extend the
+    /// selection over two hundred thousand rows first" is not an answer to
+    /// wanting the whole result.
     Copy {
         format: crate::copy::Format,
         all: bool,

@@ -41,7 +41,27 @@ pub enum Refused {
     /// There were no rows to take.
     Empty,
     /// The encoded payload is past what a terminal will take in one sequence.
+    ///
+    /// `bytes` is the *text*, not the base64 of it. The limit applies to the
+    /// encoded form, but a third larger is not a number the person choosing
+    /// how much to select can act on.
     TooLarge { bytes: usize },
+}
+
+/// The part of `area` that is actually there, or `None` when none of it is.
+///
+/// A selection is indexes into a result the store is free to replace with a
+/// shorter one, so a rectangle can name rows or columns that have gone — and an
+/// empty result names none at all. Clamping without this last part is how a
+/// result with no rows still writes one row of empty fields onto the clipboard.
+#[must_use]
+pub fn clamped(
+    rows: &PagedResult,
+    (top, left, bottom, right): (usize, usize, usize, usize),
+) -> Option<(usize, usize, usize, usize)> {
+    let bottom = bottom.min(rows.row_count().checked_sub(1)?);
+    let right = right.min(rows.columns().len().checked_sub(1)?);
+    (top <= bottom && left <= right).then_some((top, left, bottom, right))
 }
 
 /// The text for a rectangle of cells, in `format`.
@@ -49,17 +69,10 @@ pub enum Refused {
 /// `(top, left, bottom, right)` inclusive, which is what `GridUi::selection`
 /// produces — one cell is a rectangle of one.
 #[must_use]
-pub fn render(
-    rows: &PagedResult,
-    format: Format,
-    (top, left, bottom, right): (usize, usize, usize, usize),
-) -> String {
-    let cols = rows.columns().len();
-    if cols == 0 {
+pub fn render(rows: &PagedResult, format: Format, area: (usize, usize, usize, usize)) -> String {
+    let Some((top, left, bottom, right)) = clamped(rows, area) else {
         return String::new();
-    }
-    let right = right.min(cols.saturating_sub(1));
-    let bottom = bottom.min(rows.row_count().saturating_sub(1));
+    };
 
     match format {
         Format::Csv => {
@@ -130,9 +143,7 @@ pub fn sequence(text: &str) -> Result<String, Refused> {
     }
     let payload = BASE64.encode(text);
     if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(Refused::TooLarge {
-            bytes: payload.len(),
-        });
+        return Err(Refused::TooLarge { bytes: text.len() });
     }
     // `c` is the clipboard proper rather than the primary selection, and the
     // terminating BEL is what tmux and the Terminal.app lineage want; ST works
@@ -229,6 +240,33 @@ mod tests {
     }
 
     #[test]
+    fn a_result_with_no_rows_copies_nothing_rather_than_a_row_of_commas() {
+        // The rectangle for "everything" is built from `row_count() - 1`, which
+        // is row zero when there are no rows at all. Rendering it wrote a row
+        // of empty fields — a paste of `,,` and a message saying cells were
+        // sent, for a table that has none.
+        let empty = PagedResult::new(&ResultSet::new(
+            vec![
+                Column::new("a", "text", true),
+                Column::new("b", "text", true),
+            ],
+            Vec::new(),
+            None,
+        ));
+        assert_eq!(render(&empty, Format::Csv, (0, 0, 0, 1)), "");
+        assert_eq!(render(&empty, Format::Json, (0, 0, 0, 1)), "");
+    }
+
+    #[test]
+    fn a_rectangle_entirely_past_the_end_is_nothing_in_either_format() {
+        assert_eq!(render(&rows(), Format::Csv, (9, 0, 9, 0)), "");
+        // JSON went through the empty range and wrote `[]`, which is a
+        // sequence sent and a clipboard replaced for a selection that named
+        // nothing.
+        assert_eq!(render(&rows(), Format::Json, (9, 0, 9, 0)), "");
+    }
+
+    #[test]
     fn the_sequence_is_osc_52_and_base64() {
         let seq = sequence("hi").expect("it encodes");
         assert!(seq.starts_with("\u{1b}]52;c;"), "{seq:?}");
@@ -247,9 +285,13 @@ mod tests {
         // sending it and saying "copied" is the one outcome to avoid: nothing
         // arrives and nothing says so.
         let huge = "x".repeat(MAX_PAYLOAD_BYTES);
-        assert!(matches!(
+        // Reported as the text it came from: base64 is a third larger, and the
+        // person deciding how much to select cannot act on the encoded number.
+        assert_eq!(
             sequence(&huge),
-            Err(Refused::TooLarge { bytes }) if bytes > MAX_PAYLOAD_BYTES
-        ));
+            Err(Refused::TooLarge {
+                bytes: MAX_PAYLOAD_BYTES
+            })
+        );
     }
 }

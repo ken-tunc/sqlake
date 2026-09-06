@@ -808,11 +808,11 @@ impl UiState {
     /// `set-clipboard on` is the common one — swallows the sequence silently,
     /// so a message saying "copied" would be a claim this cannot check.
     fn copy(&mut self, format: crate::copy::Format, all: bool, snapshot: &Snapshot) {
-        let Some(rows) = self.active_rows(snapshot) else {
+        let Some(rows) = self.rows_of(snapshot) else {
             return;
         };
         let sort = self.active_sort(snapshot);
-        let area = match (all, self.active_grid()) {
+        let asked = match (all, self.active_grid()) {
             (true, _) => (
                 0,
                 0,
@@ -822,8 +822,15 @@ impl UiState {
             (false, Some(grid)) => grid.selection(sort),
             (false, None) => return,
         };
+        // Counted from the rectangle that is there rather than the one asked
+        // for: a selection outlives a result that shrank under it, and the
+        // count is what the message claims was sent.
+        let Some(area) = crate::copy::clamped(rows, asked) else {
+            self.push_toast(Severity::Info, "nothing to copy");
+            return;
+        };
 
-        let text = crate::copy::render(&rows, format, area);
+        let text = crate::copy::render(rows, format, area);
         let cells = (area.2 - area.0 + 1) * (area.3 - area.1 + 1);
         match crate::copy::sequence(&text) {
             Ok(sequence) => {
@@ -847,16 +854,6 @@ impl UiState {
                 ),
             ),
         }
-    }
-
-    fn active_rows(&self, snapshot: &Snapshot) -> Option<Arc<PagedResult>> {
-        let id = self.active_tab?;
-        let tab = self.tabs.iter().find(|t| t.id == id)?;
-        snapshot
-            .preview(tab.conn, &tab.table)?
-            .data
-            .ready()
-            .cloned()
     }
 
     fn clear_anchor(&mut self) {

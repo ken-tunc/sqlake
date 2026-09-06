@@ -95,6 +95,18 @@ const fn ctrl(c: char) -> KeyCombo {
     KeyCombo::ctrl(KeyCode::Char(c))
 }
 
+/// Every binding, in one place, because a key map is data.
+///
+/// A pane binding beats a global one for the same key, which is how `Down`
+/// scrolls everywhere and moves the selection in the tree, and how `Esc`
+/// cancels a filter rather than dismissing a toast while one is being typed.
+/// It is also the hazard when adding a binding: taking a letter a global
+/// binding uses stops that capability working while the pane has focus, and
+/// nothing here catches it — `no_key_is_bound_twice_in_the_same_context` sees
+/// one context at a time, and whether the shadowed meaning still matters in
+/// that pane is a judgement rather than a rule. Both cases above are
+/// deliberate; `c` for a JSON copy in the grid was not, and would have stopped
+/// `c` opening a connection.
 pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: &[
@@ -214,11 +226,17 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::ToggleDetail,
     },
     KeyBinding {
-        // `y` for the selection and `Y` for the whole result, which is the pair
-        // vi already taught; `c` and `C` are the same two as JSON. `Ctrl-c` is
-        // not available — it is the terminal's interrupt, and taking it would
-        // mean a grid somebody cannot get out of.
-        keys: &[key('y'), key('Y'), key('c'), key('C')],
+        // The letter says how much and the case says which format: `y` yanks
+        // what is selected, `a` takes it all, and shift on either asks for
+        // JSON instead of CSV.
+        //
+        // Not `c` for JSON, which is what this first reached for: `c` already
+        // opens a connection, and a pane binding beats a global one — so with
+        // the grid focused a working gesture would quietly have started doing
+        // something else. `Ctrl-c` is not available either; it is the
+        // terminal's interrupt, and a grid nobody can get out of is worse than
+        // a shortcut nobody has.
+        keys: &[key('y'), key('Y'), key('a'), key('A')],
         context: Context::Grid,
         kind: IntentKind::Copy,
     },
@@ -810,14 +828,11 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .into(),
         ],
         IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
-        // Nothing to show in full when there is no grid to have chosen a cell
-        // in, and a pane opening onto "no cell selected" is a gesture that
-        // appeared to do something.
         IntentKind::Copy => {
-            // Two axes on one gesture: the case says how much, and the letter
+            // Two axes on one gesture: the letter says how much, the case
             // says which format.
-            let all = matches!(event.code, KeyCode::Char('Y' | 'C'));
-            let format = if matches!(event.code, KeyCode::Char('c' | 'C')) {
+            let all = matches!(event.code, KeyCode::Char('a' | 'A'));
+            let format = if matches!(event.code, KeyCode::Char('Y' | 'A')) {
                 crate::copy::Format::Json
             } else {
                 crate::copy::Format::Csv
@@ -826,6 +841,9 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
                 .map(|_| vec![ViewCmd::Copy { format, all }.into()])
                 .unwrap_or_default()
         }
+        // Nothing to show in full when there is no grid to have chosen a cell
+        // in, and a pane opening onto "no cell selected" is a gesture that
+        // appeared to do something.
         IntentKind::ToggleDetail => ctx
             .active_tab
             .map(|_| vec![ViewCmd::ToggleDetail.into()])

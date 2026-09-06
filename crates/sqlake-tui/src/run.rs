@@ -1256,6 +1256,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_table_with_no_rows_copies_nothing_and_says_so() {
+        // "Everything" of an empty result is row zero of no rows: the sequence
+        // sent was one row of empty fields, under a message saying two cells
+        // had gone to the clipboard.
+        let (_store, snap, mut ui, _) = opened(
+            store(),
+            sqlake_core::node::TableRef::new(["public", "empty"]),
+        )
+        .await;
+        let _ = ui.apply(crate::intent::ViewCmd::FocusPane(PaneId::Grid), &snap);
+        let _ = ui.apply(
+            crate::intent::ViewCmd::Copy {
+                format: crate::copy::Format::Csv,
+                all: true,
+            },
+            &snap,
+        );
+
+        assert!(ui.take_copy().is_none());
+        assert_eq!(ui.toasts.last().expect("a toast").text, "nothing to copy");
+    }
+
     // ── screens ────────────────────────────────────────────────────────────
     //
     // The whole frame, as a string, reviewed by eye once and then held still.
