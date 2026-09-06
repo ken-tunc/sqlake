@@ -357,7 +357,11 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         );
     }
 
-    chrome::status_bar(frame, hits, frames.status_bar, snapshot);
+    let selected = ui
+        .active_tab
+        .and_then(|id| ui.grid(id))
+        .and_then(|g| g.selected_cells(ui.active_sort(snapshot)));
+    chrome::status_bar(frame, hits, frames.status_bar, snapshot, selected);
 
     // Toasts first so a dialog covers them: a message drawn over the thing
     // waiting for an answer hides the answer.
@@ -1104,6 +1108,64 @@ mod tests {
             ui.apply(crate::intent::ViewCmd::ScrollToEnd(PaneId::Explorer), &snap),
             None,
             "scrolling the tree fetched a page"
+        );
+    }
+
+    #[tokio::test]
+    async fn shift_and_an_arrow_extend_the_selection() {
+        let (_store, snap, mut ui, _) = opened(
+            store(),
+            sqlake_core::node::TableRef::new(["public", "users"]),
+        )
+        .await;
+        let id = ui.active_tab.expect("a tab");
+
+        // The binding is `Context::Grid`, which is where focus has to be for a
+        // key pressed over the grid to mean anything.
+        let _ = ui.apply(crate::intent::ViewCmd::FocusPane(PaneId::Grid), &snap);
+        let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
+        for _ in 0..2 {
+            for intent in crate::input::on_key(
+                ratatui::crossterm::event::KeyEvent::new(
+                    KeyCode::Down,
+                    ratatui::crossterm::event::KeyModifiers::SHIFT,
+                ),
+                &context(&ui, &snap),
+            ) {
+                if let Intent::View(cmd) = intent {
+                    let _ = ui.apply(cmd, &snap);
+                }
+            }
+        }
+
+        let grid = ui.grid(id).expect("a grid");
+        assert_eq!(grid.selection(None), (2, 1, 4, 1));
+    }
+
+    #[tokio::test]
+    async fn an_arrow_without_shift_ends_the_selection() {
+        let (_store, snap, mut ui, _) = opened(
+            store(),
+            sqlake_core::node::TableRef::new(["public", "users"]),
+        )
+        .await;
+        let id = ui.active_tab.expect("a tab");
+
+        let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
+        let _ = ui.apply(
+            crate::intent::ViewCmd::ExtendCellSelection { drow: 2, dcol: 0 },
+            &snap,
+        );
+        assert!(ui.grid(id).expect("a grid").selected_cells(None).is_some());
+
+        let _ = ui.apply(
+            crate::intent::ViewCmd::MoveCellSelection { drow: 1, dcol: 0 },
+            &snap,
+        );
+        assert_eq!(
+            ui.grid(id).expect("a grid").selected_cells(None),
+            None,
+            "moving the cursor left the old anchor behind"
         );
     }
 

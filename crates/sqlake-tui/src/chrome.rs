@@ -273,7 +273,13 @@ pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, ui: &UiStat
 
 /// Running work, with a way to stop it, and the hints that have to be visible
 /// rather than discovered.
-pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot: &Snapshot) {
+pub fn status_bar(
+    frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    area: Rect,
+    snapshot: &Snapshot,
+    selection: Option<(usize, usize)>,
+) {
     hits.push(area, Z_BASE, Target::Pane(PaneId::StatusBar));
 
     let mut spans = Vec::new();
@@ -301,13 +307,24 @@ pub fn status_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, snapshot
         x += CANCEL_WIDTH;
     }
 
-    if spans.is_empty() {
-        // Mouse capture takes the terminal's own text selection away, so the
-        // way to get it back cannot be something the user has to know already.
-        spans.push(Span::styled(
-            " Shift (or Option) + drag to select text ",
-            Style::new().fg(Color::DarkGray),
-        ));
+    // How much is selected, when it is more than one cell. A range is easy to
+    // extend past what the pane shows, and counting the highlighted cells is
+    // not something to make somebody do before copying them.
+    if let Some((rows, cols)) = selection {
+        let label = format!(" {rows}×{cols} selected ");
+        if x.saturating_add(display_width(&label)) <= area.right() {
+            x += display_width(&label);
+            spans.push(Span::styled(label, Style::new().fg(Color::Cyan)));
+        }
+    }
+
+    // Mouse capture takes the terminal's own text selection away, so the way to
+    // get it back cannot be something the user has to know already. Shown
+    // whenever there is room rather than only when nothing else is: a busy row
+    // is exactly when somebody reaches for the mouse and finds it captured.
+    let hint = " Shift (or Option) + drag to select text ";
+    if x.saturating_add(display_width(hint)) <= area.right() {
+        spans.push(Span::styled(hint, Style::new().fg(Color::DarkGray)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -672,7 +689,11 @@ mod tests {
     fn a_running_job_gets_a_cancel_button() {
         let snap = snapshot(1);
         let area = Rect::new(0, 0, 60, 1);
-        let hits = draw(|frame, hits| status_bar(frame, hits, area, &snap), 60, 1);
+        let hits = draw(
+            |frame, hits| status_bar(frame, hits, area, &snap, None),
+            60,
+            1,
+        );
 
         let found = (0..60)
             .filter_map(|x| hits.at(Position::new(x, 0)))
@@ -689,7 +710,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap))
+            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap, None))
             .unwrap();
 
         let cross = terminal
@@ -711,7 +732,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap))
+            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap, None))
             .unwrap();
 
         let rendered: String = terminal

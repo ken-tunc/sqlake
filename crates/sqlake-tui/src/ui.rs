@@ -30,6 +30,7 @@ use sqlake_app::tree::TreeView;
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, TabId};
 use sqlake_core::node::TableRef;
+use sqlake_core::result::Sort;
 
 use crate::chrome::MIN_GRID_HEIGHT;
 use crate::grid::RenderedGrid;
@@ -151,6 +152,15 @@ pub struct GridUi {
     /// text this pane exists for is the cost `MAX_CELL_CHARS` was introduced
     /// to avoid, reintroduced one pane over.
     detail: Option<((usize, usize), Arc<RenderedDetail>)>,
+    /// The other corner of the selection, and the ordering it was made under.
+    ///
+    /// `None` is one cell. The ordering rides along because a selection is
+    /// indexes into a result the store is free to replace: sorting fetches page
+    /// one again, so rows 10..20 of the old order name different rows in the
+    /// new one, and a copy taken from a stale anchor comes out wrong with
+    /// nothing said. Paging is the case that must *not* clear it — appending
+    /// leaves every existing row where it was.
+    anchor: Option<((usize, usize), Option<Sort>)>,
 }
 
 impl GridUi {
@@ -164,6 +174,33 @@ impl GridUi {
         self.grid
             .as_ref()
             .expect("just built when it was missing or stale")
+    }
+
+    /// The rectangle the selection covers, as `(top, left, bottom, right)`
+    /// inclusive.
+    ///
+    /// A rectangle rather than a set: anything else needs an answer to what a
+    /// discontiguous selection means as CSV, and there is not a good one. A
+    /// rectangle has one — the rows it covers, each cut to the columns.
+    #[must_use]
+    pub fn selection(&self, sort: Option<Sort>) -> (usize, usize, usize, usize) {
+        match self.anchor {
+            Some((at, made_under)) if made_under == sort => (
+                at.0.min(self.row),
+                at.1.min(self.col),
+                at.0.max(self.row),
+                at.1.max(self.col),
+            ),
+            _ => (self.row, self.col, self.row, self.col),
+        }
+    }
+
+    /// How many cells are selected, or `None` when it is just the one.
+    #[must_use]
+    pub fn selected_cells(&self, sort: Option<Sort>) -> Option<(usize, usize)> {
+        let (top, left, bottom, right) = self.selection(sort);
+        let size = (bottom - top + 1, right - left + 1);
+        (size != (1, 1)).then_some(size)
     }
 
     /// The document for the selected cell, built once per cell rather than
@@ -491,13 +528,28 @@ impl UiState {
             // The cursor drags the viewport along with it, so `J` reaches the
             // last loaded row exactly as a scroll does. Left out, the whole
             // feature is missing from the keyboard.
+            // Moving the cursor ends a selection; extending it keeps the
+            // anchor. That is the whole difference between the two pairs.
             ViewCmd::SelectCell { row, col } => {
+                self.clear_anchor();
                 self.select_cell(row, col, snapshot);
                 return self.wants_a_page(PaneId::Grid, snapshot);
             }
             ViewCmd::MoveCellSelection { drow, dcol } => {
                 let (row, col) = self.active_grid().map_or((0, 0), |g| (g.row, g.col));
+                self.clear_anchor();
                 self.select_cell(step(row, drow), step(col, dcol), snapshot);
+                return self.wants_a_page(PaneId::Grid, snapshot);
+            }
+            ViewCmd::ExtendCellSelection { drow, dcol } => {
+                let (row, col) = self.active_grid().map_or((0, 0), |g| (g.row, g.col));
+                self.anchor_here(snapshot);
+                self.select_cell(step(row, drow), step(col, dcol), snapshot);
+                return self.wants_a_page(PaneId::Grid, snapshot);
+            }
+            ViewCmd::ExtendCellSelectionTo { row, col } => {
+                self.anchor_here(snapshot);
+                self.select_cell(row, col, snapshot);
                 return self.wants_a_page(PaneId::Grid, snapshot);
             }
 
@@ -737,6 +789,33 @@ impl UiState {
         self.tree.offset = scroll_into_view(self.tree.offset, index, self.page(PaneId::Explorer));
     }
 
+    fn clear_anchor(&mut self) {
+        if let Some(grid) = self.active_grid_mut() {
+            grid.anchor = None;
+        }
+    }
+
+    /// Start a selection at the cursor if there is not one already.
+    ///
+    /// The ordering is recorded with it, so a sort — which fetches page one
+    /// again under a different order — leaves an anchor that no longer names
+    /// the row it was put on, and `selection` reads it as absent.
+    fn anchor_here(&mut self, snapshot: &Snapshot) {
+        let sort = self.active_sort(snapshot);
+        if let Some(grid) = self.active_grid_mut()
+            && grid.anchor.is_none()
+        {
+            grid.anchor = Some(((grid.row, grid.col), sort));
+        }
+    }
+
+    #[must_use]
+    pub fn active_sort(&self, snapshot: &Snapshot) -> Option<Sort> {
+        let id = self.active_tab?;
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        snapshot.preview(tab.conn, &tab.table)?.sort
+    }
+
     fn select_cell(&mut self, row: usize, col: usize, snapshot: &Snapshot) {
         let rows = self.row_count(snapshot);
         let cols = self.column_count(snapshot);
@@ -947,6 +1026,59 @@ mod tests {
             &snap,
         );
         (snap, ui)
+    }
+
+    #[test]
+    fn a_selection_is_the_rectangle_between_two_corners() {
+        let mut grid = GridUi {
+            row: 5,
+            col: 3,
+            anchor: Some(((2, 1), None)),
+            ..GridUi::default()
+        };
+        assert_eq!(grid.selection(None), (2, 1, 5, 3));
+        assert_eq!(grid.selected_cells(None), Some((4, 3)));
+
+        // And the other way round: dragging up and left is the same rectangle.
+        grid.row = 2;
+        grid.col = 1;
+        grid.anchor = Some(((5, 3), None));
+        assert_eq!(grid.selection(None), (2, 1, 5, 3));
+    }
+
+    #[test]
+    fn one_cell_is_not_a_range() {
+        let grid = GridUi::default();
+        assert_eq!(grid.selection(None), (0, 0, 0, 0));
+        assert_eq!(
+            grid.selected_cells(None),
+            None,
+            "the status bar would say `1×1 selected` about the cursor"
+        );
+    }
+
+    #[test]
+    fn a_selection_does_not_survive_a_sort() {
+        // It is indexes into a result the store replaces: sorting fetches page
+        // one again, so rows 2..5 of the old order are different rows now, and
+        // a copy taken from the old anchor comes out wrong with nothing said.
+        let grid = GridUi {
+            row: 5,
+            col: 3,
+            anchor: Some(((2, 1), None)),
+            ..GridUi::default()
+        };
+
+        let after = Some(sqlake_core::result::Sort::new(
+            0,
+            sqlake_core::result::SortDir::Asc,
+        ));
+        assert_eq!(
+            grid.selection(after),
+            (5, 3, 5, 3),
+            "a selection made under one ordering was kept under another"
+        );
+        assert_eq!(grid.selected_cells(after), None);
     }
 
     #[test]
