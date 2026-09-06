@@ -429,6 +429,7 @@ mod tests {
                 kind: summary.kind,
                 status: ConnStatus::Connecting,
                 capabilities: None,
+                tree: std::sync::Arc::default(),
             }],
             profiles: Arc::new(vec![summary]),
             ..Snapshot::default()

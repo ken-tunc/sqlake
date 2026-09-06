@@ -781,6 +781,7 @@ mod tests {
                 kind: sqlake_core::capability::DriverKind::Mock,
                 status: ConnStatus::Ready,
                 capabilities: None,
+                tree: std::sync::Arc::default(),
             }],
             ..Snapshot::default()
         };

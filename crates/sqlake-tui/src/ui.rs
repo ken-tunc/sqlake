@@ -716,6 +716,7 @@ mod tests {
                 kind: sqlake_core::capability::DriverKind::Mock,
                 status: sqlake_app::snapshot::ConnStatus::Ready,
                 capabilities: None,
+                tree: std::sync::Arc::default(),
             }],
             explorer,
             previews: vec![PreviewView {

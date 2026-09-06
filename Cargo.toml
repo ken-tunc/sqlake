@@ -11,6 +11,7 @@ repository = "https://github.com/ken-tunc/sqlake"
 authors = ["ken-tunc"]
 
 [workspace.dependencies]
+sqlake-api = { path = "crates/sqlake-api" }
 sqlake-app = { path = "crates/sqlake-app" }
 sqlake-config = { path = "crates/sqlake-config" }
 sqlake-conformance = { path = "crates/sqlake-conformance" }
