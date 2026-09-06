@@ -1,7 +1,7 @@
 //! One value, laid out to be read rather than to fit a column.
 //!
 //! Built beside [`crate::grid::RenderedGrid`] rather than from it. The grid
-//! clamps a cell at [`crate::grid::MAX_CELL_CHARS`] and collapses a document to
+//! clamps a cell at `MAX_CELL_CHARS` and collapses a document to
 //! `{2 keys}`, which is right in a column a few cells wide and is exactly what
 //! somebody opening the detail pane is trying to get past. Reading the grid's
 //! output here would make the pane show the same abbreviation in more space.
