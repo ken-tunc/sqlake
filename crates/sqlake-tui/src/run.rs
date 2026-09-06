@@ -949,8 +949,16 @@ mod tests {
         let action = to_the_end(&mut ui, &snap).expect("it asks");
         store.dispatch(action);
         let mut rx = store.subscribe();
-        until(&mut rx, |s| !s.busy.is_empty()).await;
-        let id = rx.borrow_and_update().busy[0].id;
+        // Read inside the predicate, not from a second borrow afterwards: the
+        // store can publish the finished page between the wait returning and
+        // the borrow, and indexing a list that has emptied panics.
+        let seen = std::cell::Cell::new(None);
+        until(&mut rx, |s| {
+            seen.set(s.busy.first().map(|b| b.id));
+            seen.get().is_some()
+        })
+        .await;
+        let id = seen.get().expect("a busy row while the page was in flight");
 
         store.dispatch(Action::Cancel(id));
         until(&mut rx, |s| s.busy.is_empty()).await;
@@ -1000,6 +1008,53 @@ mod tests {
         assert!(
             to_the_end(&mut ui, &snap).is_some(),
             "two failures with the same message ended paging for good"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cell_cursor_pages_the_way_scrolling_does() {
+        // `J` pulls the viewport along to the last loaded row without ever
+        // producing a scroll command. Fetching only on the scroll arms leaves
+        // the whole feature out of reach of the keyboard: the cursor stops at
+        // the end of page one and nothing asks for page two.
+        let (_store, snap, mut ui, conn, table) = paging().await;
+        assert_eq!(
+            ui.apply(
+                crate::intent::ViewCmd::MoveCellSelection {
+                    drow: 1000,
+                    dcol: 0
+                },
+                &snap
+            ),
+            Some(Action::LoadMore { conn, table }),
+            "the cursor reached the last loaded row and asked for nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn sorting_starts_the_asking_over() {
+        // `SortPreview` restarts the relation at page one, so whatever the tab
+        // remembers about having already asked describes a preview that no
+        // longer exists — and paging stops for as long as the tab lives.
+        let (store, snap, mut ui, conn, table) = paging().await;
+        assert!(to_the_end(&mut ui, &snap).is_some());
+
+        store.dispatch(Action::SortPreview {
+            conn,
+            table: table.clone(),
+            column: 0,
+        });
+        let mut rx = store.subscribe();
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.sort.is_some() && p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        assert!(
+            to_the_end(&mut ui, &snap).is_some(),
+            "paging stopped for the life of the tab because it had been sorted"
         );
     }
 
