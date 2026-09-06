@@ -1,6 +1,7 @@
 //! A page of rows, shaped for a reader with a context window.
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sqlake_app::PagedResult;
 
@@ -34,7 +35,7 @@ impl Default for Budget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct Column {
     pub name: String,
     pub type_name: String,
@@ -47,7 +48,7 @@ pub struct Column {
 /// every row into the context window the budget above exists to protect. It
 /// also collapses a relation with two columns of the same name, which `SELECT
 /// a.id, b.id` produces without anybody doing anything unusual.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 pub struct Page {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Json>>,
@@ -57,13 +58,13 @@ pub struct Page {
     /// relation. `total` is that, when the driver knew it; a BigQuery preview
     /// never does.
     pub loaded: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
     /// Always stated, never left to be inferred from counting rows.
     pub truncated: bool,
     /// Named, not counted: an agent that knows a column was left out can ask
     /// for it, and one told only that "3 columns were omitted" cannot.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted_columns: Vec<String>,
 }
 
