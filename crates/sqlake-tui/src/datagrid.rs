@@ -313,6 +313,8 @@ mod tests {
 
     fn tab(data: LoadState<Arc<PagedResult>>, sort: Option<Sort>) -> PreviewView {
         PreviewView {
+            exhausted: false,
+            attempts: 0,
             conn: ConnId::new(),
             table: TableRef::new(["public", "users"]),
             sort,

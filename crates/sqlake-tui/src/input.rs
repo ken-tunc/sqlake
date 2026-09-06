@@ -1001,6 +1001,8 @@ mod tests {
             previews: tabs
                 .iter()
                 .map(|t| PreviewView {
+                    exhausted: false,
+                    attempts: 0,
                     conn: t.conn,
                     table: t.table.clone(),
                     sort: None,

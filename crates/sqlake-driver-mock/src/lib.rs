@@ -181,6 +181,15 @@ pub struct Behaviour {
     /// Node paths that take [`Behaviour::slow_latency`] instead.
     pub slow_nodes: Vec<Vec<String>>,
     pub slow_latency: Duration,
+    /// Relations whose pages come back short of the limit with rows still to
+    /// come, which is BigQuery's ordinary behaviour: `tabledata.list` caps a
+    /// response at 10 MB and answers a 200-row request with as many as fit.
+    ///
+    /// Without it the only short page a test can produce is the last one, and
+    /// "short page" and "end of the relation" are the same thing in every
+    /// test — which is exactly the assumption that strands a wide table on
+    /// its first screenful.
+    pub short_pages: Vec<Vec<String>>,
 }
 
 /// How many times each flaky path has been asked for.
@@ -221,6 +230,7 @@ impl Behaviour {
             .chain(self.slow_nodes.iter())
             .chain(self.flaky_nodes.iter().map(|(p, _)| p))
             .chain(self.failing_after.iter().map(|(p, _)| p))
+            .chain(self.short_pages.iter())
     }
 
     fn matches(list: &[Vec<String>], path: &[String]) -> bool {
@@ -472,6 +482,16 @@ impl Session for MockSession {
                     .take(req.limit as usize)
                     .collect()
             }
+        };
+
+        // Cut *after* the page is built, so the rows kept are the ones the
+        // request asked for and only the tail is missing — which is what a
+        // response size cap does.
+        let rows = if Behaviour::matches(&self.behaviour.short_pages, &table.path) {
+            let keep = rows.len().div_ceil(2);
+            rows.into_iter().take(keep).collect()
+        } else {
+            rows
         };
 
         Ok(ResultSet::new(
