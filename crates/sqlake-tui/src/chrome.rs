@@ -347,6 +347,7 @@ mod tests {
                 kind: DriverKind::Mock,
                 status: ConnStatus::Ready,
                 capabilities: None,
+                tree: std::sync::Arc::default(),
             }],
             previews: Vec::new(),
             busy: (0..busy)

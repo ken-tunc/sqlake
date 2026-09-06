@@ -995,6 +995,7 @@ mod tests {
                 kind: DriverKind::Mock,
                 status: ConnStatus::Ready,
                 capabilities: Some(CAPABILITIES),
+                tree: std::sync::Arc::default(),
             }],
             explorer,
             previews: tabs

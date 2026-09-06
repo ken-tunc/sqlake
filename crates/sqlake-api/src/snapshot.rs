@@ -178,9 +178,13 @@ impl From<&Snapshot> for SessionInfo {
 }
 
 /// The objects under one connection, as far as they have been loaded.
+///
+/// Reads the connection's own tree rather than the explorer: whether a row is
+/// open is the TUI's navigation state, and a caller sharing the session must
+/// not lose sight of a schema because a human collapsed it.
 #[must_use]
 pub fn tree_of(snapshot: &Snapshot, conn: ConnId) -> Vec<NodeInfo> {
-    snapshot.tree(conn).map(NodeInfo::from).collect()
+    snapshot.objects(conn).map(NodeInfo::from).collect()
 }
 
 #[cfg(test)]
@@ -324,6 +328,33 @@ mod tests {
         assert_eq!(users.relation_kind.as_deref(), Some("table"));
         assert_eq!(users.status, NodeStatus::Leaf);
         assert!(users.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn collapsing_the_row_in_the_tui_does_not_empty_the_agents_tree() {
+        // The failure this guards against is silent: a caller sharing the
+        // session reads `[]` and concludes the database has no objects,
+        // because somebody clicked a triangle.
+        let (store, conn, _) = connected(Behaviour::instant()).await;
+        let snapshot = store
+            .dispatch_and_settle(
+                Action::ToggleNode {
+                    conn,
+                    node: NodeRef::root(),
+                },
+                LIMIT,
+                |s| s.tree(conn).count() == 0,
+            )
+            .await
+            .expect("the row closes");
+
+        assert_eq!(snapshot.tree(conn).count(), 0, "the explorer drew nothing");
+        assert!(
+            tree_of(&snapshot, conn)
+                .iter()
+                .any(|n| n.path == ["public"]),
+            "the objects are still loaded, and the caller has not collapsed anything"
+        );
     }
 
     #[tokio::test]

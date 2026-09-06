@@ -73,6 +73,14 @@ pub struct ConnectionView {
     /// Known once the connection is open. Until then the UI has nothing to
     /// branch on, which is correct: there is nothing to show yet.
     pub capabilities: Option<Capabilities>,
+    /// Every object fetched for this connection, whether or not its row is
+    /// currently open.
+    ///
+    /// Separate from [`Snapshot::explorer`] because expansion is one
+    /// front-end's navigation state, and a caller with no screen has not
+    /// collapsed anything. Reading the explorer instead would let a human
+    /// closing a row turn an agent's answer into "this database is empty".
+    pub tree: Arc<TreeView>,
 }
 
 impl ConnectionView {
@@ -156,11 +164,21 @@ impl Snapshot {
     }
 
     /// The rows belonging to one connection, without its own row.
+    ///
+    /// This is what the explorer draws, so a collapsed connection has none.
+    /// For the objects themselves, use [`Snapshot::objects`].
     pub fn tree(&self, id: ConnId) -> impl Iterator<Item = &VisibleNode> {
         self.explorer
             .nodes
             .iter()
             .filter(move |node| node.conn == id && !node.node_ref.path.is_empty())
+    }
+
+    /// Every object loaded under one connection, regardless of what is open.
+    pub fn objects(&self, id: ConnId) -> impl Iterator<Item = &VisibleNode> {
+        self.connection(id)
+            .into_iter()
+            .flat_map(|conn| conn.tree.nodes.iter())
     }
 
     /// Whether the store has applied an action dispatched at this point in the
@@ -235,6 +253,7 @@ mod tests {
             kind: DriverKind::Mock,
             status,
             capabilities: None,
+            tree: Arc::default(),
         }
     }
 

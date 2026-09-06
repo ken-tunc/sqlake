@@ -1005,6 +1005,7 @@ impl Runtime {
                     kind: c.kind,
                     status: c.status.clone(),
                     capabilities: c.capabilities,
+                    tree: Arc::clone(&c.view),
                 })
                 .collect(),
             explorer: Arc::new(self.explorer()),
