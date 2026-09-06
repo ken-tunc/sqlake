@@ -190,11 +190,9 @@ pub fn tree_of(snapshot: &Snapshot, conn: ConnId) -> Vec<NodeInfo> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use serde_json::Value as Json;
     use sqlake_app::action::Action;
     use sqlake_app::store::{Drivers, Store};
     use sqlake_core::id::ProfileId;
@@ -225,52 +223,6 @@ mod tests {
             .await
             .expect("the connection settles");
         (store, conn, snapshot)
-    }
-
-    /// Every key anywhere in the document, however deeply nested.
-    fn keys(value: &Json, into: &mut BTreeSet<String>) {
-        match value {
-            Json::Object(map) => {
-                for (key, v) in map {
-                    into.insert(key.clone());
-                    keys(v, into);
-                }
-            }
-            Json::Array(items) => items.iter().for_each(|v| keys(v, into)),
-            _ => {}
-        }
-    }
-
-    #[tokio::test]
-    async fn nothing_crossing_the_socket_carries_a_credential() {
-        // Asserted as the whole key set rather than as the absence of a list of
-        // bad names: a field added to any of these types fails this test and
-        // has to be looked at, which is the only version of this check that
-        // keeps working.
-        let (_store, _conn, snapshot) = connected(Behaviour::instant()).await;
-        let json = serde_json::to_value(SessionInfo::from(&*snapshot)).expect("serialises");
-
-        let mut found = BTreeSet::new();
-        keys(&json, &mut found);
-        let expected: BTreeSet<String> = [
-            "cancel",
-            "capabilities",
-            "connections",
-            "cost_estimate",
-            "driver",
-            "free_preview",
-            "hierarchy",
-            "id",
-            "name",
-            "profile",
-            "profiles",
-            "sortable_preview",
-            "state",
-        ]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-        assert_eq!(found, expected);
     }
 
     #[tokio::test]

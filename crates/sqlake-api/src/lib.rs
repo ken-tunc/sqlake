@@ -16,7 +16,9 @@ pub mod socket;
 pub mod value;
 
 pub use page::{Budget, Column, Page};
-pub use protocol::{Failure, Request, RequestKind, Response, SortBy, schema};
+pub use protocol::{
+    Failure, FailureKind, Request, RequestKind, Response, ResponseKind, SortBy, schema,
+};
 pub use serve::{DEFAULT_TIMEOUT, Service};
 pub use snapshot::{ConnectionInfo, NodeInfo, NodeStatus, ProfileInfo, SessionInfo, Status};
 pub use socket::{Client, DEFAULT_SESSION, Listener, ListenerHandle, session_name, socket_path};

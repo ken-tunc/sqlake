@@ -205,6 +205,69 @@ pub enum Response {
     Failed(Failure),
 }
 
+/// Generates a kind enum and its list together, for the same reason
+/// [`RequestKind`] exists: a check over "every one of these" has to be able to
+/// name them all.
+macro_rules! kinds {
+    ($kind:ident: $($name:ident),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum $kind {
+            $($name),*
+        }
+
+        impl $kind {
+            pub const ALL: &'static [Self] = &[$(Self::$name),*];
+        }
+    };
+}
+
+kinds!(ResponseKind: Snapshot, Schema, Connections, Nodes, Page, Failed);
+
+// One level below `ResponseKind`, because a `Failed` response is not one
+// shape: each variant carries its own fields, so a check that samples one
+// failure has looked at a sixth of what `Failed` can put on the wire.
+kinds!(
+    FailureKind: NoSuchConnection,
+    NotFound,
+    Driver,
+    Timeout,
+    Unsupported,
+    Malformed,
+);
+
+impl Response {
+    /// Exhaustive on purpose, so a new response cannot be added without the
+    /// check on what crosses the socket being told about it.
+    #[must_use]
+    pub const fn kind(&self) -> ResponseKind {
+        match self {
+            Self::Snapshot(_) => ResponseKind::Snapshot,
+            Self::Schema(_) => ResponseKind::Schema,
+            Self::Connections(_) => ResponseKind::Connections,
+            Self::Nodes(_) => ResponseKind::Nodes,
+            Self::Page(_) => ResponseKind::Page,
+            Self::Failed(_) => ResponseKind::Failed,
+        }
+    }
+}
+
+impl Failure {
+    /// Exhaustive for the same reason [`Response::kind`] is: `Malformed` is
+    /// never reached through [`crate::Service`] at all, so provoking failures
+    /// is not a way to enumerate them.
+    #[must_use]
+    pub const fn kind(&self) -> FailureKind {
+        match self {
+            Self::NoSuchConnection { .. } => FailureKind::NoSuchConnection,
+            Self::NotFound { .. } => FailureKind::NotFound,
+            Self::Driver { .. } => FailureKind::Driver,
+            Self::Timeout { .. } => FailureKind::Timeout,
+            Self::Unsupported { .. } => FailureKind::Unsupported,
+            Self::Malformed { .. } => FailureKind::Malformed,
+        }
+    }
+}
+
 /// The request and response schema, generated from the types.
 ///
 /// Both under one root because a caller wants the pair: a schema for requests
