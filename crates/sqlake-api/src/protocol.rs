@@ -37,17 +37,24 @@ pub struct SortBy {
 #[serde(rename_all = "snake_case", tag = "request", deny_unknown_fields)]
 pub enum Request {
     /// The session as a whole: its connections and the profiles it could open.
-    Snapshot,
+    ///
+    /// A struct variant with no fields rather than a unit one: serde reads a
+    /// unit variant out of an internally tagged enum with a visitor that
+    /// accepts any map, so `deny_unknown_fields` never reaches it and
+    /// `{"request": "snapshot", "connection": "…"}` would be answered as a
+    /// plain snapshot. The wire form and the generated schema are the same
+    /// either way.
+    Snapshot {},
 
     /// This document.
     ///
     /// A request rather than only a subcommand so that a caller which reached
     /// the socket first does not have to shell out to discover what else it can
     /// send.
-    Schema,
+    Schema {},
 
     /// Every connection currently open.
-    ConnectionList,
+    ConnectionList {},
 
     /// The namespaces in a connection.
     ///
@@ -125,9 +132,9 @@ impl Request {
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
         match self {
-            Self::Snapshot => RequestKind::Snapshot,
-            Self::Schema => RequestKind::Schema,
-            Self::ConnectionList => RequestKind::ConnectionList,
+            Self::Snapshot {} => RequestKind::Snapshot,
+            Self::Schema {} => RequestKind::Schema,
+            Self::ConnectionList {} => RequestKind::ConnectionList,
             Self::NamespaceList { .. } => RequestKind::NamespaceList,
             Self::TableList { .. } => RequestKind::TableList,
             Self::TablePreview { .. } => RequestKind::TablePreview,
@@ -198,23 +205,44 @@ pub enum Response {
 /// alone would tell it what to send and nothing about what comes back.
 #[must_use]
 pub fn schema() -> Json {
+    let mut definitions = Map::new();
+    let request = subschema(schema_for!(Request), &mut definitions);
+    let response = subschema(schema_for!(Response), &mut definitions);
+
     let mut root = Map::new();
     root.insert("$schema".into(), Json::from(SCHEMA_DIALECT));
     root.insert("title".into(), Json::from("sqlake agent surface"));
-    root.insert("request".into(), subschema(schema_for!(Request)));
-    root.insert("response".into(), subschema(schema_for!(Response)));
+    root.insert("request".into(), request);
+    root.insert("response".into(), response);
+    root.insert("$defs".into(), Json::Object(definitions));
     Json::Object(root)
 }
 
-/// The dialect is declared once, at the root.
+/// Strips what only belongs to a document root, and hoists what has to live
+/// there.
 ///
-/// `schema_for!` stamps every schema it generates as a document in its own
-/// right, and two of them nested under one root would each redeclare it — which
-/// a validator is entitled to read as a subschema changing dialect mid-document.
-fn subschema(schema: schemars::Schema) -> Json {
+/// The dialect, because `schema_for!` stamps every schema it generates as a
+/// document in its own right, and two of them nested under one root would each
+/// redeclare it — which a validator is entitled to read as a subschema changing
+/// dialect mid-document.
+///
+/// `$defs`, because the `$ref`s pointing at them are written `#/$defs/…` and
+/// `#` is the *document* root. Left nested, every reference in both schemas
+/// names something that is not there.
+fn subschema(schema: schemars::Schema, definitions: &mut Map<String, Json>) -> Json {
     let mut json = serde_json::to_value(schema).expect("a schema serialises");
-    if let Some(object) = json.as_object_mut() {
-        object.remove("$schema");
+    let Some(object) = json.as_object_mut() else {
+        return json;
+    };
+    object.remove("$schema");
+    if let Some(Json::Object(own)) = object.remove("$defs") {
+        for (name, definition) in own {
+            let clash = definitions.insert(name.clone(), definition.clone());
+            assert!(
+                clash.is_none_or(|existing| existing == definition),
+                "two different types are both called `{name}`, and hoisting merged them"
+            );
+        }
     }
     json
 }
@@ -237,9 +265,9 @@ mod tests {
     #[test]
     fn every_kind_is_tagged_the_way_serde_tags_it() {
         let requests = [
-            Request::Snapshot,
-            Request::Schema,
-            Request::ConnectionList,
+            Request::Snapshot {},
+            Request::Schema {},
+            Request::ConnectionList {},
             Request::NamespaceList {
                 connection: "c".into(),
             },
@@ -262,6 +290,13 @@ mod tests {
                 "{request:?} is tagged differently from what its kind claims"
             );
         }
+        // The claim that makes `Snapshot {}` free: an empty struct variant is
+        // on the wire exactly what the unit variant was, so only the
+        // deserializer's behaviour changed.
+        assert_eq!(
+            serde_json::to_value(Request::Snapshot {}).expect("it serialises"),
+            json!({"request": "snapshot"})
+        );
         let kinds: BTreeSet<_> = requests.iter().map(Request::kind).collect();
         assert_eq!(
             kinds.len(),
@@ -299,6 +334,63 @@ mod tests {
         assert_eq!(schema["$schema"], Json::from(SCHEMA_DIALECT));
         assert!(schema["request"].get("$schema").is_none());
         assert!(schema["response"].get("$schema").is_none());
+    }
+
+    /// A `$ref` is resolved against the document root, so a definition left
+    /// where `schema_for!` put it — under `request` or `response` — is named by
+    /// a reference to nothing, and a caller that validates against this
+    /// document cannot load it at all.
+    #[test]
+    fn every_reference_resolves_against_the_root() {
+        fn references(json: &Json, found: &mut Vec<String>) {
+            match json {
+                Json::Object(members) => {
+                    for (key, value) in members {
+                        match (key.as_str(), value.as_str()) {
+                            ("$ref", Some(target)) => found.push(target.to_owned()),
+                            _ => references(value, found),
+                        }
+                    }
+                }
+                Json::Array(items) => items.iter().for_each(|item| references(item, found)),
+                _ => {}
+            }
+        }
+
+        let schema = schema();
+        let definitions = schema["$defs"]
+            .as_object()
+            .expect("the definitions are hoisted to the root");
+        let mut found = Vec::new();
+        references(&schema, &mut found);
+        assert!(!found.is_empty(), "nothing referenced, so nothing checked");
+        for target in found {
+            let name = target
+                .strip_prefix("#/$defs/")
+                .unwrap_or_else(|| panic!("`{target}` is not rooted at the document"));
+            assert!(
+                definitions.contains_key(name),
+                "`{target}` names no definition"
+            );
+        }
+    }
+
+    /// The tag is the whole request for these, so anything beside it is a
+    /// caller asking for something that will not happen.
+    #[test]
+    fn a_request_with_no_fields_still_refuses_one() {
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({"request": "snapshot"}))
+                .expect("the bare request parses"),
+            Request::Snapshot {}
+        );
+        assert!(
+            serde_json::from_value::<Request>(
+                json!({"request": "connection_list", "connection": "c"})
+            )
+            .is_err(),
+            "a filter that does not exist was accepted and ignored"
+        );
     }
 
     /// The reason the schema is generated rather than written: a caller reads
