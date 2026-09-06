@@ -90,7 +90,7 @@ async fn a_page_of_every_kind_of_value_serialises() {
     );
 
     // The rows the grid exists to survive: extremes, then nulls, then a NaN.
-    assert_eq!(cell(1, "v_int"), json!(i64::MIN));
+    assert_eq!(cell(1, "v_int"), json!({"$int": "-9223372036854775808"}));
     assert_eq!(cell(1, "v_float"), json!({"$float": "-inf"}));
     assert_eq!(cell(1, "v_array"), json!([]));
     assert_eq!(cell(2, "v_bool"), json!(null));

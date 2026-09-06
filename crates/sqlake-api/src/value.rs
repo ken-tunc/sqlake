@@ -7,13 +7,14 @@
 //! renderings of one `PagedResult` is what makes them peers rather than one
 //! reusing the other's formatter.
 //!
-//! Three values have no JSON of their own, and a fourth case — a formatter
-//! that cannot render its input — has nothing truthful to put in the cell at
-//! all. Each gets a one-key object whose key starts with `$`. The alternative
-//! — a bare string — is worse in the way that matters: an agent cannot tell it
-//! from a column that really is text, so it quotes base64 back as if it were
-//! the value. A `$` key can collide with a real key inside a `Json` column,
-//! which is why the marker is a whole object and never a field added to one.
+//! Where JSON cannot hold a value — bytes, a type the driver did not decode,
+//! a float that is not finite, an integer a double would round, a formatter
+//! that cannot render its input — the cell becomes a one-key object whose key
+//! starts with `$`. The alternative — a bare string — is worse in the way that
+//! matters: an agent cannot tell it from a column that really is text, so it
+//! quotes base64 back as if it were the value. A `$` key can collide with a
+//! real key inside a `Json` column, which is why the marker is a whole object
+//! and never a field added to one.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -27,14 +28,19 @@ use time::macros::format_description;
 const BYTES: &str = "$base64";
 const OPAQUE: &str = "$opaque";
 const NONFINITE: &str = "$float";
+const WIDE_INT: &str = "$int";
 const ERROR: &str = "$error";
+
+/// The largest magnitude a JSON number survives once a parser reads it as a
+/// double, which most do.
+const EXACT_INT: i64 = (1 << 53) - 1;
 
 #[must_use]
 pub fn to_json(value: &Value) -> Json {
     match value {
         Value::Null => Json::Null,
         Value::Bool(b) => Json::Bool(*b),
-        Value::Int(n) => Json::from(*n),
+        Value::Int(n) => int(*n),
         Value::Float(f) => float(*f),
         // A JSON number is a double in most parsers, and an
         // arbitrary-precision numeric is exactly what the driver went to the
@@ -97,6 +103,22 @@ fn marker(key: &str, value: Json) -> Json {
     Json::Object(object)
 }
 
+/// Wrapped only past the point a double stops being exact, so the ordinary
+/// integer stays a number an agent can compare and subtract.
+///
+/// The same reasoning as [`Value::Decimal`], which is stringified for being
+/// wider than a double — but `bigserial` keys are common enough that paying
+/// for them on every `42` would be the wrong trade. A marker rather than a
+/// bare string because the value really is a number, and because silently
+/// rounding a key to its neighbour is the failure this exists to prevent.
+fn int(n: i64) -> Json {
+    if (-EXACT_INT..=EXACT_INT).contains(&n) {
+        Json::from(n)
+    } else {
+        marker(WIDE_INT, Json::String(n.to_string()))
+    }
+}
+
 /// JSON has no NaN and no infinities, and `serde_json` turns one into `null` —
 /// a float that overflowed reported as a value that was absent.
 fn float(f: f64) -> Json {
@@ -131,6 +153,39 @@ mod tests {
         // what an agent asked for.
         let document = json!({"a": [1, 2, {"b": null}], "c": "text"});
         assert_eq!(to_json(&Value::Json(document.clone())), document);
+    }
+
+    #[test]
+    fn an_ordinary_integer_stays_a_number() {
+        // The common case pays nothing: an agent can compare and subtract it
+        // without unwrapping anything.
+        assert_eq!(to_json(&Value::Int(42)), json!(42));
+        assert_eq!(to_json(&Value::Int(-42)), json!(-42));
+    }
+
+    #[test]
+    fn an_integer_a_double_would_round_is_wrapped() {
+        // 2^53 + 1. As a JSON number this reads back as 2^53 in any parser
+        // that uses a double, so a `bigserial` key silently becomes its
+        // neighbour's — the quietest way to answer a question about the wrong
+        // row.
+        let key = 9_007_199_254_740_993_i64;
+        assert_eq!(
+            to_json(&Value::Int(key)),
+            json!({"$int": "9007199254740993"})
+        );
+        assert_eq!(
+            to_json(&Value::Int(i64::MIN)),
+            json!({"$int": "-9223372036854775808"})
+        );
+    }
+
+    #[test]
+    fn the_boundary_is_where_a_double_stops_being_exact() {
+        assert_eq!(to_json(&Value::Int(EXACT_INT)), json!(EXACT_INT));
+        assert_eq!(to_json(&Value::Int(-EXACT_INT)), json!(-EXACT_INT));
+        assert!(to_json(&Value::Int(EXACT_INT + 1)).get(WIDE_INT).is_some());
+        assert!(to_json(&Value::Int(-EXACT_INT - 1)).get(WIDE_INT).is_some());
     }
 
     #[test]
