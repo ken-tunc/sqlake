@@ -15,6 +15,7 @@
 
 pub mod action;
 pub mod error;
+pub mod json;
 pub mod pages;
 pub mod session;
 pub mod snapshot;

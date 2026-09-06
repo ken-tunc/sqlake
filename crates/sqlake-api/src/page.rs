@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sqlake_app::PagedResult;
 
-use crate::value::to_json;
+use sqlake_app::json::to_json;
 
 /// How much of a result is worth putting in front of an agent.
 ///

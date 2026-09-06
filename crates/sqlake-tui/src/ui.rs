@@ -297,6 +297,12 @@ pub struct UiState {
     /// of, which is worse than not opening it.
     detail_offset: usize,
     detail_rows: usize,
+    /// An OSC 52 sequence waiting for the render loop to write it.
+    ///
+    /// Not written from here: this type holds no terminal, and the sequence has
+    /// to go out through the writer the TUI already owns rather than a second
+    /// thing reaching for stdout while the alternate screen is up.
+    pending_copy: Option<String>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
     explorer_width: Option<u16>,
@@ -571,6 +577,7 @@ impl UiState {
             }
 
             ViewCmd::ToggleDetail => self.toggle_detail(),
+            ViewCmd::Copy { format, all } => self.copy(format, all, snapshot),
             ViewCmd::DismissModal => self.modal = None,
 
             // A relation already open is raised, not duplicated — the same
@@ -787,6 +794,66 @@ impl UiState {
         // Keep the selection on screen, which is the whole reason selection and
         // scrolling are not independent.
         self.tree.offset = scroll_into_view(self.tree.offset, index, self.page(PaneId::Explorer));
+    }
+
+    /// The sequence the render loop should write, if there is one.
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+
+    /// Put the selection — or the whole result — on the clipboard.
+    ///
+    /// What is reported afterwards is what was *sent*. OSC 52 has no reply, and
+    /// a terminal with clipboard writes turned off — tmux without
+    /// `set-clipboard on` is the common one — swallows the sequence silently,
+    /// so a message saying "copied" would be a claim this cannot check.
+    fn copy(&mut self, format: crate::copy::Format, all: bool, snapshot: &Snapshot) {
+        let Some(rows) = self.rows_of(snapshot) else {
+            return;
+        };
+        let sort = self.active_sort(snapshot);
+        let asked = match (all, self.active_grid()) {
+            (true, _) => (
+                0,
+                0,
+                rows.row_count().saturating_sub(1),
+                rows.columns().len().saturating_sub(1),
+            ),
+            (false, Some(grid)) => grid.selection(sort),
+            (false, None) => return,
+        };
+        // Counted from the rectangle that is there rather than the one asked
+        // for: a selection outlives a result that shrank under it, and the
+        // count is what the message claims was sent.
+        let Some(area) = crate::copy::clamped(rows, asked) else {
+            self.push_toast(Severity::Info, "nothing to copy");
+            return;
+        };
+
+        let text = crate::copy::render(rows, format, area);
+        let cells = (area.2 - area.0 + 1) * (area.3 - area.1 + 1);
+        match crate::copy::sequence(&text) {
+            Ok(sequence) => {
+                self.pending_copy = Some(sequence);
+                self.push_toast(
+                    Severity::Info,
+                    format!("sent {cells} cells to the clipboard"),
+                );
+            }
+            Err(crate::copy::Refused::Empty) => {
+                self.push_toast(Severity::Info, "nothing to copy");
+            }
+            // Refused rather than sent: a sequence past the terminal's limit is
+            // dropped whole, so sending it would report a copy that never
+            // happened.
+            Err(crate::copy::Refused::TooLarge { bytes }) => self.push_toast(
+                Severity::Warning,
+                format!(
+                    "{cells} cells is {}KB, past what a terminal takes in one go — select fewer",
+                    bytes / 1024
+                ),
+            ),
+        }
     }
 
     fn clear_anchor(&mut self) {

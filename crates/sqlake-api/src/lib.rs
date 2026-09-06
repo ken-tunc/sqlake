@@ -13,7 +13,6 @@ pub mod protocol;
 pub mod serve;
 pub mod snapshot;
 pub mod socket;
-pub mod value;
 
 pub use page::{Budget, Column, Page};
 pub use protocol::{
@@ -22,4 +21,7 @@ pub use protocol::{
 pub use serve::{DEFAULT_TIMEOUT, Service};
 pub use snapshot::{ConnectionInfo, NodeInfo, NodeStatus, ProfileInfo, SessionInfo, Status};
 pub use socket::{Client, DEFAULT_SESSION, Listener, ListenerHandle, session_name, socket_path};
-pub use value::to_json;
+// The JSON a `Value` becomes is one answer, and it lives where both
+// front-ends reach it. Re-exported so a caller of this crate need not know
+// which layer settled it.
+pub use sqlake_app::json::to_json;
