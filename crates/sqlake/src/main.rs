@@ -1,5 +1,7 @@
 //! Argument parsing, dependency wiring, startup. Nothing else lives here.
 
+mod agent;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +40,7 @@ struct Args {
     /// would leave the log silently almost empty.
     #[arg(
         long,
+        global = true,
         default_value = "info",
         value_parser = ["error", "warn", "info", "debug", "trace"]
     )]
@@ -49,14 +52,15 @@ struct Args {
     /// it is how every screen can be looked at without a server, and how a bug
     /// report can be reproduced by somebody with no access to the database it
     /// happened on.
-    #[arg(long)]
+    #[arg(long, global = true)]
     mock: bool,
 
     /// Connect to these profiles at startup instead of the first one.
     ///
     /// Names come from `connections.toml`. Several are allowed: two
-    /// connections is the ordinary case, not an exotic one.
-    #[arg(long = "connect", value_name = "PROFILE")]
+    /// connections is the ordinary case, not an exotic one. A subcommand takes
+    /// one, since it answers one request.
+    #[arg(long = "connect", global = true, value_name = "PROFILE")]
     connect: Vec<String>,
 
     /// Panic once the terminal is taken over, to prove it is given back.
@@ -65,11 +69,44 @@ struct Args {
     /// tidy exit path, and the only honest way to check that is to panic.
     #[arg(long, hide = true)]
     panic_test: bool,
+
+    /// Answer one request and exit, instead of opening the client.
+    ///
+    /// The agent surface's one-shot mode. Every other flag still applies:
+    /// `--mock` picks the built-in database, `--connect` picks a profile.
+    #[command(subcommand)]
+    command: Option<agent::Command>,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let args = Args::parse();
     let _log = init_logging(&args.log_level)?;
+
+    // Before the panic hook and the terminal guard: a subcommand never takes
+    // the screen, and installing a hook that restores a terminal nobody entered
+    // would leave a stray reset in the middle of a caller's JSON.
+    if let Some(command) = &args.command {
+        let (profiles, page_size, connect) = if command.needs_a_connection() {
+            let (profiles, settings) = configuration(&args)?;
+            let connect = opening(&profiles, &args)?;
+            // One request, one connection. A second `--connect` is a caller
+            // expecting an answer that covers both, and silently dropping it
+            // answers about the first as though it had asked for only that.
+            anyhow::ensure!(
+                connect.len() <= 1,
+                "--connect: a subcommand opens one connection, and {} were named",
+                connect.len()
+            );
+            (profiles, settings.page_size, connect.into_iter().next())
+        } else {
+            (
+                Arc::new(agent::NoProfiles) as Arc<dyn Profiles>,
+                Settings::default().page_size,
+                None,
+            )
+        };
+        return agent::run(command, drivers(), profiles, page_size, connect);
+    }
 
     // Every mode change is undone by the guard's `Drop`, and the hook routes a
     // panic through the same function. Installed before the guard exists so a
@@ -117,7 +154,7 @@ fn main() -> Result<()> {
     // The guard restores the screen as it drops, which happens on the way out
     // of this function whether `result` is an error or not.
     result.context("the render loop stopped")?;
-    Ok(())
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Every driver this build can talk to.
