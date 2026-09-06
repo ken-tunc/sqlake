@@ -356,6 +356,10 @@ impl InputContext<'_> {
             match self.focus {
                 PaneId::Explorer => Context::Explorer,
                 PaneId::Grid => Context::Grid,
+                // The pane shows the grid's selected cell, so the grid's
+                // bindings are the ones that make sense in it — and scrolling,
+                // which is `Global`, is what it is mostly for.
+                PaneId::Detail => Context::Grid,
                 PaneId::TabBar | PaneId::StatusBar => Context::Global,
             }
         }

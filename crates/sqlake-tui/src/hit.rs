@@ -50,6 +50,9 @@ pub enum PaneId {
     #[default]
     Explorer,
     Grid,
+    /// One cell in full, under the grid. Scrollable, because the values it
+    /// exists for are longer than any pane.
+    Detail,
     StatusBar,
 }
 

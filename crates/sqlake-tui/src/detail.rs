@@ -10,6 +10,9 @@
 //! far to indent a nested field are terminal decisions, so they are made here
 //! and the widget receives lines.
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -44,9 +47,22 @@ pub struct RenderedDetail {
 /// A guard against a value that nests further than anybody will read, not a
 /// display choice: the grid's own recursion has no depth limit either, but it
 /// stops at one line. Twelve is past every shape a `RECORD` or a composite
-/// takes in practice, and a value deeper than that is still shown — as JSON on
-/// one line, which is what it would have looked like anyway.
+/// takes in practice, and a value deeper than that is still shown — on one
+/// line, which is what it would have looked like anyway.
 const MAX_DEPTH: u8 = 12;
+
+/// Levels [`compact`] follows before it falls back to a count.
+///
+/// The recursion below [`MAX_DEPTH`] is a line per field and bounded by the
+/// value; this one is a single line, so it needs its own floor rather than the
+/// stack's.
+const MAX_COMPACT_DEPTH: u8 = 8;
+
+/// Bytes shown before a blob is described rather than spelled out.
+///
+/// Larger than the grid's eight, because reading the value is what this pane
+/// is for; not unbounded, because a megabyte of hex is not read either.
+const MAX_HEX_BYTES: usize = 1024;
 
 impl RenderedDetail {
     #[must_use]
@@ -58,11 +74,6 @@ impl RenderedDetail {
             type_name: type_name.to_owned(),
             lines,
         }
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
     }
 }
 
@@ -93,6 +104,15 @@ fn push(lines: &mut Vec<DetailLine>, depth: u8, label: Option<String>, value: &V
         // A JSON document is followed the same way, because an agent asked for
         // the document and so did whoever opened this pane.
         Value::Json(json) => push_json(lines, depth, label, json),
+        // Empty, or nested past the depth limit. Either way it goes on one
+        // line — but with its contents on it, because a struct printed as `{}`
+        // says the row is empty when it is not.
+        Value::Struct(_) | Value::Array(_) => lines.push(DetailLine {
+            depth,
+            label,
+            text: compact(value),
+            kind: CellKind::Complex,
+        }),
         _ => lines.push(DetailLine {
             depth,
             label,
@@ -143,12 +163,71 @@ fn push_json(
             text: sanitise_unbounded(text),
             kind: CellKind::Text,
         }),
-        other => lines.push(DetailLine {
+        // Empty, or past the depth limit: one line, and sanitised — `serde_json`
+        // escapes the C0 controls on the way out but not a bidi override, which
+        // reorders every line drawn after it.
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => lines.push(DetailLine {
             depth,
             label,
-            text: other.to_string(),
+            text: sanitise_unbounded(&json.to_string()),
+            kind: CellKind::Complex,
+        }),
+        serde_json::Value::Bool(b) => lines.push(DetailLine {
+            depth,
+            label,
+            text: b.to_string(),
+            kind: CellKind::Text,
+        }),
+        number @ serde_json::Value::Number(_) => lines.push(DetailLine {
+            depth,
+            label,
+            text: number.to_string(),
             kind: CellKind::Number,
         }),
+    }
+}
+
+/// A composite on one line, for a value nested past [`MAX_DEPTH`].
+fn compact(value: &Value) -> String {
+    let mut out = String::new();
+    write_compact(&mut out, value, MAX_COMPACT_DEPTH);
+    out
+}
+
+fn write_compact(out: &mut String, value: &Value, budget: u8) {
+    match value {
+        Value::Struct(fields) => {
+            if budget == 0 {
+                let _ = write!(out, "{{{} fields}}", fields.len());
+                return;
+            }
+            out.push('{');
+            for (i, (name, nested)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&sanitise_unbounded(name));
+                out.push_str(": ");
+                write_compact(out, nested, budget - 1);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            if budget == 0 {
+                let _ = write!(out, "[{} items]", items.len());
+                return;
+            }
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_compact(out, item, budget - 1);
+            }
+            out.push(']');
+        }
+        Value::Json(json) => out.push_str(&sanitise_unbounded(&json.to_string())),
+        scalar => out.push_str(&self::scalar(scalar)),
     }
 }
 
@@ -163,19 +242,39 @@ fn scalar(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
-        Value::Decimal(text) => text.clone(),
+        // Sanitised like any other string from a driver: `numeric` is digits
+        // in every database anyone has, and "in every database anyone has" is
+        // not the guarantee this pane draws into a terminal on.
+        Value::Decimal(text) => sanitise_unbounded(text),
         Value::Text(text) => sanitise_unbounded(text),
-        Value::Bytes(bytes) => format!("{} bytes", bytes.len()),
+        Value::Bytes(bytes) => hex(bytes),
         Value::Date(d) => d.to_string(),
         Value::Time(t) => t.to_string(),
         Value::Timestamp(ts) => ts.to_string(),
         Value::TimestampTz(ts) => ts.to_string(),
-        // Reached only for the empty ones; the rest are followed above.
-        Value::Struct(_) => "{}".to_owned(),
-        Value::Array(_) => "[]".to_owned(),
+        Value::Struct(_) | Value::Array(_) => compact(value),
         Value::Json(json) => sanitise_unbounded(&json.to_string()),
-        Value::Opaque { type_name, text } => format!("{type_name}: {}", sanitise_unbounded(text)),
+        Value::Opaque { type_name, text } => format!(
+            "{}: {}",
+            sanitise_unbounded(type_name),
+            sanitise_unbounded(text)
+        ),
     }
+}
+
+/// A blob as hex, which is more than the grid's eight bytes and less than a
+/// megabyte of it.
+fn hex(bytes: &[u8]) -> String {
+    let shown = bytes.len().min(MAX_HEX_BYTES);
+    let mut out = String::with_capacity(2 + shown * 2);
+    out.push_str("0x");
+    for b in &bytes[..shown] {
+        let _ = write!(out, "{b:02x}");
+    }
+    if bytes.len() > shown {
+        let _ = write!(out, "… ({} bytes)", bytes.len());
+    }
+    out
 }
 
 fn kind_of(value: &Value) -> CellKind {
@@ -214,19 +313,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, detail: Option<&RenderedDetail>
         return;
     };
 
+    // A newline in the value becomes a line here rather than being carried
+    // inside one: ratatui measures a grapheme's width to place it, scores a
+    // control character zero, and drops it — so `a\nb` left whole is drawn as
+    // `ab`, which is a different value. A tab goes the same way, and is spent
+    // as spaces for the same reason.
     let lines: Vec<Line<'_>> = detail
         .lines
         .iter()
-        .map(|line| {
-            let mut spans = vec![Span::raw("  ".repeat(usize::from(line.depth)))];
-            if let Some(label) = &line.label {
-                spans.push(Span::styled(
-                    format!("{label}: "),
-                    Style::new().fg(Color::Gray),
-                ));
-            }
-            spans.push(Span::styled(line.text.clone(), style_for(line.kind)));
-            Line::from(spans)
+        .flat_map(|line| {
+            let indent = "  ".repeat(usize::from(line.depth));
+            let style = style_for(line.kind);
+            line.text.split('\n').enumerate().map(move |(i, piece)| {
+                let mut spans = vec![Span::raw(indent.clone())];
+                if i == 0
+                    && let Some(label) = &line.label
+                {
+                    spans.push(Span::styled(
+                        format!("{label}: "),
+                        Style::new().fg(Color::Gray),
+                    ));
+                }
+                spans.push(Span::styled(expand_tabs(piece), style));
+                Line::from(spans)
+            })
         })
         .collect();
 
@@ -236,6 +346,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, detail: Option<&RenderedDetail>
             .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         inside,
     );
+}
+
+/// Spaces to a tab stop, borrowing when there is nothing to spend.
+fn expand_tabs(text: &str) -> Cow<'_, str> {
+    if text.contains('\t') {
+        Cow::Owned(text.replace('\t', "    "))
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 /// The grid's palette, so one value does not change colour on the way here.
@@ -258,10 +377,14 @@ mod tests {
     }
 
     fn drawn(detail: Option<&RenderedDetail>, w: u16, h: u16) -> String {
+        drawn_at(detail, w, h, 0)
+    }
+
+    fn drawn_at(detail: Option<&RenderedDetail>, w: u16, h: u16, offset: usize) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("a terminal");
         terminal
-            .draw(|frame| render(frame, Rect::new(0, 0, w, h), detail, 0))
+            .draw(|frame| render(frame, Rect::new(0, 0, w, h), detail, offset))
             .expect("it draws");
         let buffer = terminal.backend().buffer().clone();
         (0..h)
@@ -295,6 +418,21 @@ mod tests {
             body.matches("ab").count() > 20,
             "the value was cut at the pane's width: {screen}"
         );
+    }
+
+    #[test]
+    fn a_value_taller_than_the_pane_can_be_scrolled_to() {
+        // Without this the pane shows six rows of a value the grid had already
+        // shown 512 characters of — less than the thing it was opened to get
+        // past.
+        let lines: Vec<String> = (0..40).map(|i| format!("line{i}")).collect();
+        let detail = RenderedDetail::of("c", "text", &Value::Text(lines.join("\n")));
+
+        let top = drawn_at(Some(&detail), 20, 8, 0);
+        let down = drawn_at(Some(&detail), 20, 8, 30);
+        assert!(top.contains("line0"), "{top}");
+        assert!(!top.contains("line35"), "{top}");
+        assert!(down.contains("line35"), "{down}");
     }
 
     #[test]
@@ -356,6 +494,21 @@ mod tests {
         // thing standing between somebody and the value.
         let detail = of(&Value::Text("a\nb".into()));
         assert!(detail.lines[0].text.contains('\n'), "{:?}", detail.lines[0]);
+
+        // And as a *drawn* one. Left inside a span the newline is scored zero
+        // columns and dropped, which draws the value as `ab` — a different
+        // value, and one the grid's `␊` would at least not have claimed.
+        let screen = drawn(Some(&detail), 20, 6);
+        let body: Vec<&str> = screen.lines().skip(1).collect();
+        assert!(body[0].contains('a') && !body[0].contains('b'), "{screen}");
+        assert!(body[1].contains('b'), "{screen}");
+    }
+
+    #[test]
+    fn a_tab_is_spent_as_spaces_rather_than_vanishing() {
+        let detail = of(&Value::Text("a\tb".into()));
+        let screen = drawn(Some(&detail), 20, 4);
+        assert!(screen.contains("a    b"), "{screen}");
     }
 
     #[test]
@@ -384,9 +537,43 @@ mod tests {
         }
         let detail = of(&value);
         assert!(detail.lines.iter().all(|l| l.depth <= MAX_DEPTH));
+        // `[]` would satisfy "not empty" while saying the array holds nothing,
+        // which is the one thing the limit must not do: the reader cannot tell
+        // it apart from an array that really is empty.
         assert!(
-            !detail.lines.last().expect("a line").text.is_empty(),
-            "the value past the depth limit was dropped instead of shown"
+            detail.lines.last().expect("a line").text.contains('1'),
+            "the value past the depth limit was dropped instead of shown: {:?}",
+            detail.lines.last()
+        );
+    }
+
+    #[test]
+    fn a_struct_past_the_limit_is_not_reported_as_empty() {
+        let mut value = Value::Struct(vec![("k".into(), Value::Text("v".into()))]);
+        for _ in 0..(MAX_DEPTH + 4) {
+            value = Value::Struct(vec![("a".into(), value)]);
+        }
+        let detail = of(&value);
+        let last = detail.lines.last().expect("a line");
+        assert_ne!(last.text, "{}", "a struct with fields was drawn as empty");
+        assert!(last.text.contains('v'), "{last:?}");
+    }
+
+    #[test]
+    fn a_blob_shows_at_least_what_the_grid_showed() {
+        // Opening the pane on a `bytea` must not replace the bytes the grid
+        // already had room for with a count of them.
+        let detail = of(&Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(detail.lines[0].text, "0xdeadbeef");
+    }
+
+    #[test]
+    fn a_decimal_is_sanitised_like_every_other_string_from_a_driver() {
+        let detail = of(&Value::Decimal("1\u{1b}[2J0".into()));
+        assert!(
+            !detail.lines[0].text.contains('\u{1b}'),
+            "{:?}",
+            detail.lines[0]
         );
     }
 }

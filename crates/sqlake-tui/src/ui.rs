@@ -21,6 +21,8 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 use sqlake_app::PagedResult;
+
+use crate::detail::RenderedDetail;
 use sqlake_app::action::Action;
 use sqlake_app::snapshot::{ConnStatus, LoadState, Snapshot};
 #[cfg(test)]
@@ -102,11 +104,12 @@ const DEFAULT_EXPLORER_PERMILLE: u32 = 280;
 /// anywhere to go.
 const LOAD_MARGIN_ROWS: usize = 20;
 
-/// Rows the detail pane opens at.
+/// Rows the detail pane takes.
 ///
-/// Enough for a small document without taking the grid over. It is resizable
-/// from there, which is what makes the default a starting point rather than a
-/// judgement about how big a value is.
+/// Enough for a small document without taking the grid over. Fixed, because
+/// there is no splitter for it yet: nothing but this constant decides how much
+/// of a long value is reachable, which is what a `SplitId` for the pane would
+/// change.
 const DEFAULT_DETAIL_HEIGHT: u16 = 8;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -140,6 +143,14 @@ pub struct GridUi {
     pub col: usize,
     widths: HashMap<usize, u16>,
     grid: Option<RenderedGrid>,
+    /// The selected cell, laid out to be read, and which cell that was.
+    ///
+    /// Cached for the same reason the grid is: a snapshot is republished for
+    /// reasons that have nothing to do with this tab, and rebuilding here
+    /// means sanitising the whole value again — which for the megabyte-long
+    /// text this pane exists for is the cost `MAX_CELL_CHARS` was introduced
+    /// to avoid, reintroduced one pane over.
+    detail: Option<((usize, usize), Arc<RenderedDetail>)>,
 }
 
 impl GridUi {
@@ -153,6 +164,22 @@ impl GridUi {
         self.grid
             .as_ref()
             .expect("just built when it was missing or stale")
+    }
+
+    /// The document for the selected cell, built once per cell rather than
+    /// once per frame.
+    pub fn detail(&mut self) -> Option<Arc<RenderedDetail>> {
+        let at = (self.row, self.col);
+        if self.detail.as_ref().is_none_or(|(was, _)| *was != at) {
+            let rendered = self.grid.as_ref()?;
+            let value = rendered.raw(at.0, at.1)?;
+            let column = rendered.columns().get(at.1)?;
+            self.detail = Some((
+                at,
+                Arc::new(RenderedDetail::of(&column.name, &column.type_name, value)),
+            ));
+        }
+        self.detail.as_ref().map(|(_, d)| Arc::clone(d))
     }
 
     /// Drawing needs the grid and the widths and offsets beside it at the same
@@ -224,6 +251,15 @@ pub struct UiState {
     /// person's question, and a caller reading the same snapshot through
     /// `sqlake-api` has the value already.
     detail_height: Option<u16>,
+    /// How far down the detail pane is scrolled, and how many lines it has to
+    /// scroll through.
+    ///
+    /// The pane exists for values longer than a column, and a value longer
+    /// than a column is often longer than a pane: without this it shows the
+    /// first few rows of something the grid had already shown 512 characters
+    /// of, which is worse than not opening it.
+    detail_offset: usize,
+    detail_rows: usize,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
     explorer_width: Option<u16>,
@@ -304,6 +340,20 @@ impl UiState {
         // to choose one.
         let ceiling = total.saturating_sub(MIN_GRID_HEIGHT);
         wanted.min(ceiling)
+    }
+
+    /// How many lines the pane has to scroll through, which only the frame
+    /// that drew it knows.
+    pub fn set_detail_rows(&mut self, rows: usize) {
+        self.detail_rows = rows;
+        // A shorter value must not leave the pane scrolled past its end,
+        // showing an empty pane for a value that is there.
+        self.detail_offset = self.detail_offset.min(rows.saturating_sub(1));
+    }
+
+    #[must_use]
+    pub fn detail_offset(&self) -> usize {
+        self.detail_offset
     }
 
     #[must_use]
@@ -571,6 +621,7 @@ impl UiState {
         match pane {
             PaneId::Explorer => self.tree.offset,
             PaneId::Grid => self.active_grid().map_or(0, |g| g.row_offset),
+            PaneId::Detail => self.detail_offset,
             PaneId::TabBar | PaneId::StatusBar => 0,
         }
     }
@@ -585,6 +636,7 @@ impl UiState {
         match pane {
             PaneId::Explorer => self.visible_len(snapshot),
             PaneId::Grid => self.row_count(snapshot),
+            PaneId::Detail => self.detail_rows,
             PaneId::TabBar | PaneId::StatusBar => 0,
         }
     }
@@ -598,6 +650,7 @@ impl UiState {
                     grid.row_offset = clamped;
                 }
             }
+            PaneId::Detail => self.detail_offset = clamped,
             PaneId::TabBar | PaneId::StatusBar => {}
         }
     }
@@ -894,6 +947,38 @@ mod tests {
             &snap,
         );
         (snap, ui)
+    }
+
+    #[test]
+    fn the_detail_document_is_built_once_per_cell() {
+        // A snapshot is republished for reasons that have nothing to do with
+        // this tab, and rebuilding sanitises the whole value again — the cost
+        // `MAX_CELL_CHARS` exists to avoid, one pane over.
+        let mut grid = GridUi::default();
+        let rows = std::sync::Arc::new(sqlake_app::PagedResult::new(
+            &sqlake_core::result::ResultSet::new(
+                vec![sqlake_core::result::Column::new("c", "text", false)],
+                vec![sqlake_core::result::Row(vec![
+                    sqlake_core::value::Value::Text("x".repeat(1000)),
+                ])],
+                None,
+            ),
+        ));
+        grid.grid(&rows);
+
+        let first = grid.detail().expect("a document");
+        let again = grid.detail().expect("a document");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &again),
+            "the value was laid out again for the same cell"
+        );
+
+        grid.col = 0;
+        grid.row = 0;
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &grid.detail().expect("a document")
+        ));
     }
 
     #[test]

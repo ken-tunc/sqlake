@@ -312,6 +312,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     // column, and a viewport measured without them makes `ScrollToEnd` stop a
     // row short of the end.
     ui.set_viewport(PaneId::Grid, datagrid::body_area(grid));
+    let mut detail = None;
     if let Some((id, conn, table)) = active
         && let Some(preview) = snapshot.preview(conn, &table)
     {
@@ -326,21 +327,34 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         // Built from the value rather than from the cell the grid drew: the
         // grid clamps at `MAX_CELL_CHARS` and writes `{2 keys}` for a
         // document, which is what somebody opening this pane is trying to see
-        // past.
+        // past. Cached per cell, so the value is not sanitised again on a
+        // frame drawn for a spinner tick.
         if frames.detail.height > 0 {
-            let ui_grid = ui.grid(id);
-            let detail = ui_grid.and_then(|g| {
-                let rendered = g.rendered()?;
-                let value = rendered.raw(g.row, g.col)?;
-                let column = rendered.columns().get(g.col)?;
-                Some(crate::detail::RenderedDetail::of(
-                    &column.name,
-                    &column.type_name,
-                    value,
-                ))
-            });
-            crate::detail::render(frame, frames.detail, detail.as_ref(), 0);
+            detail = ui.grid_mut(id).detail();
         }
+    }
+
+    // Outside the preview: the pane has already taken its rows from the grid,
+    // and drawing nothing into them when the tab it was opened over has gone
+    // leaves a band of screen that belongs to no pane at all.
+    if frames.detail.height > 0 {
+        // The pane is a hit target and a scroll position of its own: the
+        // values it exists for are longer than any pane, so showing the first
+        // few rows of one and no way to reach the rest would be worse than not
+        // opening it.
+        hits.push(
+            frames.detail,
+            crate::hit::Z_BASE,
+            Target::Pane(PaneId::Detail),
+        );
+        ui.set_viewport(PaneId::Detail, frames.detail);
+        ui.set_detail_rows(detail.as_ref().map_or(0, |d| d.lines.len()));
+        crate::detail::render(
+            frame,
+            frames.detail,
+            detail.as_ref().map(AsRef::as_ref),
+            ui.detail_offset(),
+        );
     }
 
     chrome::status_bar(frame, hits, frames.status_bar, snapshot);
