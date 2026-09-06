@@ -3,4 +3,7 @@
 *.pdb
 
 .DS_Store
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+CLAUDE.local.md
