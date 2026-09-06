@@ -86,7 +86,7 @@ pub fn render(
                 }
                 return;
             }
-            body(frame, hits, area, sortable, grid, ui, tab.sort);
+            body(frame, hits, area, grid, ui, tab.sort, sortable);
         }
     }
 }
@@ -178,8 +178,12 @@ fn header(
                     })
                     .add_modifier(Modifier::BOLD)
             } else {
-                // Not bold, and dimmed: the same row, visibly not a button.
-                Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+                // Recessed by colour and by weight, and deliberately not
+                // `DIM`: dimmed dark grey is what a `NULL` cell is drawn in,
+                // and a column name borrowing that would say the value is
+                // missing rather than that the ordering is. Two axes rather
+                // than one because a terminal is free to ignore either.
+                Style::new().fg(Color::DarkGray)
             }),
             rect,
         );
@@ -202,10 +206,10 @@ fn body(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
     area: Rect,
-    sortable: bool,
     grid: &RenderedGrid,
     ui: &GridUi,
     sort: Option<Sort>,
+    sortable: bool,
 ) {
     // One column is left for the scrollbar so a wide value is cut rather than
     // hidden behind the thumb.
@@ -386,10 +390,14 @@ mod tests {
             style(&fixed),
             "a header that cannot be sorted is drawn as one that can"
         );
+        // And not the null palette. `DarkGray` + `DIM` is what a missing value
+        // is drawn in, and a column name borrowing it says the wrong thing —
+        // what is unavailable is the ordering, not the data.
+        let null = style_for(CellKind::Null, false);
+        let cell = &fixed[(0, 0)];
         assert!(
-            fixed[(0, 0)]
-                .modifier
-                .contains(ratatui::style::Modifier::DIM)
+            Some(cell.fg) != null.fg || cell.modifier != null.add_modifier,
+            "an unsortable header is drawn in the style that means NULL"
         );
     }
 
@@ -401,7 +409,7 @@ mod tests {
         let tab = tab(LoadState::Ready(numbers(3, 2)), None);
         let (_, hits, _) = draw_as(&tab, &mut GridUi::default(), 40, 6, false);
         assert!(matches!(
-            hits.at(ratatui::layout::Position::new(0, 0)),
+            hits.at(Position::new(0, 0)),
             Some(Target::GridHeader { col: 0 })
         ));
     }

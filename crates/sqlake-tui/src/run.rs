@@ -23,7 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
-use sqlake_app::snapshot::{ConnStatus, Snapshot};
+use sqlake_app::snapshot::{ConnStatus, ConnectionView, Snapshot};
 use sqlake_app::store::Store;
 use tokio::sync::watch;
 
@@ -320,8 +320,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         // capability rather than a branch on which driver it is.
         let sortable = snapshot
             .connection(conn)
-            .and_then(|c| c.capabilities)
-            .is_some_and(|c| c.sortable_preview);
+            .is_some_and(ConnectionView::can_sort_preview);
         datagrid::render(frame, hits, grid, preview, ui.grid_mut(id), sortable);
     }
 
