@@ -322,6 +322,25 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
             .connection(conn)
             .is_some_and(ConnectionView::can_sort_preview);
         datagrid::render(frame, hits, grid, preview, ui.grid_mut(id), sortable);
+
+        // Built from the value rather than from the cell the grid drew: the
+        // grid clamps at `MAX_CELL_CHARS` and writes `{2 keys}` for a
+        // document, which is what somebody opening this pane is trying to see
+        // past.
+        if frames.detail.height > 0 {
+            let ui_grid = ui.grid(id);
+            let detail = ui_grid.and_then(|g| {
+                let rendered = g.rendered()?;
+                let value = rendered.raw(g.row, g.col)?;
+                let column = rendered.columns().get(g.col)?;
+                Some(crate::detail::RenderedDetail::of(
+                    &column.name,
+                    &column.type_name,
+                    value,
+                ))
+            });
+            crate::detail::render(frame, frames.detail, detail.as_ref(), 0);
+        }
     }
 
     chrome::status_bar(frame, hits, frames.status_bar, snapshot);

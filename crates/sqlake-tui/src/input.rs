@@ -172,6 +172,13 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::EvenSplit,
     },
     KeyBinding {
+        // In the grid, where the cell it shows is chosen. `Enter` because it
+        // reads as "look at this one", and it is not otherwise bound there.
+        keys: &[KeyCombo::new(KeyCode::Enter)],
+        context: Context::Grid,
+        kind: IntentKind::ToggleDetail,
+    },
+    KeyBinding {
         keys: &[KeyCombo::new(KeyCode::Esc)],
         context: Context::Modal,
         kind: IntentKind::DismissModal,
@@ -724,6 +731,13 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .into(),
         ],
         IntentKind::EvenSplit => vec![ViewCmd::EvenSplit(SplitId::Explorer).into()],
+        // Nothing to show in full when there is no grid to have chosen a cell
+        // in, and a pane opening onto "no cell selected" is a gesture that
+        // appeared to do something.
+        IntentKind::ToggleDetail => ctx
+            .active_tab
+            .map(|_| vec![ViewCmd::ToggleDetail.into()])
+            .unwrap_or_default(),
         IntentKind::DismissModal => vec![ViewCmd::DismissModal.into()],
         IntentKind::Filter => vec![ViewCmd::SetFilter(next_filter(event, ctx)).into()],
 

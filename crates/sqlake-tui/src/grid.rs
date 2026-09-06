@@ -35,7 +35,7 @@ const MAX_WIDTH: u16 = 60;
 
 /// Longest cell text kept before truncating. Guards against a single 1MB text
 /// value being measured character by character on every frame.
-const MAX_CELL_CHARS: usize = 512;
+pub(crate) const MAX_CELL_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -322,6 +322,27 @@ pub(crate) fn sanitise(s: &str) -> String {
         }
     }
     out
+}
+
+/// The same protection, for somewhere with room.
+///
+/// A newline and a tab are kept: they break a grid row apart, which is why the
+/// cell version escapes them, but the detail pane has lines to spare and an
+/// escaped newline there is the thing standing between a reader and the value.
+/// Everything that would repaint or reorder the screen is still replaced, and
+/// nothing is clamped — being unclamped is the whole point of the pane.
+pub(crate) fn sanitise_unbounded(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' {
+                c
+            } else if c.is_control() || is_bidi_control(c) {
+                '·'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Terminal columns occupied, which is not the character count.

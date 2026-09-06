@@ -23,12 +23,21 @@ use crate::ui::{MIN_PANE_WIDTH, UiState};
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 20;
 
+/// Rows the grid keeps whatever else wants room.
+///
+/// A header and a handful of rows. Below this the detail pane is not shown at
+/// all: a grid squeezed to its header is not a grid, and the cell being
+/// examined is chosen from it.
+pub(crate) const MIN_GRID_HEIGHT: u16 = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frames {
     pub tab_bar: Rect,
     pub explorer: Rect,
     pub splitter: Rect,
     pub grid: Rect,
+    /// Under the grid, and zero-height when there is not room for both.
+    pub detail: Rect,
     pub status_bar: Rect,
 }
 
@@ -47,18 +56,30 @@ pub fn layout(area: Rect, ui: &mut UiState) -> Frames {
     .areas(area);
 
     let explorer_width = ui.explorer_width(area.width);
-    let [explorer, splitter, grid] = Layout::horizontal([
+    let [explorer, splitter, right] = Layout::horizontal([
         Constraint::Length(explorer_width),
         Constraint::Length(1),
         Constraint::Min(MIN_PANE_WIDTH),
     ])
     .areas(body);
 
+    // The detail pane takes from the grid rather than from the screen, and
+    // only when the grid can spare it: on a short terminal the rows are what
+    // somebody is looking at, and a pane that squeezed them to two would cost
+    // more than it showed.
+    let detail_height = ui.detail_height(right.height);
+    let [grid, detail] = Layout::vertical([
+        Constraint::Min(MIN_GRID_HEIGHT),
+        Constraint::Length(detail_height),
+    ])
+    .areas(right);
+
     Frames {
         tab_bar,
         explorer,
         splitter,
         grid,
+        detail,
         status_bar,
     }
 }
@@ -312,6 +333,48 @@ pub(crate) fn fit(text: &str, max: u16) -> String {
     }
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod detail_layout_tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_pane_takes_nothing() {
+        let mut ui = UiState::new();
+        let frames = layout(Rect::new(0, 0, 100, 30), &mut ui);
+        assert_eq!(frames.detail.height, 0);
+        assert!(frames.grid.height > 0);
+    }
+
+    #[test]
+    fn an_open_pane_takes_from_the_grid_and_not_from_the_screen() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut ui = UiState::new();
+        let before = layout(area, &mut ui).grid.height;
+        ui.toggle_detail();
+        let frames = layout(area, &mut ui);
+        assert!(frames.detail.height > 0);
+        assert_eq!(
+            frames.grid.height + frames.detail.height,
+            before,
+            "the pane came from somewhere other than the grid"
+        );
+    }
+
+    #[test]
+    fn the_grid_keeps_its_minimum_on_a_short_terminal() {
+        // The cell being read is chosen in the grid, so a grid squeezed to its
+        // header cannot be used to choose one.
+        let mut ui = UiState::new();
+        ui.toggle_detail();
+        let frames = layout(Rect::new(0, 0, 100, MIN_HEIGHT), &mut ui);
+        assert!(
+            frames.grid.height >= MIN_GRID_HEIGHT,
+            "the grid was squeezed below what it needs: {}",
+            frames.grid.height
+        );
+    }
 }
 
 #[cfg(test)]

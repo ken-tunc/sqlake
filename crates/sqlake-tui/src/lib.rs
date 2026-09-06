@@ -13,6 +13,7 @@
 
 pub mod chrome;
 pub mod datagrid;
+pub mod detail;
 pub mod grid;
 pub mod hit;
 pub mod input;

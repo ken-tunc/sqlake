@@ -29,6 +29,7 @@ use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, TabId};
 use sqlake_core::node::TableRef;
 
+use crate::chrome::MIN_GRID_HEIGHT;
 use crate::grid::RenderedGrid;
 use crate::hit::{PaneId, SplitId, Target, ToastId};
 use crate::intent::ViewCmd;
@@ -100,6 +101,13 @@ const DEFAULT_EXPLORER_PERMILLE: u32 = 280;
 /// tall terminal that would exceed a page and ask before the previous page had
 /// anywhere to go.
 const LOAD_MARGIN_ROWS: usize = 20;
+
+/// Rows the detail pane opens at.
+///
+/// Enough for a small document without taking the grid over. It is resizable
+/// from there, which is what makes the default a starting point rather than a
+/// judgement about how big a value is.
+const DEFAULT_DETAIL_HEIGHT: u16 = 8;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TreeUi {
@@ -210,6 +218,12 @@ pub struct UiState {
     /// not raise it again — only a *new* message does.
     reported_preview_errors: HashMap<(ConnId, TableRef), String>,
     grids: HashMap<TabId, GridUi>,
+    /// How tall the detail pane is, or `None` while it is closed.
+    ///
+    /// View state like the splitter: which cell is being read closely is one
+    /// person's question, and a caller reading the same snapshot through
+    /// `sqlake-api` has the value already.
+    detail_height: Option<u16>,
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
     explorer_width: Option<u16>,
@@ -275,6 +289,34 @@ impl UiState {
         // On a screen too narrow for both, the explorer is the one that yields.
         let ceiling = total.saturating_sub(MIN_PANE_WIDTH + 1);
         wanted.clamp(MIN_PANE_WIDTH.min(ceiling), ceiling)
+    }
+
+    /// How many rows the detail pane gets, which is none when it is closed or
+    /// when the grid cannot spare them.
+    #[must_use]
+    pub fn detail_height(&self, total: u16) -> u16 {
+        let Some(wanted) = self.detail_height else {
+            return 0;
+        };
+        // The grid keeps its minimum whatever this asks for. Below that the
+        // pane is not shown rather than shown small: the cell being read is
+        // chosen in the grid, and a grid squeezed to its header cannot be used
+        // to choose one.
+        let ceiling = total.saturating_sub(MIN_GRID_HEIGHT);
+        wanted.min(ceiling)
+    }
+
+    #[must_use]
+    pub fn detail_open(&self) -> bool {
+        self.detail_height.is_some()
+    }
+
+    /// Open or close the pane.
+    pub fn toggle_detail(&mut self) {
+        self.detail_height = match self.detail_height {
+            Some(_) => None,
+            None => Some(DEFAULT_DETAIL_HEIGHT),
+        };
     }
 
     /// Turn a new `last_error` on one of this screen's open previews into a
@@ -426,6 +468,7 @@ impl UiState {
                 self.explorer_width = None;
             }
 
+            ViewCmd::ToggleDetail => self.toggle_detail(),
             ViewCmd::DismissModal => self.modal = None,
 
             // A relation already open is raised, not duplicated — the same
