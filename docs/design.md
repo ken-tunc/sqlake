@@ -405,7 +405,7 @@ asks about — the reasoning is in `tests/conformance.rs`.
 | **M0 — Foundation** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M1 — Connection management** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M2 — Table list** ✅ | — | Done. `crates/` and `git log` are the record |
-| **M3** | Table preview (feature 3) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
+| **M3** | Table preview (feature 3) — [design-m3.md](design-m3.md) | Paging, sorting, cell detail, range selection, CSV/JSON copy via OSC 52, context menu |
 | **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
 | **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
