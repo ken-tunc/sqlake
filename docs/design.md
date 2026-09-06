@@ -164,17 +164,17 @@ cell-detail pane under it — with the SQL and definition tabs arriving in M4 an
 
 ## 6. Mouse and keyboard
 
-`KEYMAP` in `crates/sqlake-tui/src/input.rs` is the list of bindings, and the two coverage
-tests beside it are what keep it complete: one asserts that every capability reachable with
-the mouse has a key, the other that the key produces the capability it names. Adding a target
-or a gesture stops the crate compiling until it has a sample.
+`KEYMAP` in `crates/sqlake-tui/src/input.rs` is the list of bindings, and the coverage tests
+beside it are what keep it complete: one asserts that every capability reachable with the
+mouse has a key, another that the key produces the capability it names. Adding a target or a
+gesture stops the crate compiling until it has a sample.
 
-What that mechanism does not cover, because it has not been built:
+What that mechanism does not cover:
 
 - Mouse capture takes native text selection away from the terminal, so the status bar carries
-  a permanent hint ("Shift — or Option — + drag to select") and **OSC 52 copy** puts a cell, a
-  selection or a whole result on the clipboard through the terminal, which is what works over
-  SSH. `--no-mouse` disables capture entirely.
+  the hint "Shift (or Option) + drag to select text" whenever there is room for it, and
+  **OSC 52 copy** puts a cell, a selection or a whole result on the clipboard through the
+  terminal, which is what works over SSH. `--no-mouse` disables capture entirely.
 - Some terminals and tmux configurations cannot deliver right-click, so every context menu
   entry needs a key binding, and the menu itself does too — for those terminals it does not
   exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
@@ -326,7 +326,7 @@ masking lives in exactly one function and never reaches the log.
 - **`RECORD` and `REPEATED` are flattened for display only.** The driver decodes them as
   `Value::Struct` and `Value::Array`, because `sqlake-api` hands an agent the same values and
   a document is what it asked for. Dotted column names (`user.name`) and the nesting in the
-  nesting in the detail pane are the front-end's rendering of that.
+  detail pane are the front-end's rendering of that.
 
 ---
 
@@ -432,7 +432,7 @@ Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 �
 | --- | --- | --- |
 | Terminal state corrupted after returning from the external editor | unusable | One restore path, shared with the panic hook (`TerminalGuard`) |
 | `$EDITOR` is a GUI editor and returns immediately | annoyance | `editor_args` can supply a `--wait` equivalent; warn when the editor exits instantly |
-| Mouse capture steals native text selection | annoyance | OSC 52 copy as standard, a permanent hint about shift-drag, and `--no-mouse` |
+| Mouse capture steals native text selection | annoyance | OSC 52 copy as standard, a hint about shift-drag whenever the status bar has room, and `--no-mouse` |
 | Terminals and tmux configurations without right-click or hover | missing features | Every feature has a key binding, enforced by the coverage tests (§6) |
 | Too many staged types make the code verbose | velocity | Keep to the pipelines listed in §4.1; add a stage only when skipping it would cause a real accident |
 | BigQuery billing accident | real cost | `tabledata.list` for preview; `ApprovedQuery` enforced by the type system; `maximumBytesBilled` |

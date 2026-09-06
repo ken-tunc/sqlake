@@ -12,7 +12,8 @@ is reachable with the mouse, and every one of those actions also has a key bindi
 ## Try it
 
 ```sh
-cargo run                 # the first configured connection, or --mock for the built-in one
+cargo run -- --mock       # the built-in mock database, with no server to set up
+cargo run                 # the first connection in connections.toml
 cargo run -- --no-mouse   # when the terminal or tmux swallows mouse events
 
 # and without a terminal at all
@@ -22,10 +23,11 @@ cargo run -- --mock table preview public.users --limit 5
 Click a schema's `▸` to expand it, double-click a table to open it. `Tab` moves between the
 panes; `Space` and `Enter` do in the tree what a click and a double-click do. In the grid,
 `J`/`K` and `H`/`L` move the cell cursor and `Shift` with an arrow extends a selection; the
-arrows scroll, and scrolling towards the end fetches the next page. `s` sorts the selected
-column, `Enter` shows a cell in full, `y` copies the selection as CSV and `a` copies
-everything — shift on either for JSON. `.` opens the context menu, `q` quits. Anything
-reachable with the mouse has a key binding, and a test enforces it rather than a promise.
+arrows scroll, and scrolling towards the end fetches the next page — `m` asks for it outright.
+`s` sorts the selected column, `Enter` shows a cell in full, `y` copies the selection as CSV
+and `a` copies everything — shift on either for JSON. `.` opens the context menu, `q` quits.
+Anything reachable with the mouse has a key binding, and a test enforces it rather than a
+promise.
 
 Logs go to `$XDG_STATE_HOME/sqlake/sqlake.log` and never to the screen.
 
