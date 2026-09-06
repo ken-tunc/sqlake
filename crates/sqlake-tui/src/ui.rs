@@ -303,6 +303,12 @@ pub struct UiState {
     /// to go out through the writer the TUI already owns rather than a second
     /// thing reaching for stdout while the alternate screen is up.
     pending_copy: Option<String>,
+    /// The open context menu, if any. Screen state like the modal: which cell
+    /// somebody right-clicked is one person's gesture.
+    pub menu: Option<crate::menu::Menu>,
+    /// Where the pointer was last seen, so a gesture that opens something at it
+    /// has somewhere to open.
+    pub pointer: (u16, u16),
     /// `None` until the splitter is moved, so the default follows the terminal
     /// width instead of being frozen at whatever it was on the first frame.
     explorer_width: Option<u16>,
@@ -576,6 +582,10 @@ impl UiState {
                 self.explorer_width = None;
             }
 
+            ViewCmd::OpenMenu { at, ranged } => {
+                self.menu = Some(crate::menu::Menu::for_grid(at, ranged));
+            }
+            ViewCmd::CloseMenu => self.menu = None,
             ViewCmd::ToggleDetail => self.toggle_detail(),
             ViewCmd::Copy { format, all } => self.copy(format, all, snapshot),
             ViewCmd::DismissModal => self.modal = None,

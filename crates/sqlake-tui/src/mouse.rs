@@ -79,6 +79,9 @@ struct Press {
 
 #[derive(Debug, Default)]
 pub struct MouseState {
+    /// The last position any event reported, for a gesture that opens
+    /// something where the pointer is.
+    at: Position,
     pressed: Option<Press>,
     last_click: Option<(Target, Position, Instant)>,
     hover: Option<Target>,
@@ -88,6 +91,13 @@ impl MouseState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Where the pointer was last seen, for a gesture that opens something at
+    /// it.
+    #[must_use]
+    pub const fn position(&self) -> (u16, u16) {
+        (self.at.x, self.at.y)
     }
 
     /// What the pointer is currently over, if anything.
@@ -125,6 +135,7 @@ impl MouseState {
         map: &HitMap,
         now: Instant,
     ) -> Vec<(Target, Gesture)> {
+        self.at = Position::new(event.column, event.row);
         let position = Position::new(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.down(position, map),

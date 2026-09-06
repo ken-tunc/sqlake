@@ -101,6 +101,14 @@ pub enum ViewCmd {
     },
     EvenSplit(SplitId),
 
+    /// Open the context menu over a cell.
+    OpenMenu {
+        at: (u16, u16),
+        /// Whether more than one cell is selected, which is what the copy
+        /// entries are called after.
+        ranged: bool,
+    },
+    CloseMenu,
     /// Open or close the pane that shows one cell in full.
     ToggleDetail,
     /// Put the selection — or, with `all`, the whole result — on the clipboard.
@@ -161,6 +169,7 @@ intent_kinds! {
     ResizeColumn       => "change a column's width",
     MoveSplit          => "move the split between panes",
     EvenSplit          => "reset the split",
+    Menu               => "open the context menu",
     ToggleDetail       => "show a cell in full",
     Copy               => "copy cells to the clipboard",
     DismissModal       => "close the dialog",
@@ -206,6 +215,7 @@ impl IntentKind {
                 ViewCmd::ResizeColumn { .. } => Self::ResizeColumn,
                 ViewCmd::MoveSplit { .. } => Self::MoveSplit,
                 ViewCmd::EvenSplit(_) => Self::EvenSplit,
+                ViewCmd::OpenMenu { .. } | ViewCmd::CloseMenu => Self::Menu,
                 ViewCmd::ToggleDetail => Self::ToggleDetail,
                 ViewCmd::Copy { .. } => Self::Copy,
                 ViewCmd::DismissModal => Self::DismissModal,

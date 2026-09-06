@@ -125,6 +125,10 @@ pub enum Target {
 
     /// Everything behind a modal. Clicking it dismisses the modal instead of
     /// reaching what is underneath.
+    /// One line of the open context menu.
+    MenuItem {
+        index: usize,
+    },
     Backdrop,
     /// The dialog's own body.
     ///

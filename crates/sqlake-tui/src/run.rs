@@ -92,6 +92,7 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                         event, &hits, &mut mouse, &ui, &snapshot, mouse_enabled, &mut intents,
                     );
                     ui.hover = mouse.hovered();
+                    ui.pointer = mouse.position();
                 }
             },
             changed = snapshots.changed() => {
@@ -245,6 +246,13 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         snapshot,
         focus: ui.focus,
         modal_open: ui.modal.is_some(),
+        pointer: ui.pointer,
+        ranged_selection: ui
+            .active_tab
+            .and_then(|id| ui.grid(id))
+            .and_then(|g| g.selected_cells(ui.active_sort(snapshot)))
+            .is_some(),
+        menu: ui.menu.as_ref(),
         // The selected row's connection, falling back to the first: with
         // several open, `D` has to disconnect the one being looked at.
         connection: ui
@@ -379,6 +387,11 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     overlay::toasts(frame, hits, body_of(frames), &ui.toasts);
     if let Some(dialog) = ui.modal.clone() {
         overlay::modal(frame, hits, area, &dialog);
+    }
+    // Last, and at `Z_MENU`: a menu covers what it was opened over, and a click
+    // on it must not fall through to the cell underneath.
+    if let Some(menu) = ui.menu.clone() {
+        crate::menu::render(frame, hits, area, &menu);
     }
 }
 
