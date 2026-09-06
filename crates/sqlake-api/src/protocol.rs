@@ -176,6 +176,12 @@ pub enum Failure {
     /// The request was well-formed but asks for something this session cannot
     /// do — a sort on a driver whose preview cannot sort, say.
     Unsupported { message: String },
+    /// The line was not a request this build understands.
+    ///
+    /// Answered rather than dropped: a client whose request could not be parsed
+    /// would otherwise watch the socket go quiet and have to guess whether the
+    /// session had died.
+    Malformed { message: String },
 }
 
 /// What a caller is sent back.

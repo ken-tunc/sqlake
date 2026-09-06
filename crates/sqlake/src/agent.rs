@@ -8,11 +8,12 @@
 //! JSON goes to stdout and nothing else does. Diagnostics go to stderr, so a
 //! caller can pipe stdout into a parser without filtering prose out of it.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::{Args as ClapArgs, Subcommand};
-use sqlake_api::{Failure, Request, Response, Service};
+use sqlake_api::{ConnectionInfo, Failure, Request, Response, Service, Status};
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
 use sqlake_core::id::{ConnId, ProfileId};
@@ -150,27 +151,47 @@ impl Command {
         }
     }
 
-    /// Whether answering this needs a database at all.
+    /// What answering this needs, which differs by mode.
     ///
-    /// `api schema` describes the protocol, which is a fact about the build
-    /// rather than about a session. Opening a connection to print it would put
-    /// a keyring prompt in front of somebody asking what the commands are.
-    pub(crate) const fn needs_a_connection(&self) -> bool {
-        !matches!(
-            self,
+    /// One boolean cannot say it: `connection list` needs a connection to exist
+    /// in one-shot, because a store that just started has nothing to list, but
+    /// carries no connection id and needs no lookup when attached.
+    pub(crate) const fn needs(&self) -> Needs {
+        match self {
+            // The schema describes the build rather than a session. Opening a
+            // connection to print it would put a keyring prompt in front of
+            // somebody asking what the commands are.
             Self::Api {
-                what: ApiCommand::Schema
+                what: ApiCommand::Schema,
+            } => Needs::Nothing,
+            Self::Api {
+                what: ApiCommand::Snapshot,
             }
-        )
+            | Self::Connection {
+                what: ConnectionCommand::List,
+            } => Needs::Session,
+            Self::Schema { .. } | Self::Table { .. } => Needs::Connection,
+        }
     }
+}
+
+/// What a command has to have before it can be answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Needs {
+    /// Nothing at all: the answer is a fact about this build.
+    Nothing,
+    /// A session to ask. One-shot has to start one; attached already has one.
+    Session,
+    /// A particular connection, named in the request.
+    Connection,
 }
 
 /// A store with nothing to connect to.
 ///
-/// What a command that [needs no connection](Command::needs_a_connection) runs
-/// against. Reading the config to answer `api schema` would let a
-/// `connections.toml` that does not parse withhold the document describing how
-/// to write one — from the caller least able to guess.
+/// What a command that [needs nothing](Command::needs) runs against. Reading
+/// the config to answer `api schema` would let a `connections.toml` that does
+/// not parse withhold the document describing how to write one — from the
+/// caller least able to guess.
 #[derive(Debug)]
 pub(crate) struct NoProfiles;
 
@@ -196,19 +217,28 @@ pub(crate) fn run(
     profiles: Arc<dyn Profiles>,
     page_size: u32,
     connect: Option<ProfileId>,
+    session: Option<PathBuf>,
 ) -> Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let response = runtime.block_on(async {
-        let service = Service::new(Store::spawn(drivers, profiles, page_size));
-        let connection = if command.needs_a_connection() {
-            match open(service.store(), connect).await? {
-                Ok(connection) => connection,
-                Err(failure) => return anyhow::Ok(Response::Failed(failure)),
-            }
-        } else {
-            String::new()
-        };
-        anyhow::Ok(service.answer(&command.request(connection)).await)
+        // Attached first, because reusing a session is the whole reason the
+        // socket exists: its connections, its tunnels and its already-answered
+        // credential prompts are what a fresh store would have to pay for
+        // again — and for a profile that needs a person, cannot.
+        //
+        // Not for a command that needs nothing: `api schema` is generated from
+        // this build's types, so asking a session would describe whichever
+        // binary happens to be running it, and would hang behind a session
+        // that is wedged — for an answer this process already has.
+        if command.needs() != Needs::Nothing
+            && let Some(path) = session
+            && let Some(mut client) = sqlake_api::Client::attach(&path)
+                .await
+                .with_context(|| format!("reaching the session at {}", path.display()))?
+        {
+            return attached(&mut client, command, connect.as_ref()).await;
+        }
+        one_shot(command, drivers, profiles, page_size, connect).await
     });
     // The runtime goes without waiting for anything still resolving a profile,
     // for the reason in the doc comment above.
@@ -222,6 +252,93 @@ pub(crate) fn run(
     runtime.shutdown_background();
 
     print(&response)
+}
+
+/// Ask a session that is already running.
+///
+/// The connection is chosen here rather than named by the caller: a person
+/// opened it, so its id is something only the session knows. `--connect` picks
+/// among them by profile when more than one is open.
+async fn attached(
+    client: &mut sqlake_api::Client,
+    command: &Command,
+    connect: Option<&ProfileId>,
+) -> Result<Response> {
+    let connection = match command.needs() {
+        Needs::Nothing | Needs::Session => String::new(),
+        Needs::Connection => {
+            let open = match client.request(&Request::ConnectionList {}).await? {
+                Response::Connections(open) => open,
+                // The session answered something else, which is a protocol
+                // failure rather than this caller's to explain away.
+                other => return Ok(Response::Failed(unexpected(&other))),
+            };
+            match choose(&open, connect) {
+                Ok(id) => id,
+                Err(failure) => return Ok(Response::Failed(failure)),
+            }
+        }
+    };
+    client
+        .request(&command.request(connection))
+        .await
+        .context("asking the session")
+}
+
+/// Which of the session's connections to read through.
+///
+/// Split from the asking so the decision is testable without a socket: the
+/// asking is one request, and the choosing is the part with rules.
+fn choose(open: &[ConnectionInfo], connect: Option<&ProfileId>) -> Result<String, Failure> {
+    // Everything when nothing was named: a session with two connections open
+    // is ordinary, and narrowing that is what `--connect` is for.
+    let asked_for = |c: &&ConnectionInfo| connect.is_none_or(|p| c.profile == p.as_str());
+    // A ready one ahead of the rest, because a session whose first connection
+    // failed to open still has a working second: taking one by position alone
+    // would answer with that failure instead of with the database.
+    let chosen = open
+        .iter()
+        .find(|c| asked_for(c) && c.status == Status::Ready)
+        .or_else(|| open.iter().find(asked_for));
+    chosen.map(|c| c.id.clone()).ok_or_else(|| match connect {
+        // The id a caller could have meant is the profile it named, so that is
+        // what the failure carries. Which connections *are* open is one
+        // `connection list` away and does not belong in this answer.
+        Some(profile) => Failure::NoSuchConnection {
+            connection: profile.as_str().to_owned(),
+        },
+        // Not "no such connection": the session is reachable and has none, so
+        // there was never an id to get wrong.
+        None => Failure::Unsupported {
+            message: "the session has no connections open".to_owned(),
+        },
+    })
+}
+
+fn unexpected(response: &Response) -> Failure {
+    Failure::Malformed {
+        message: format!("the session answered a connection list with {response:?}"),
+    }
+}
+
+/// Start a store, answer one request, and drop it.
+async fn one_shot(
+    command: &Command,
+    drivers: Drivers,
+    profiles: Arc<dyn Profiles>,
+    page_size: u32,
+    connect: Option<ProfileId>,
+) -> Result<Response> {
+    let service = Service::new(Store::spawn(drivers, profiles, page_size));
+    let connection = if command.needs() == Needs::Nothing {
+        String::new()
+    } else {
+        match open(service.store(), connect).await? {
+            Ok(connection) => connection,
+            Err(failure) => return Ok(Response::Failed(failure)),
+        }
+    };
+    Ok(service.answer(&command.request(connection)).await)
 }
 
 /// Open the one connection a one-shot command reads through.
@@ -299,7 +416,7 @@ fn diagnostic(failure: &Failure) -> String {
                 "gave up after {waited_ms}ms. A profile that needs a prompt has to be opened in a session"
             )
         }
-        Failure::Unsupported { message } => message.clone(),
+        Failure::Unsupported { message } | Failure::Malformed { message } => message.clone(),
     }
 }
 
@@ -383,12 +500,82 @@ mod tests {
         }
     }
 
+    fn open(profiles: &[&str]) -> Vec<ConnectionInfo> {
+        profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| ConnectionInfo {
+                id: format!("id-{i}"),
+                profile: (*profile).to_owned(),
+                name: (*profile).to_owned(),
+                driver: "mock".into(),
+                status: sqlake_api::Status::Ready,
+                capabilities: None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn only_the_schema_is_answerable_without_a_database() {
-        assert!(!parse(&["api", "schema"]).needs_a_connection());
-        assert!(parse(&["api", "snapshot"]).needs_a_connection());
-        assert!(parse(&["connection", "list"]).needs_a_connection());
-        assert!(parse(&["table", "preview", "public.users"]).needs_a_connection());
+    fn a_session_with_one_connection_needs_no_choosing() {
+        assert_eq!(choose(&open(&["mock"]), None), Ok("id-0".into()));
+    }
+
+    #[test]
+    fn connect_picks_among_a_sessions_connections() {
+        // The point of `--connect` when attached: two databases open is
+        // ordinary, and the first is not always the one meant.
+        let open = open(&["staging", "prod"]);
+        let prod = ProfileId::parse("prod").expect("a usable id");
+        assert_eq!(choose(&open, Some(&prod)), Ok("id-1".into()));
+    }
+
+    #[test]
+    fn a_profile_the_session_has_not_opened_is_named_in_the_failure() {
+        let open = open(&["staging"]);
+        let prod = ProfileId::parse("prod").expect("a usable id");
+        assert_eq!(
+            choose(&open, Some(&prod)),
+            Err(Failure::NoSuchConnection {
+                connection: "prod".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_connection_that_failed_to_open_is_not_the_one_to_read_through() {
+        // A session opened with two profiles where the first could not
+        // connect: reading through it would answer with that failure, and the
+        // database next to it is right there.
+        let mut open = open(&["staging", "prod"]);
+        open[0].status = Status::Failed {
+            reason: "no route to host".into(),
+        };
+        assert_eq!(choose(&open, None), Ok("id-1".into()));
+    }
+
+    #[test]
+    fn a_session_with_nothing_open_is_not_a_wrong_id() {
+        // `NoSuchConnection` would send the caller looking for a typo in an id
+        // it never gave.
+        assert!(matches!(
+            choose(&open(&[]), None),
+            Err(Failure::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn what_a_command_needs_is_not_one_question() {
+        // `connection list` needs a connection to exist before one-shot has
+        // anything to report, and needs no id at all when attached. A single
+        // boolean answered one of those and got the other wrong.
+        assert_eq!(parse(&["api", "schema"]).needs(), Needs::Nothing);
+        assert_eq!(parse(&["api", "snapshot"]).needs(), Needs::Session);
+        assert_eq!(parse(&["connection", "list"]).needs(), Needs::Session);
+        assert_eq!(parse(&["schema", "list"]).needs(), Needs::Connection);
+        assert_eq!(
+            parse(&["table", "preview", "public.users"]).needs(),
+            Needs::Connection
+        );
     }
 
     #[test]
