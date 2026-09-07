@@ -219,6 +219,18 @@ async fn a_statement_the_server_refuses_is_an_error(
         !matches!(err, DriverError::Unsupported(_)),
         "{kind}: reported the server's refusal as the driver not supporting it: {err}"
     );
+
+    // Where, in lines and columns, whoever said it. A driver that passed the
+    // server's own offset through — or its `[3:15]` — would make the front-end
+    // ask which server this was, which is the one thing it must not have to.
+    let DriverError::Query { at: Some(at), .. } = err else {
+        panic!("{kind}: refused a statement without saying where: {err}");
+    };
+    let lines = u32::try_from(subject.broken_query.lines().count()).unwrap_or(u32::MAX);
+    assert!(
+        (1..=lines).contains(&at.line) && at.column >= 1,
+        "{kind}: {at} is not inside a statement of {lines} line(s)"
+    );
 }
 
 /// Giving up on a query leaves the connection usable.

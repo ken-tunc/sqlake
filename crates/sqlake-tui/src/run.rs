@@ -457,14 +457,21 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
             TabContent::Preview(_) => None,
         })
         .is_some_and(|q| q.data.ready().is_some());
-    if let Some((_, _, TabContent::Sql { text, .. })) = &active
+    if let Some((id, _, TabContent::Sql { text, .. })) = &active
         && !sql_rows
     {
         // The whole pane, not `body_area`: there is no header row and no
         // scrollbar column to leave out, because there is no grid.
         ui.set_viewport(PaneId::Grid, grid);
         ui.set_sql_lines(crate::sql::line_count(text));
-        crate::sql::render(frame, grid, text, ui.sql_offset());
+        // Where the *server* said, which is why nothing here works it out: the
+        // driver converted its own dialect's answer, and this crate names no
+        // driver.
+        let at = ui
+            .query_of(*id)
+            .and_then(|query| snapshot.query(query))
+            .and_then(|query| query.failed_at);
+        crate::sql::render(frame, grid, text, ui.sql_offset(), at);
     }
     if let Some((id, _, TabContent::Sql { .. })) = &active
         && sql_rows
@@ -1632,6 +1639,49 @@ mod tests {
             "{:?}",
             ui.modal
         );
+    }
+
+    #[tokio::test]
+    async fn screen_with_a_query_refused_on_its_second_line() {
+        // The whole of T7 on screen: the server said where, the driver turned
+        // that into a line, and nothing between here and it knows which server
+        // it was.
+        let (store, _) = connected_to(store_of(Behaviour {
+            failing_sql: vec!["sql_that_is_wrong".to_owned()],
+            ..Behaviour::instant()
+        }))
+        .await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let _ = ui.apply(crate::intent::ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+        let sql = "select\n  sql_that_is_wrong\nfrom public.users";
+        ui.set_buffer(tab, sql.to_owned());
+
+        let query = sqlake_core::id::QueryId::new();
+        ui.set_query(tab, query);
+        store.dispatch(Action::RunQuery {
+            conn,
+            query,
+            sql: sql.to_owned(),
+            max_rows: None,
+        });
+        until(&mut rx, |s| {
+            s.query(query).is_some_and(|q| q.data.error().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+        assert_eq!(
+            snap.query(query)
+                .and_then(|q| q.failed_at)
+                .map(|at| at.line),
+            Some(2)
+        );
+
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 20));
     }
 
     #[tokio::test]

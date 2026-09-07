@@ -6,14 +6,15 @@
 //! before agreeing to be charged.
 
 use gcp_bigquery_client::Client;
+use gcp_bigquery_client::error::BQError;
 use gcp_bigquery_client::model::query_request::QueryRequest;
 use gcp_bigquery_client::model::query_response::QueryResponse;
 use gcp_bigquery_client::model::table_field_schema::TableFieldSchema;
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
-use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use sqlake_core::sql::{ApprovedQuery, Estimate, Position, ValidatedSql};
 
-use crate::error::{driver_error, listing_failed};
+use crate::error::driver_error;
 use crate::value;
 
 /// The bytes the query would be billed for, without running it.
@@ -40,7 +41,7 @@ pub async fn estimate(
         .job()
         .query(project, request)
         .await
-        .map_err(listing_failed)?;
+        .map_err(refused)?;
 
     // Unknown rather than an error when the field is missing or unreadable: a
     // number this could not parse is a reason to say nothing about the cost,
@@ -78,7 +79,7 @@ pub async fn execute(
         .job()
         .query(project, request)
         .await
-        .map_err(listing_failed)?;
+        .map_err(refused)?;
 
     // A job that has not finished inside the synchronous call's own timeout
     // answers with no rows and `jobComplete: false`. Reporting that as an
@@ -94,12 +95,47 @@ pub async fn execute(
     if let Some(errors) = &response.errors
         && let Some(first) = errors.first()
     {
-        return Err(DriverError::Query(first.message.clone().unwrap_or_else(
-            || "the query failed and said nothing about why".to_owned(),
-        )));
+        let message = first
+            .message
+            .clone()
+            .unwrap_or_else(|| "the query failed and said nothing about why".to_owned());
+        let at = position_in(&message);
+        return Err(DriverError::Query { message, at });
     }
 
     Ok(result_set(&response))
+}
+
+/// The API refusing to run the statement.
+///
+/// Separate from `error::listing_failed`, which is the same `BQError` with
+/// nowhere to point: a refused statement arrives as an HTTP 400 whose message carries
+/// the position, and mapping it the same way as a failed `tables.list` would
+/// throw that away — which is what the `errors` array below does not, and the
+/// reason both paths exist.
+fn refused(err: BQError) -> DriverError {
+    let message = crate::error::describe(err);
+    let at = position_in(&message);
+    DriverError::Query { message, at }
+}
+
+/// BigQuery writes the position into the message, as `[line:column]`.
+///
+/// Read out of the text because that is the only place it is: the REST error
+/// has no field for it. The last one in the message rather than the first — a
+/// message quoting the statement can contain something that looks like a
+/// position, and the one BigQuery appends is at the end.
+///
+/// Doing it here rather than in a front-end is the rule `Capabilities` follows
+/// applied to errors: this crate knows its own dialect, and the UI must not
+/// have to.
+fn position_in(message: &str) -> Option<Position> {
+    let inside = message.rsplit_once('[')?.1.split_once(']')?.0;
+    let (line, column) = inside.split_once(':')?;
+    Some(Position::new(
+        line.trim().parse().ok()?,
+        column.trim().parse().ok()?,
+    ))
 }
 
 fn result_set(response: &QueryResponse) -> ResultSet {
@@ -180,6 +216,35 @@ mod tests {
                 serde_json::json!({ "totalBytesProcessed": "lots" })
             )),
             None
+        );
+    }
+
+    #[test]
+    fn a_position_is_read_out_of_the_message_because_that_is_where_it_is() {
+        assert_eq!(
+            position_in("Unrecognized name: nope at [3:15]"),
+            Some(Position::new(3, 15))
+        );
+        assert_eq!(
+            position_in("Syntax error: Unexpected end of script at [1:9]"),
+            Some(Position::new(1, 9))
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_position_in_it_has_none() {
+        assert_eq!(position_in("Access Denied: Table t"), None);
+        assert_eq!(position_in("something [not a position]"), None);
+        assert_eq!(position_in("half a position [3:]"), None);
+    }
+
+    #[test]
+    fn the_position_taken_is_the_one_bigquery_appended() {
+        // A message quoting the statement can contain something shaped like a
+        // position, and BigQuery's own is the last thing in the line.
+        assert_eq!(
+            position_in("Invalid array subscript a[1:2] at [4:9]"),
+            Some(Position::new(4, 9))
         );
     }
 

@@ -10,7 +10,7 @@ use crate::capability::{Capabilities, DriverKind};
 use crate::node::{NodeRef, TableRef, TreeNode};
 use crate::profile::ResolvedProfile;
 use crate::result::{PageRequest, ResultSet};
-use crate::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use crate::sql::{ApprovedQuery, Estimate, Position, ValidatedSql};
 
 pub type DriverResult<T> = Result<T, DriverError>;
 
@@ -22,8 +22,16 @@ pub enum DriverError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    #[error("query failed: {0}")]
-    Query(String),
+    /// The server refused or failed a statement.
+    ///
+    /// `at` is where in the statement, when the server said — one field with
+    /// an `Option` rather than a second variant, because "did this query fail"
+    /// is a question a caller should not have to ask twice.
+    #[error("query failed: {message}")]
+    Query {
+        message: String,
+        at: Option<Position>,
+    },
 
     /// The driver does not implement this operation. Reaching this is a bug in
     /// the caller: [`Capabilities`] should have prevented the call.
@@ -38,11 +46,20 @@ pub enum DriverError {
 }
 
 impl DriverError {
+    /// A query failure with nowhere to point, which is most of them: only a
+    /// syntax error has a position, and only the driver can work out where.
+    pub fn query(message: impl Into<String>) -> Self {
+        Self::Query {
+            message: message.into(),
+            at: None,
+        }
+    }
+
     /// Whether retrying the same call could plausibly succeed. Used to decide
     /// between offering a retry and reporting a dead end.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Connect(_) | Self::Query(_) | Self::Other(_))
+        matches!(self, Self::Connect(_) | Self::Query { .. } | Self::Other(_))
     }
 }
 
@@ -121,6 +138,7 @@ mod tests {
     #[test]
     fn only_transient_failures_are_retryable() {
         assert!(DriverError::Connect("refused".into()).is_retryable());
+        assert!(DriverError::query("deadlock").is_retryable());
         assert!(!DriverError::NotFound("x".into()).is_retryable());
         assert!(!DriverError::Unsupported("triggers".into()).is_retryable());
         assert!(!DriverError::Cancelled.is_retryable());

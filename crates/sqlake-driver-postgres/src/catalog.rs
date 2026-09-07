@@ -117,7 +117,7 @@ fn relation_kind(relkind: i8) -> RelationKind {
 }
 
 fn query(err: tokio_postgres::Error) -> sqlake_core::driver::DriverError {
-    sqlake_core::driver::DriverError::Query(crate::describe(&err))
+    sqlake_core::driver::DriverError::query(crate::describe(&err))
 }
 
 #[cfg(test)]

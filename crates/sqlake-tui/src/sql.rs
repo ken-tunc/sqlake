@@ -11,8 +11,10 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+
+use sqlake_core::sql::Position;
 
 use crate::grid::sanitise;
 
@@ -24,8 +26,10 @@ use crate::grid::sanitise;
 const EMPTY: &str = "Press e to write a query.";
 
 /// `offset` is the first line drawn, so a buffer longer than the pane can be
-/// scrolled through the same way everything else is.
-pub fn render(frame: &mut Frame<'_>, area: Rect, text: &str, offset: usize) {
+/// scrolled through the same way everything else is. `at` is where the server
+/// said the statement was wrong, which is why lines are cut here and never
+/// wrapped: a wrapped line makes "line 3" mean two different things.
+pub fn render(frame: &mut Frame<'_>, area: Rect, text: &str, offset: usize, at: Option<Position>) {
     if area.height == 0 {
         return;
     }
@@ -39,12 +43,29 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, text: &str, offset: usize) {
     }
 
     // Cut to the pane rather than wrapped: a wrapped line makes "line 3" mean
-    // two different things, and line 3 is what an error is about to point at.
+    // two different things, and line 3 is what an error points at.
+    let bad = at.map(|at| at.line as usize);
     let lines: Vec<Line<'_>> = text
         .lines()
+        .enumerate()
         .skip(offset)
         .take(area.height as usize)
-        .map(|line| Line::from(sanitise(line)))
+        .map(|(index, line)| {
+            let line = sanitise(line);
+            // The whole line, not the column. A column is a guess about where
+            // the mistake starts — the server reports where it *stopped
+            // understanding*, which is usually just after it — and a caret
+            // under the wrong character reads as a claim the line does not
+            // make.
+            if bad == Some(index + 1) {
+                Line::from(Span::styled(
+                    line,
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(line)
+            }
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -64,11 +85,52 @@ mod tests {
     use super::*;
 
     fn drawn(text: &str, offset: usize, height: u16) -> String {
+        marked(text, offset, height, None).0
+    }
+
+    /// The screen, and which of its lines were drawn in the error style.
+    fn marked(
+        text: &str,
+        offset: usize,
+        height: u16,
+        at: Option<Position>,
+    ) -> (String, Vec<usize>) {
         let mut terminal = Terminal::new(TestBackend::new(30, height)).unwrap();
         terminal
-            .draw(|frame| render(frame, frame.area(), text, offset))
+            .draw(|frame| render(frame, frame.area(), text, offset, at))
             .unwrap();
-        terminal.backend().to_string()
+        let buffer = terminal.backend().buffer();
+        let flagged = (0..height)
+            .filter(|y| buffer[(0, *y)].style().fg == Some(Color::Red))
+            .map(|y| y as usize)
+            .collect();
+        (terminal.backend().to_string(), flagged)
+    }
+
+    #[test]
+    fn the_line_the_server_named_is_the_one_marked() {
+        let text = "select\n  nope\nfrom t";
+        let (_, flagged) = marked(text, 0, 3, Some(Position::new(2, 3)));
+        assert_eq!(flagged, [1], "row 1 on screen is line 2 of the buffer");
+
+        // And scrolled, the marker moves with the text rather than staying on
+        // the row it was drawn at.
+        let (_, flagged) = marked(text, 1, 3, Some(Position::new(2, 3)));
+        assert_eq!(flagged, [0]);
+    }
+
+    #[test]
+    fn a_position_off_the_screen_marks_nothing_rather_than_the_wrong_line() {
+        let text = "select\n  nope\nfrom t";
+        let (_, flagged) = marked(text, 0, 3, Some(Position::new(9, 1)));
+        assert!(flagged.is_empty(), "{flagged:?}");
+    }
+
+    #[test]
+    fn a_failure_with_nowhere_to_point_marks_nothing() {
+        let text = "select\n  nope\nfrom t";
+        let (_, flagged) = marked(text, 0, 3, None);
+        assert!(flagged.is_empty(), "{flagged:?}");
     }
 
     #[test]

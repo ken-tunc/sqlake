@@ -60,9 +60,9 @@ async fn the_postgres_driver_conforms() {
         relation: TableRef::new([DATABASE, "public", "users"]),
         missing: TableRef::new([DATABASE, "public", "no_such_relation"]),
         query: "select * from public.users order by id".to_owned(),
-        // Refused at plan time, so `EXPLAIN` is where PostgreSQL says no —
-        // which is the half of the case this driver exercises.
-        broken_query: "select no_such_column from public.users".to_owned(),
+        // Over three lines, so the position the suite checks is about a line
+        // rather than always the first one.
+        broken_query: "select\n  no_such_column\nfrom public.users".to_owned(),
     })
     .await;
 }

@@ -790,6 +790,7 @@ impl Runtime {
             estimate: None,
             needs_approval: None,
             data: LoadState::Loading,
+            failed_at: None,
         });
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running a query");
@@ -854,6 +855,7 @@ impl Runtime {
         let Some(query) = self.queries.iter_mut().find(|q| q.id == id) else {
             return;
         };
+        query.failed_at = None;
         match result {
             Ok(RunQueryOutput::Ran { estimate, result }) => {
                 query.estimate = Some(estimate);
@@ -868,7 +870,10 @@ impl Runtime {
                 // until somebody says yes.
                 query.data = LoadState::Idle;
             }
-            Err(err) => query.data = LoadState::Failed(err.user_message()),
+            Err(err) => {
+                query.failed_at = err.at();
+                query.data = LoadState::Failed(err.user_message());
+            }
         }
     }
 

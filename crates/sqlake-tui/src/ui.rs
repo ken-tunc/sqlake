@@ -1352,6 +1352,7 @@ mod tests {
                 budget: 1_000_000_000,
             })),
             data: LoadState::Idle,
+            failed_at: None,
         }
     }
 
@@ -2166,6 +2167,7 @@ mod tests {
             estimate: None,
             needs_approval: None,
             data: LoadState::Ready(rows(4, 2)),
+            failed_at: None,
         });
         assert_eq!(ui.rows_of(&snap).map(|r| r.row_count()), Some(4));
     }
@@ -2189,6 +2191,7 @@ mod tests {
             estimate: None,
             needs_approval: None,
             data: LoadState::Failed("no such column: nope".to_owned()),
+            failed_at: None,
         });
 
         ui.raise_query_errors(&snap);

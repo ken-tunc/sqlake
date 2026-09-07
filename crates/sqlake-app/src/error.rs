@@ -36,6 +36,19 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Where in the statement, when the driver worked it out.
+    ///
+    /// Only a query failure has one, and only for the statement that was sent
+    /// — which is why it travels on the error rather than being derived from
+    /// the text afterwards.
+    #[must_use]
+    pub const fn at(&self) -> Option<sqlake_core::sql::Position> {
+        match self {
+            Self::Driver(DriverError::Query { at, .. }) => *at,
+            _ => None,
+        }
+    }
+
     /// The single-line form a front-end shows next to whatever failed.
     #[must_use]
     pub fn user_message(&self) -> String {

@@ -41,7 +41,7 @@ pub async fn preview(
     let statement = client
         .prepare(&text)
         .await
-        .map_err(|err| DriverError::Query(crate::describe(&err)))?;
+        .map_err(|err| DriverError::query(crate::describe(&err)))?;
 
     let columns = statement
         .columns()
@@ -62,7 +62,7 @@ pub async fn preview(
     let rows: Vec<Row> = client
         .query(&statement, &[&limit, &offset])
         .await
-        .map_err(|err| DriverError::Query(crate::describe(&err)))?
+        .map_err(|err| DriverError::query(crate::describe(&err)))?
         .iter()
         .map(|row| {
             (0..row.len())

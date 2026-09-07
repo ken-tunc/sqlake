@@ -62,6 +62,8 @@ fn subject(driver: MockDriver) -> Subject {
         relation: TableRef::new(["public", "users"]),
         missing: TableRef::new(["public", "no_such_relation"]),
         query: "select * from public.users".to_owned(),
-        broken_query: format!("select {WRONG} from public.users"),
+        // Over three lines, so the position the suite checks is about a line
+        // rather than always the first one.
+        broken_query: format!("select\n  {WRONG}\nfrom public.users"),
     }
 }
