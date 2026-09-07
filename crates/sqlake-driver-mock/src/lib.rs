@@ -624,6 +624,9 @@ impl Session for MockSession {
         tokio::time::sleep(self.behaviour.query_latency).await;
         let text = query.text();
         if let Some(marker) = self.behaviour.refuses(text) {
+            // A refusal is an answer, not an abandonment: leaving it armed
+            // would count every failing query as a cancelled one.
+            running.finished();
             return Err(syntax_error(text, marker));
         }
 

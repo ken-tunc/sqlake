@@ -9,6 +9,7 @@ use futures::{StreamExt as _, pin_mut};
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
 use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use tokio::sync::OwnedMutexGuard;
 use tokio_postgres::{CancelToken, Client};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -75,6 +76,11 @@ fn total_cost(plan: &serde_json::Value) -> Option<f64> {
 struct StopsTheQuery {
     token: Option<CancelToken>,
     tls: Option<tls::Verification>,
+    /// The connection's lock, handed to the cancel request so that the next
+    /// call on this connection waits for it. A cancel names the backend rather
+    /// than the statement, so one still opening its socket when the next query
+    /// starts would cancel *that*.
+    running: Option<OwnedMutexGuard<()>>,
 }
 
 impl Drop for StopsTheQuery {
@@ -83,6 +89,7 @@ impl Drop for StopsTheQuery {
             return;
         };
         let tls = self.tls;
+        let running = self.running.take();
         // Spawned, because `Drop` cannot await. A runtime already shutting
         // down refuses it, and there is nothing useful to do about that: the
         // process is going, and the server drops the query with the socket.
@@ -90,6 +97,10 @@ impl Drop for StopsTheQuery {
             return;
         }
         tokio::spawn(async move {
+            // Dropped at the end of this task, not before: holding it is what
+            // makes the next caller wait. The connect is bounded by the
+            // profile's `connect_timeout`, so the wait is too.
+            let _running = running;
             // The connection this goes down has to be secured the same way the
             // first one was: a server requiring TLS refuses a plaintext cancel
             // request, and one that is not expecting TLS refuses the handshake.
@@ -124,6 +135,7 @@ impl StopsTheQuery {
 pub async fn execute(
     client: &Client,
     tls: Option<tls::Verification>,
+    running: OwnedMutexGuard<()>,
     query: &ApprovedQuery,
 ) -> DriverResult<ResultSet> {
     // Prepared first, so the columns come from the *statement*. Reading them
@@ -160,6 +172,7 @@ pub async fn execute(
     let mut guard = StopsTheQuery {
         token: Some(client.cancel_token()),
         tls,
+        running: Some(running),
     };
 
     let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
@@ -178,7 +191,8 @@ pub async fn execute(
         );
     }
 
-    // Every row that is coming has arrived, so there is nothing left to stop.
+    // Nobody is waiting on this statement any more — every row that was asked
+    // for has arrived, and under a cap the rest are drained with the stream.
     // A failure inside the loop above leaves it armed, which sends a request
     // the server ignores — the alternative is deciding whether each error
     // means the statement ended, which is a question only the server can

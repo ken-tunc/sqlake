@@ -275,22 +275,15 @@ async fn until_gone(client: &tokio_postgres::Client) {
     panic!("a connection was still open five seconds after it should have gone");
 }
 
-/// `None` when there is no Docker to talk to.
-///
-/// # Panics
-///
-/// When `SQLAKE_REQUIRE_DOCKER` is set, because then the absence is the
-/// failure: a CI run that quietly skips this suite is a CI run that proves
-/// nothing about the driver.
+/// Recognisable in `pg_stat_activity`, and in nothing else that runs here.
+const MARKER: &str = "sqlake_cancel_probe";
+
 /// Abandoning a query stops it *at the server*, not just here.
 ///
 /// The one case that cannot be written against a fixture: what it asserts is
 /// what a second connection can see about the first, and only a real backend
 /// has an opinion about that. `Capabilities::cancel` is a claim about this and
 /// nothing else.
-/// Recognisable in `pg_stat_activity`, and in nothing else that runs here.
-const MARKER: &str = "sqlake_cancel_probe";
-
 #[tokio::test]
 async fn abandoning_a_query_stops_it_at_the_server() {
     use std::future::Future as _;
@@ -343,7 +336,17 @@ async fn abandoning_a_query_stops_it_at_the_server() {
         let mut started = false;
         for _ in 0..100 {
             let _ = running_query.as_mut().poll(&mut cx);
+            // Kept polling for a few more turns after the server picks the
+            // query up: the messages are pipelined, so the backend can be
+            // executing while this side has not yet read that the bind
+            // succeeded — and stopping at the first sighting would leave the
+            // future somewhere it never is in the running client, where the
+            // actor polls it continuously.
             if running().await > 0 {
+                for _ in 0..10 {
+                    let _ = running_query.as_mut().poll(&mut cx);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 started = true;
                 break;
             }
@@ -363,6 +366,13 @@ async fn abandoning_a_query_stops_it_at_the_server() {
     panic!("the server is still running the query five seconds after it was abandoned");
 }
 
+/// `None` when there is no Docker to talk to.
+///
+/// # Panics
+///
+/// When `SQLAKE_REQUIRE_DOCKER` is set, because then the absence is the
+/// failure: a CI run that quietly skips this suite is a CI run that proves
+/// nothing about the driver.
 async fn start() -> Option<testcontainers::ContainerAsync<Postgres>> {
     match Postgres::default().start().await {
         Ok(container) => Some(container),
