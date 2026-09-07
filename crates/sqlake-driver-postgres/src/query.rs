@@ -156,6 +156,18 @@ pub async fn execute(
         .map(|column| Column::new(column.name(), column.type_().name(), true))
         .collect();
 
+    // Armed *before* the statement goes out, not after the await that sends
+    // it: Bind, Execute and Sync are pipelined, so the server can already be
+    // running the query while this side is still waiting to hear that the bind
+    // succeeded. A guard armed after that await is unarmed for part of the
+    // window it exists for. The cost of arming early is at most a cancel
+    // request for a query that never ran, which the server ignores.
+    let mut guard = StopsTheQuery {
+        token: Some(client.cancel_token()),
+        tls,
+        running: Some(running),
+    };
+
     // `query_raw` rather than `query`: it streams, so a cap of fifty on a
     // statement matching a million rows stops after fifty instead of
     // materialising the lot and throwing most of it away.
@@ -164,16 +176,6 @@ pub async fn execute(
         .await
         .map_err(|err| DriverError::Query(crate::describe(&err)))?;
     pin_mut!(stream);
-
-    // Armed here rather than at the top: this is the window in which a query
-    // is actually running on the server. A failure before it has nothing to
-    // cancel, and a cancel request sent for one would be a second connection
-    // opened to say nothing.
-    let mut guard = StopsTheQuery {
-        token: Some(client.cancel_token()),
-        tls,
-        running: Some(running),
-    };
 
     let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
     let mut rows: Vec<Row> = Vec::new();

@@ -163,16 +163,19 @@ async fn run(session: Box<dyn Session>, mut rx: mpsc::Receiver<SessionCmd>) {
                 cancel,
             } => {
                 tokio::select! {
-                    result = session.execute(&query) => {
-                        let _ = reply.send(result);
-                    }
+                    // Biased, so a caller that gave up while this command sat
+                    // in the queue behind another one never reaches the driver
+                    // at all. Left to chance, half of those send a statement to
+                    // the server before the cancel branch is looked at.
+                    biased;
                     // The caller is gone. Falling out of the select drops the
                     // driver's future half-way through its call, which is the
-                    // signal a driver turns into a cancel request of its own —
-                    // and the actor is free again immediately, which is the
-                    // point.
+                    // signal a driver turns into a cancel request of its own.
                     _ = cancel => {
                         tracing::debug!("a query was abandoned; the driver is being unwound");
+                    }
+                    result = session.execute(&query) => {
+                        let _ = reply.send(result);
                     }
                 }
             }

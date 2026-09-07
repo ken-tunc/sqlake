@@ -74,6 +74,14 @@ async fn the_tree_shows_what_a_person_would_look_for() {
     use sqlake_core::driver::Driver as _;
     use sqlake_core::node::{NodeKind, NodeRef, RelationKind};
 
+    // The cancel path says what it did through `tracing` and nowhere else, so
+    // without this a request that was refused and one that was never sent look
+    // identical in a failure.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
     let Some(container) = start().await else {
         return;
     };
@@ -291,6 +299,14 @@ async fn abandoning_a_query_stops_it_at_the_server() {
     use sqlake_core::capability::Escaping;
     use sqlake_core::driver::Driver as _;
     use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
+
+    // The cancel path says what it did through `tracing` and nowhere else, so
+    // without this a request that was refused and one that was never sent look
+    // identical in a failure.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
 
     let Some(container) = start().await else {
         return;
