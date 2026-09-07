@@ -2608,6 +2608,7 @@ mod tests {
             Target::Button(ButtonId::DismissModal),
             Target::Button(ButtonId::NewSqlTab),
             Target::Button(ButtonId::RunQuery),
+            Target::Button(ButtonId::ModalChoice { index: 0 }),
         ],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],
@@ -2832,10 +2833,18 @@ mod tests {
         for focus in [PaneId::Explorer, PaneId::Grid] {
             for selection in [Some(0), Some(1)] {
                 for open in [None, Some(&menu)] {
-                    let mut c = f.ctx(focus);
-                    c.tree_selection = selection;
-                    c.menu = open;
-                    contexts.push(c);
+                    // A dialog with an answer on it, for the same reason the
+                    // menu is opened: a `ModalChoice` resolves to nothing
+                    // without one, and the sweep would pass while proving
+                    // nothing about the dialog's buttons at all.
+                    for asking in [None, Some(&f.asking)] {
+                        let mut c = f.ctx(focus);
+                        c.tree_selection = selection;
+                        c.menu = open;
+                        c.modal = asking;
+                        c.modal_open = asking.is_some();
+                        contexts.push(c);
+                    }
                 }
             }
         }

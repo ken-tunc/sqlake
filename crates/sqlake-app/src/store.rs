@@ -227,6 +227,7 @@ struct Conn {
 }
 
 const CANCELLED: &str = "cancelled";
+const DISCONNECTED: &str = "the connection was closed";
 
 /// How a connection's own row looks.
 ///
@@ -439,7 +440,7 @@ impl Runtime {
                 max_rows,
             } => self.run_query(conn, query, sql, max_rows),
             Action::ApproveQuery(query) => self.approve_query(query),
-            Action::ForgetQuery(query) => self.queries.retain(|q| q.id != query),
+            Action::ForgetQuery(query) => self.forget_query(query),
             Action::Cancel(id) => self.cancel(id),
             Action::Quit => self.should_quit = true,
         }
@@ -535,7 +536,7 @@ impl Runtime {
         // Nothing still in flight for this connection can be applied now, and
         // leaving the rows behind means "connecting to mock" stays in the
         // status bar after the user closed it.
-        let orphaned: Vec<BusyId> = self
+        let orphaned: Vec<(BusyId, BusyOwner)> = self
             .busy
             .iter()
             .filter(|b| match &b.owner {
@@ -545,10 +546,17 @@ impl Runtime {
                     self.queries.iter().any(|q| q.id == *query && q.conn == id)
                 }
             })
-            .map(|b| b.id)
+            .map(|b| (b.id, b.owner.clone()))
             .collect();
-        for busy in orphaned {
+        for (busy, owner) in orphaned {
             self.drop_task(busy);
+            // A query keeps its rows, but a query that had none yet has to be
+            // told the reply is not coming: left `Loading` it spins for ever,
+            // and a caller with no screen waiting for it to settle never
+            // returns.
+            if matches!(owner, BusyOwner::Query(_)) {
+                self.abandon(&owner, DISCONNECTED);
+            }
         }
 
         // Previews belong to a connection; leaving them behind would show
@@ -809,6 +817,16 @@ impl Runtime {
     /// what runs is what was estimated — not whatever the buffer says now,
     /// which after an `$EDITOR` round trip need not be the same thing.
     fn approve_query(&mut self, id: QueryId) {
+        let Some(conn_id) = self.queries.iter().find(|q| q.id == id).map(|q| q.conn) else {
+            return;
+        };
+        // Before the question is taken and the state goes to `Loading`: a
+        // connection that died while the dialog was open sends nothing, so no
+        // reply ever arrives to un-stick it — and the answer that would have
+        // run it would have been consumed on the way.
+        let Some(session) = self.session(conn_id) else {
+            return;
+        };
         let Some(query) = self.queries.iter_mut().find(|q| q.id == id) else {
             return;
         };
@@ -817,11 +835,7 @@ impl Runtime {
             // double click, or an agent retrying — must not run it twice.
             return;
         };
-        let conn_id = query.conn;
         query.data = LoadState::Loading;
-        let Some(session) = self.session(conn_id) else {
-            return;
-        };
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running an approved query");
         let events = self.events.clone();
@@ -856,6 +870,22 @@ impl Runtime {
             }
             Err(err) => query.data = LoadState::Failed(err.user_message()),
         }
+    }
+
+    fn forget_query(&mut self, id: QueryId) {
+        // Otherwise the busy row outlives its reader, the same way a forgotten
+        // preview's would: "running a query" with a cancel button, for a result
+        // nothing is going to show, until a reply nobody wants lands.
+        let running: Vec<BusyId> = self
+            .busy
+            .iter()
+            .filter(|b| matches!(b.owner, BusyOwner::Query(q) if q == id))
+            .map(|b| b.id)
+            .collect();
+        for busy in running {
+            self.drop_task(busy);
+        }
+        self.queries.retain(|q| q.id != id);
     }
 
     fn forget_preview(&mut self, conn_id: ConnId, table: &TableRef) {
@@ -1572,6 +1602,98 @@ mod tests {
         })
         .await;
         assert!(snap.query(id).is_some_and(|q| q.data.ready().is_some()));
+    }
+
+    #[tokio::test]
+    async fn a_query_still_running_when_its_connection_closes_is_told_so() {
+        // Its task is abandoned, so no reply is coming. Left `Loading` it
+        // spins for ever, and a caller waiting for it to settle never returns.
+        let store = store(Behaviour {
+            latency: std::time::Duration::from_millis(200),
+            ..Behaviour::instant()
+        });
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        store.dispatch(Action::RunQuery {
+            conn,
+            query: id,
+            sql: "select * from public.users".to_owned(),
+            max_rows: None,
+        });
+        until(&store, move |s| {
+            s.query(id).is_some_and(|q| q.data.is_loading())
+        })
+        .await;
+
+        let snap = settled(&store, Action::Disconnect(conn), move |s| {
+            s.query(id).is_some_and(QueryView::is_settled)
+        })
+        .await;
+        assert!(snap.query(id).unwrap().data.error().is_some());
+    }
+
+    #[tokio::test]
+    async fn approving_after_the_connection_closed_strands_nothing() {
+        // The question is only worth taking when there is something to run it
+        // on: consumed with no session, the query keeps a spinner nobody can
+        // cancel and an answer nobody can give again.
+        let store = store_with_budget(
+            Behaviour {
+                estimate_bytes: 5_000,
+                ..Behaviour::instant()
+            },
+            Some(1_000),
+        );
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let asked = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
+        )
+        .await
+        .applied;
+        let _ = settled(&store, Action::Disconnect(conn), move |s| {
+            s.connection(conn)
+                .is_some_and(|c| c.status == ConnStatus::Closed)
+        })
+        .await;
+
+        let snap = settled(&store, Action::ApproveQuery(id), move |s| s.applied > asked).await;
+        let query = snap.query(id).unwrap();
+        assert!(!query.data.is_loading(), "{:?}", query.data);
+        assert!(query.needs_approval.is_some(), "the answer was eaten");
+        assert!(snap.busy.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_query_takes_its_spinner_with_it() {
+        // Otherwise the busy row outlives its reader: "running a query", with
+        // a cancel button, for a result nothing is going to show.
+        let store = store(Behaviour {
+            latency: std::time::Duration::from_millis(200),
+            ..Behaviour::instant()
+        });
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        store.dispatch(Action::RunQuery {
+            conn,
+            query: id,
+            sql: "select * from public.users".to_owned(),
+            max_rows: None,
+        });
+        until(&store, move |s| !s.busy.is_empty()).await;
+
+        let snap = settled(&store, Action::ForgetQuery(id), move |s| {
+            s.query(id).is_none()
+        })
+        .await;
+        assert!(snap.busy.is_empty(), "{:?}", snap.busy);
     }
 
     #[tokio::test]

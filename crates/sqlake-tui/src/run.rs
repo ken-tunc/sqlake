@@ -113,6 +113,7 @@ pub async fn run(
                 raise_connection_failure(&snapshot, &mut ui);
                 ui.raise_preview_errors(&snapshot);
                 ui.raise_approvals(&snapshot);
+                ui.raise_query_errors(&snapshot);
                 ui.close_disconnected_tabs(&snapshot);
                 dirty = true;
             }
@@ -157,6 +158,13 @@ pub async fn run(
                     if let Action::RunQuery { query, .. } = &action
                         && let Some(tab) = ui.active_tab
                     {
+                        // The run this tab is about to stop showing. Nothing
+                        // else can be: a query is keyed by the run, so leaving
+                        // it behind would keep a whole result set in the store
+                        // that nothing could ever reach again.
+                        if let Some(previous) = ui.query_of(tab) {
+                            store.dispatch(Action::ForgetQuery(previous));
+                        }
                         ui.set_query(tab, *query);
                     }
                     store.dispatch(action);
@@ -276,6 +284,7 @@ fn initial_ui(snapshot: &Snapshot) -> UiState {
     raise_connection_failure(snapshot, &mut ui);
     ui.raise_preview_errors(snapshot);
     ui.raise_approvals(snapshot);
+    ui.raise_query_errors(snapshot);
     ui.close_disconnected_tabs(snapshot);
     ui
 }

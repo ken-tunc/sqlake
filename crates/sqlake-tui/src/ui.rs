@@ -167,18 +167,23 @@ const LOAD_MARGIN_ROWS: usize = 20;
 
 /// A byte count somebody is about to be charged for, in units they price in.
 ///
-/// Truncating rather than rounding: this is shown next to a limit, and a
+/// Powers of a thousand, because that is what the budget beside it was written
+/// in: `max_bytes_billed = "20GB"` is twenty thousand million bytes, and a
+/// dialog that divided it by 1024s would answer "the limit is 18.6 GB" about a
+/// number the user typed as 20.
+///
+/// Truncating rather than rounding: this is shown next to that limit, and a
 /// number that rounded up to the limit would read as being at it.
 fn bytes(n: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
-        (1 << 40, "TB"),
-        (1 << 30, "GB"),
-        (1 << 20, "MB"),
-        (1 << 10, "KB"),
+        (1_000_000_000_000, "TB"),
+        (1_000_000_000, "GB"),
+        (1_000_000, "MB"),
+        (1_000, "kB"),
     ];
     for (scale, unit) in UNITS {
         if n >= scale {
-            return format!("{:.1} {unit}", n as f64 / scale as f64);
+            return format!("{}.{} {unit}", n / scale, n % scale * 10 / scale);
         }
     }
     format!("{n} B")
@@ -367,6 +372,10 @@ pub struct UiState {
     /// The last error already raised for each preview, so that a redraw does
     /// not raise it again — only a *new* message does.
     reported_preview_errors: HashMap<(ConnId, TableRef), String>,
+    /// The runs whose failure has already been raised. By id rather than by
+    /// message: a run is one attempt and fails once, and running again is a
+    /// new id.
+    reported_query_errors: HashSet<QueryId>,
     grids: HashMap<TabId, GridUi>,
     /// How tall the detail pane is, or `None` while it is closed.
     ///
@@ -552,6 +561,27 @@ impl UiState {
                 }
                 Some(_) => {}
             }
+        }
+    }
+
+    /// Say why a run produced nothing.
+    ///
+    /// Without this a statement the server — or `ValidatedSql` — refused is
+    /// invisible: the pane falls back to the buffer because there are no rows,
+    /// the spinner has already gone, and pressing Run reads as having done
+    /// nothing at all.
+    pub fn raise_query_errors(&mut self, snapshot: &Snapshot) {
+        // Collected before mutating: `push_toast` needs `&mut self`.
+        let failures: Vec<(QueryId, String)> = self
+            .tabs
+            .iter()
+            .filter_map(|t| self.query_of(t.id))
+            .filter(|id| !self.reported_query_errors.contains(id))
+            .filter_map(|id| Some((id, snapshot.query(id)?.data.error()?.to_owned())))
+            .collect();
+        for (id, why) in failures {
+            self.reported_query_errors.insert(id);
+            self.push_toast(Severity::Error, why);
         }
     }
 
@@ -2141,6 +2171,36 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_failed_says_so_once() {
+        // A failure leaves no rows, so the pane falls back to the buffer and
+        // the spinner is already gone: without a toast, pressing Run on a
+        // statement the server refused reads as having done nothing at all.
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+        let id = QueryId::new();
+        ui.set_query(tab, id);
+        snap.queries.push(QueryView {
+            id,
+            conn,
+            sql: "select nope".to_owned(),
+            estimate: None,
+            needs_approval: None,
+            data: LoadState::Failed("no such column: nope".to_owned()),
+        });
+
+        ui.raise_query_errors(&snap);
+        assert_eq!(ui.toasts.len(), 1);
+        assert_eq!(ui.toasts[0].text, "no such column: nope");
+        // The same snapshot again — a redraw with nothing new — must not raise
+        // a second toast for a run that has already failed once.
+        ui.raise_query_errors(&snap);
+        assert_eq!(ui.toasts.len(), 1);
+    }
+
+    #[test]
     fn the_run_button_shows_exactly_when_pressing_it_would_do_something() {
         let conn = ConnId::new();
         let snap = snapshot(conn, 3, 10, 3);
@@ -2168,11 +2228,14 @@ mod tests {
     fn a_byte_count_reads_in_the_units_somebody_prices_in() {
         assert_eq!(bytes(0), "0 B");
         assert_eq!(bytes(999), "999 B");
-        assert_eq!(bytes(1 << 20), "1.0 MB");
-        assert_eq!(bytes(20 * (1 << 30)), "20.0 GB");
+        assert_eq!(bytes(1_000_000), "1.0 MB");
+        // The units the budget is written in: `max_bytes_billed = "20GB"` is
+        // this number, and the dialog has to say 20 back.
+        assert_eq!(bytes(20_000_000_000), "20.0 GB");
         // Truncating rather than rounding: shown next to a limit, a number
         // that rounded up to the limit would read as being at it.
-        assert_eq!(bytes((1 << 30) - 1), "1024.0 MB");
+        assert_eq!(bytes(1_999_999_999), "1.9 GB");
+        assert_eq!(bytes(999_999_999), "999.9 MB");
     }
 
     #[test]
