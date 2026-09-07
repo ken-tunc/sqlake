@@ -43,6 +43,16 @@ pub fn runtime_dir() -> Result<PathBuf, ConfigError> {
     state_dir().map(|dir| dir.join("run"))
 }
 
+/// Where a tab's working file is handed to `$EDITOR` and read back.
+///
+/// Under the state directory rather than a temporary one: `/tmp` is cleared
+/// while the client is still running on some systems, and the file is the only
+/// copy of the buffer between writing it and the editor saving it.
+#[must_use]
+pub fn scratch_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("scratch")
+}
+
 /// Settings that are not about a particular connection.
 #[must_use]
 pub fn settings_file(config_dir: &Path) -> PathBuf {
@@ -115,6 +125,10 @@ mod tests {
 
     #[test]
     fn the_file_names_hang_off_the_directory() {
+        assert_eq!(
+            scratch_dir(Path::new("/xdg/sqlake")),
+            PathBuf::from("/xdg/sqlake/scratch")
+        );
         let dir = PathBuf::from("/xdg/sqlake");
         assert_eq!(
             settings_file(&dir),

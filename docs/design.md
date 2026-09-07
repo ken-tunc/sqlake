@@ -216,27 +216,25 @@ exits. The same mechanism as `git commit`.
 
 ### 7.2 Flow
 
-1. `e`, or a click on the editor area → an `Intent` the render loop answers itself, *not* an
-   `Action`: the store runs on its own task, and handing the terminal over has to happen between
-   two frames on the thread that owns the terminal.
-2. **The main loop handles this synchronously** — it hands the terminal over, so ordering
-   matters and it must not go through the store.
-   - Release `TerminalGuard`
-   - Write the buffer to `~/.local/state/sqlake/scratch/{tab_id}.sql`
-   - `Command::new(editor).args(&args).arg(path).status()` and wait
-   - Re-acquire `TerminalGuard` and `terminal.clear()` for a full redraw
-3. Read the file back into a `RawSql`. If it changed, record it as a draft in history (M8).
-4. `Ctrl-Enter` or the run button hands off to the `RunQuery` use case: estimate, approve, run.
+Built: `Intent::Handover` in `sqlake-tui`, answered by `run`'s loop, over `editor::Editor` and
+`TerminalGuard::suspended`. What is worth saying here and not there is why it is not an
+`Action`: the store runs on its own task and publishes what it did, and handing the screen to
+another program has to happen between two frames, on the thread that owns the terminal, with the
+loop stopped.
+
+Still to come: `Ctrl-Enter` or the run button handing off to the `RunQuery` use case — estimate,
+approve, run — and recording a changed buffer as a draft in history (M8).
 
 ### 7.3 Caveats
 
 - Restore runs through the same path as the panic hook, so an editor that dies
   abnormally still leaves a usable screen.
-- Editor resolution order: the `editor` setting, `$VISUAL`, `$EDITOR`, then `vi`. `editor_args`
-  (e.g. `["--wait"]`) exists for GUI editors.
+- Editor resolution order is `Settings::editor_program`, which states it.
 - The store task keeps running while the editor is open, so streams from running queries are
   still consumed. The display catches up on return.
-- Scratch files are persisted per tab and reloaded on session restore.
+- Scratch files are per tab and rewritten from the buffer on every edit. Reloading one on
+  session restore is M8's; until then a file left by a previous session must not become the
+  contents of a tab that never had them, which is what truncating first prevents.
 
 ### 7.4 What the SQL tab does own
 

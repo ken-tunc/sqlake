@@ -4,7 +4,7 @@ expression: "screen(&snap, &mut ui, 100, 20)"
 ---
  users ×  SQL#1 ×  +                                                                                
 ┏ Explorer ━━━━━━━━━━━━━━━━┓│┌ SQL#1 ──────────────────────────────────────────────────────────────┐
-┃▾ mock                    ┃││Nothing to run yet.                                                  │
+┃▾ mock                    ┃││Press e to write a query.                                            │
 ┃  ▸ public                ┃││                                                                     │
 ┃  ▸ analytics             ┃││                                                                     │
 ┃  ▸ restricted            ┃││                                                                     │

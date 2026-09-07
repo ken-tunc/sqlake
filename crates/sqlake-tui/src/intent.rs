@@ -22,6 +22,31 @@ pub enum Intent {
     View(ViewCmd),
     /// Dispatched to the store. May perform I/O.
     App(Action),
+    /// Handled by the render loop *with the terminal in hand*.
+    ///
+    /// Its own variant rather than a [`ViewCmd`]: `UiState::apply` has a
+    /// snapshot and no terminal, and giving it one would put a `Tui` into every
+    /// view test. Not an [`Action`] either, for the reason [`Handover`] gives.
+    Handover(Handover),
+}
+
+/// Something that needs the terminal handed over before it can happen.
+///
+/// The store runs on its own task and publishes what it did; handing the
+/// screen to another program has to happen between two frames, on the thread
+/// that owns the terminal, with the loop stopped. There is no way to say that
+/// as an `Action`, which is why the design document's `Action::EditExternally`
+/// could not have worked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handover {
+    /// Edit a SQL tab's buffer in `$EDITOR`.
+    Edit(TabId),
+}
+
+impl From<Handover> for Intent {
+    fn from(handover: Handover) -> Self {
+        Self::Handover(handover)
+    }
 }
 
 impl From<ViewCmd> for Intent {
@@ -179,6 +204,7 @@ intent_kinds! {
     Menu               => "open the context menu",
     ToggleDetail       => "show a cell in full",
     Copy               => "copy cells to the clipboard",
+    EditExternally     => "edit the query in $EDITOR",
     DismissModal       => "close the dialog",
     Filter             => "search the explorer",
 
@@ -234,6 +260,9 @@ impl IntentKind {
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
                 ViewCmd::DismissToast(_) => Self::DismissToast,
+            },
+            Intent::Handover(handover) => match handover {
+                Handover::Edit(_) => Self::EditExternally,
             },
             Intent::App(action) => match action {
                 Action::Connect { .. } => Self::Connect,

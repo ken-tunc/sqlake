@@ -181,13 +181,25 @@ fn main() -> Result<std::process::ExitCode> {
         None => None,
     };
 
-    let (_guard, mut terminal) = TerminalGuard::enter(!args.no_mouse)?;
+    // Before the screen is taken over: resolving it reads the environment and
+    // can fail on a machine with no state directory, and that is a message
+    // somebody can read here rather than a dialog over a client they have not
+    // seen yet.
+    let editor = editor(&settings)?;
+
+    let (mut _guard, mut terminal) = TerminalGuard::enter(!args.no_mouse)?;
     assert!(
         !args.panic_test,
         "--panic-test: the terminal should come back"
     );
 
-    let result = runtime.block_on(sqlake_tui::run(&mut terminal, &store, !args.no_mouse));
+    let result = runtime.block_on(sqlake_tui::run(
+        &mut terminal,
+        &mut _guard,
+        &store,
+        !args.no_mouse,
+        &editor,
+    ));
 
     // The user asked to quit, so the client goes.
     //
@@ -223,6 +235,22 @@ fn listen(
     Ok(listener.spawn_on(runtime, Arc::new(sqlake_api::Service::new(store.clone()))))
 }
 
+/// What `e` hands the buffer to, and where the working files go.
+///
+/// Resolved once, here, rather than per keystroke: a variable changed in
+/// another shell must not take effect halfway through a session, and the file
+/// would move with it.
+fn editor(settings: &Settings) -> Result<sqlake_tui::editor::Editor> {
+    let scratch = sqlake_config::paths::scratch_dir(
+        &sqlake_config::paths::state_dir().context("finding the state directory")?,
+    );
+    Ok(sqlake_tui::editor::Editor::new(
+        settings.editor_program(std::env::var_os("VISUAL"), std::env::var_os("EDITOR")),
+        settings.editor_args.clone(),
+        scratch,
+    ))
+}
+
 /// Every driver this build can talk to.
 ///
 /// All of them, always: which one a connection needs is a fact about its
@@ -243,7 +271,7 @@ fn configuration(args: &Args) -> Result<(Arc<dyn Profiles>, Settings)> {
     // message on a terminal that still works, instead of an error raised into
     // a client that has already taken the screen over.
     let config = Config::load().context("reading the configuration")?;
-    let settings = config.settings;
+    let settings = config.settings.clone();
     Ok((Arc::new(config), settings))
 }
 
