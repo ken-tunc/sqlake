@@ -197,7 +197,8 @@ What that mechanism does not cover:
   entry needs a key binding, and the menu itself does too — for those terminals it does not
   exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
   cannot, because it only ever clicks the menu's first line.
-- Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M4).
+- Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M7, with the templates
+  it exists to insert).
 
 ---
 
@@ -215,14 +216,16 @@ exits. The same mechanism as `git commit`.
 
 ### 7.2 Flow
 
-1. `e`, or a click on the editor area → `Action::EditExternally { tab }`.
+1. `e`, or a click on the editor area → an `Intent` the render loop answers itself, *not* an
+   `Action`: the store runs on its own task, and handing the terminal over has to happen between
+   two frames on the thread that owns the terminal.
 2. **The main loop handles this synchronously** — it hands the terminal over, so ordering
    matters and it must not go through the store.
    - Release `TerminalGuard`
    - Write the buffer to `~/.local/state/sqlake/scratch/{tab_id}.sql`
    - `Command::new(editor).args(&args).arg(path).status()` and wait
    - Re-acquire `TerminalGuard` and `terminal.clear()` for a full redraw
-3. Read the file back into a `RawSql`. If it changed, record it as a draft in history.
+3. Read the file back into a `RawSql`. If it changed, record it as a draft in history (M8).
 4. `Ctrl-Enter` or the run button hands off to the `RunQuery` use case: estimate, approve, run.
 
 ### 7.3 Caveats
