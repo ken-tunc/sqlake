@@ -9,8 +9,10 @@ use futures::{StreamExt as _, pin_mut};
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
 use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
-use tokio_postgres::Client;
+use tokio_postgres::{CancelToken, Client};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::tls;
 use crate::value::RawValue;
 
 /// The planner's total cost for the statement.
@@ -60,7 +62,70 @@ fn total_cost(plan: &serde_json::Value) -> Option<f64> {
     plan.get(0)?.get("Plan")?.get("Total Cost")?.as_f64()
 }
 
-pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<ResultSet> {
+/// Tells the server to stop, if it is dropped while a query is still running.
+///
+/// A cancel request is a *second connection* carrying the backend's process id
+/// and secret — it cannot be sent down the socket the query is occupying, which
+/// is exactly why it works while the first one is busy.
+///
+/// Dropping is the signal because dropping is what already happens: the layer
+/// above stops awaiting, the future unwinds, and this runs. Asking the driver
+/// to take a cancellation handle instead would mean threading one through a
+/// trait so that it could be triggered from a task that has already let go.
+struct StopsTheQuery {
+    token: Option<CancelToken>,
+    tls: Option<tls::Verification>,
+}
+
+impl Drop for StopsTheQuery {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let tls = self.tls;
+        // Spawned, because `Drop` cannot await. A runtime already shutting
+        // down refuses it, and there is nothing useful to do about that: the
+        // process is going, and the server drops the query with the socket.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            // The connection this goes down has to be secured the same way the
+            // first one was: a server requiring TLS refuses a plaintext cancel
+            // request, and one that is not expecting TLS refuses the handshake.
+            let sent = match tls {
+                None => token.cancel_query(tokio_postgres::NoTls).await,
+                Some(verification) => match tls::client_config(verification) {
+                    Ok(config) => token.cancel_query(MakeRustlsConnect::new(config)).await,
+                    Err(why) => {
+                        tracing::warn!(%why, "cancel: no TLS configuration to send it with");
+                        return;
+                    }
+                },
+            };
+            match sent {
+                // PostgreSQL answers nothing at all to a cancel request — it
+                // acts on it or ignores it, and never says which — so this
+                // says only that the request went out.
+                Ok(()) => tracing::info!("asked postgres to cancel the running query"),
+                Err(err) => tracing::warn!(error = %crate::describe(&err), "cancel request failed"),
+            }
+        });
+    }
+}
+
+impl StopsTheQuery {
+    /// The query finished on its own, so there is nothing to cancel.
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+pub async fn execute(
+    client: &Client,
+    tls: Option<tls::Verification>,
+    query: &ApprovedQuery,
+) -> DriverResult<ResultSet> {
     // Prepared first, so the columns come from the *statement*. Reading them
     // off the first row costs nothing until the result is empty, and then the
     // grid is handed a result with no columns and draws nothing at all — which
@@ -88,6 +153,15 @@ pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<Res
         .map_err(|err| DriverError::Query(crate::describe(&err)))?;
     pin_mut!(stream);
 
+    // Armed here rather than at the top: this is the window in which a query
+    // is actually running on the server. A failure before it has nothing to
+    // cancel, and a cancel request sent for one would be a second connection
+    // opened to say nothing.
+    let mut guard = StopsTheQuery {
+        token: Some(client.cancel_token()),
+        tls,
+    };
+
     let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
     let mut rows: Vec<Row> = Vec::new();
     // Before the await, not after: asking for one more row than the cap and
@@ -103,6 +177,13 @@ pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<Res
                 .collect(),
         );
     }
+
+    // Every row that is coming has arrived, so there is nothing left to stop.
+    // A failure inside the loop above leaves it armed, which sends a request
+    // the server ignores — the alternative is deciding whether each error
+    // means the statement ended, which is a question only the server can
+    // answer and which it answers by ignoring the request.
+    guard.disarm();
 
     // Uncapped, the stream ran to the end and the count is the whole answer.
     // Capped, it is not: `None` rather than fifty, which the grid would show as

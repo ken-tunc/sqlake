@@ -16,7 +16,9 @@
 //! shipped with a parameter bound as the wrong type, and every test in the
 //! workspace passed, because none of them spoke to a server.
 
+use std::future::Future as _;
 use std::sync::Arc;
+use std::task::{Context, Waker};
 
 use sqlake_core::capability::Capabilities;
 use sqlake_core::driver::{Driver, DriverError, Session};
@@ -80,6 +82,7 @@ pub async fn run(subject: &Subject) {
     a_query_comes_back_with_its_columns(&*session, subject, kind).await;
     a_row_cap_is_honoured(&*session, subject, kind).await;
     a_statement_the_server_refuses_is_an_error(&*session, subject, kind).await;
+    a_connection_answers_again_after_a_query_is_abandoned(&*session, subject, kind).await;
 
     session.close().await;
 }
@@ -216,6 +219,36 @@ async fn a_statement_the_server_refuses_is_an_error(
         !matches!(err, DriverError::Unsupported(_)),
         "{kind}: reported the server's refusal as the driver not supporting it: {err}"
     );
+}
+
+/// Giving up on a query leaves the connection usable.
+///
+/// The claim every driver has to keep, whatever [`Capabilities::cancel`] says
+/// about the server: dropping a call must not leave the session half-way
+/// through one. A driver that wrote a request and did not read its answer
+/// leaves the next caller reading somebody else's rows.
+async fn a_connection_answers_again_after_a_query_is_abandoned(
+    session: &dyn Session,
+    subject: &Subject,
+    kind: &str,
+) {
+    let query = approved(session, &subject.query, None, kind, "query").await;
+    // Polled once and dropped, which is what cancelling does one layer up.
+    // By hand rather than with a timeout, so this needs no runtime of its own
+    // — and so "started" means started rather than "did not finish in time".
+    {
+        let mut running = std::pin::pin!(session.execute(&query));
+        let mut cx = Context::from_waker(Waker::noop());
+        // A driver that answered on the first poll had nothing to abandon,
+        // which is not a failure — the case is about what a driver that did
+        // start leaves behind.
+        let _ = running.as_mut().poll(&mut cx);
+    }
+
+    let again = approved(session, &subject.query, None, kind, "query").await;
+    session.execute(&again).await.unwrap_or_else(|err| {
+        panic!("{kind}: the connection did not survive an abandoned query: {err}")
+    });
 }
 
 /// The tree has exactly as many levels as [`Capabilities::hierarchy`] claims.

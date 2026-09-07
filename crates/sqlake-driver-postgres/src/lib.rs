@@ -126,7 +126,11 @@ impl Driver for PgDriver {
         // tree's top node is this database, and a relation from another one
         // cannot be read over this connection at all.
         let database = current_database(&client).await?;
-        Ok(Box::new(PgSession { client, database }))
+        Ok(Box::new(PgSession {
+            client,
+            database,
+            tls: tls::Verification::of(params.sslmode),
+        }))
     }
 }
 
@@ -189,6 +193,9 @@ pub struct PgSession {
     /// The database this connection is attached to. PostgreSQL has no
     /// cross-database queries, so this is a fact about the whole session.
     database: String,
+    /// How this connection was secured, kept because a cancel request opens a
+    /// second one and has to be secured the same way.
+    tls: Option<tls::Verification>,
 }
 
 #[async_trait]
@@ -210,7 +217,7 @@ impl Session for PgSession {
     }
 
     async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet> {
-        query::execute(&self.client, query).await
+        query::execute(&self.client, self.tls, query).await
     }
 
     async fn close(self: Box<Self>) {

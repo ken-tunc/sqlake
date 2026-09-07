@@ -282,6 +282,82 @@ async fn until_gone(client: &tokio_postgres::Client) {
 /// When `SQLAKE_REQUIRE_DOCKER` is set, because then the absence is the
 /// failure: a CI run that quietly skips this suite is a CI run that proves
 /// nothing about the driver.
+/// Abandoning a query stops it *at the server*, not just here.
+///
+/// The one case that cannot be written against a fixture: what it asserts is
+/// what a second connection can see about the first, and only a real backend
+/// has an opinion about that. `Capabilities::cancel` is a claim about this and
+/// nothing else.
+/// Recognisable in `pg_stat_activity`, and in nothing else that runs here.
+const MARKER: &str = "sqlake_cancel_probe";
+
+#[tokio::test]
+async fn abandoning_a_query_stops_it_at_the_server() {
+    use sqlake_core::capability::Escaping;
+    use sqlake_core::driver::Driver as _;
+    use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
+
+    let Some(container) = start().await else {
+        return;
+    };
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("a mapped port");
+    seed(port).await;
+
+    let session = PgDriver::new()
+        .connect(&profile(port))
+        .await
+        .expect("should connect");
+
+    let sql = ValidatedSql::parse(
+        &RawSql::new(format!("select pg_sleep(120) /* {MARKER} */")),
+        Escaping::None,
+    )
+    .expect("one statement");
+    let query = ApprovedQuery::within(sql, None, Estimate::Unknown, None).expect("no budget");
+
+    let watcher = raw_client(port).await;
+    let running = || async {
+        watcher
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where query like $1 and state = 'active'",
+                &[&format!("%{MARKER}%")],
+            )
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+    };
+
+    // Started, then dropped — which is what the store does when somebody
+    // cancels.
+    let handle = tokio::spawn(async move {
+        let _ = session.execute(&query).await;
+        session
+    });
+    for _ in 0..100 {
+        if running().await > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(running().await > 0, "the probe query never started");
+
+    handle.abort();
+
+    // The cancel goes out on a second connection from a spawned task, so it
+    // is not instantaneous — but it is not `pg_sleep(120)` either.
+    for _ in 0..100 {
+        if running().await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the server is still running the query five seconds after it was abandoned");
+}
+
 async fn start() -> Option<testcontainers::ContainerAsync<Postgres>> {
     match Postgres::default().start().await {
         Ok(container) => Some(container),

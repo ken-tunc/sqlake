@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -214,6 +215,12 @@ pub struct Behaviour {
     /// what the test is for. Zero by default, so a budget only bites when a
     /// test says what it is testing.
     pub estimate_bytes: u64,
+    /// How long a query takes, on top of [`Behaviour::latency`].
+    ///
+    /// Its own knob because `latency` applies to connecting too, and a test
+    /// about cancelling a slow query would otherwise spend that time opening
+    /// the connection it cancels on.
+    pub query_latency: Duration,
     /// Substrings that make [`Session::execute`] fail.
     ///
     /// The message carries a line and column, because that is the shape a
@@ -309,6 +316,27 @@ impl Behaviour {
     }
 }
 
+/// Records that a query was unwound rather than finished.
+///
+/// The mock's stand-in for a driver telling its server to stop: there is no
+/// server, so what it can prove is that the future was dropped mid-call, which
+/// is the signal a real driver acts on.
+struct Unwound(Option<Arc<AtomicU64>>);
+
+impl Unwound {
+    fn finished(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unwound {
+    fn drop(&mut self) {
+        if let Some(count) = self.0.take() {
+            count.fetch_add(1, atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// A failure shaped like a server's own, with somewhere in the text to point.
 ///
 /// The position is what T7's error marker needs, and inventing it here rather
@@ -338,6 +366,9 @@ pub struct MockDriver {
     capabilities: Capabilities,
     catalog: Arc<Catalog>,
     attempts: Arc<Attempts>,
+    /// Queries unwound rather than finished. Shared with every session this
+    /// driver makes, so a test holds the driver and asks it afterwards.
+    cancelled: Arc<AtomicU64>,
 }
 
 impl MockDriver {
@@ -361,7 +392,14 @@ impl MockDriver {
             capabilities: CAPABILITIES,
             catalog: Arc::new(catalog),
             attempts: Arc::default(),
+            cancelled: Arc::default(),
         }
+    }
+
+    /// How many queries were dropped before they finished.
+    #[must_use]
+    pub fn cancelled(&self) -> u64 {
+        self.cancelled.load(atomic::Ordering::SeqCst)
     }
 
     /// Advertise a different capability set — a deeper hierarchy, index
@@ -414,6 +452,7 @@ impl Driver for MockDriver {
             capabilities: self.capabilities,
             catalog: Arc::clone(&self.catalog),
             attempts: Arc::clone(&self.attempts),
+            cancelled: Arc::clone(&self.cancelled),
         }))
     }
 }
@@ -424,6 +463,7 @@ pub struct MockSession {
     capabilities: Capabilities,
     catalog: Arc<Catalog>,
     attempts: Arc<Attempts>,
+    cancelled: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -575,7 +615,13 @@ impl Session for MockSession {
     /// one row holding the text, because a mock whose answer to half the
     /// queries is an error is a mock that cannot be typed into.
     async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet> {
+        // Counted only if this future is dropped before the query finishes,
+        // which is what cancellation *is*: nothing sends the mock a message,
+        // it is unwound. Without something observable here, "the cancel
+        // reached the driver" would be a claim no test could make.
+        let mut running = Unwound(Some(Arc::clone(&self.cancelled)));
         self.behaviour.delay_for(&[]).await;
+        tokio::time::sleep(self.behaviour.query_latency).await;
         let text = query.text();
         if let Some(marker) = self.behaviour.refuses(text) {
             return Err(syntax_error(text, marker));
@@ -583,6 +629,7 @@ impl Session for MockSession {
 
         let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
         let Some((schema, table)) = self.catalog.name_in(text) else {
+            running.finished();
             return Ok(ResultSet::new(
                 vec![Column::new("query", "text", false)],
                 vec![Row(vec![Value::Text(text.to_owned())])]
@@ -600,6 +647,7 @@ impl Session for MockSession {
             0,
             u32::try_from(cap.min(u32::MAX as usize)).unwrap_or(u32::MAX),
         );
+        running.finished();
         Ok(ResultSet::new(
             fixture.columns.clone(),
             rows,

@@ -78,6 +78,12 @@ pub struct Capabilities {
     pub constraints: bool,
     pub partitioning: bool,
     pub transactions: bool,
+    /// Cancelling reaches the server.
+    ///
+    /// Not "the client can stop waiting", which is always true and is done by
+    /// dropping the request. This is the stronger claim that the work stops —
+    /// which for a query that is being billed by the byte is the only version
+    /// of the claim worth making.
     pub cancel: bool,
     /// When false, results are fetched in full before being displayed.
     pub streaming: bool,
@@ -149,7 +155,7 @@ mod tests {
         constraints: false,
         partitioning: true,
         transactions: false,
-        cancel: true,
+        cancel: false,
         streaming: true,
         cost_estimate: true,
         free_preview: true,

@@ -944,9 +944,16 @@ impl Runtime {
         });
     }
 
-    /// This does not stop work already running inside the driver: real
-    /// cancellation is a driver capability and arrives with `CancelHandle` in
-    /// M4.
+    /// Aborting the task is also what stops the work at the server.
+    ///
+    /// The task holds the far end of the session actor's cancel channel, so
+    /// dropping it closes that channel, the actor's `select` fires, and the
+    /// driver's own future is unwound mid-call — which is where a driver that
+    /// can reach its server sends the cancel. A driver whose
+    /// [`Capabilities::cancel`] is false stops the client waiting and nothing
+    /// more, which is what that flag says.
+    ///
+    /// [`Capabilities::cancel`]: sqlake_core::capability::Capabilities::cancel
     fn drop_task(&mut self, id: BusyId) {
         if let Some(handle) = self.tasks.remove(&id) {
             handle.abort();
@@ -1280,6 +1287,8 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use sqlake_core::node::NodeKind;
+    use std::time::Duration;
+
     use sqlake_core::sql::Estimate;
     use sqlake_core::value::Value;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, NO_SORT};
@@ -1387,6 +1396,100 @@ mod tests {
 
     fn preview_of<'a>(snap: &'a Snapshot, conn: ConnId, table: &TableRef) -> &'a PreviewView {
         snap.preview(conn, table).expect("a preview")
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_query_unwinds_the_driver_rather_than_only_the_wait() {
+        // The point of the whole mechanism: the session actor runs the query,
+        // and a cancel sent down its own channel would queue behind the thing
+        // it is meant to stop. Dropping the caller's task closes a channel the
+        // actor is selecting on instead.
+        let driver = Arc::new(MockDriver::new(Behaviour {
+            query_latency: Duration::from_secs(30),
+            ..Behaviour::instant()
+        }));
+        let store = Store::spawn(
+            Drivers::new().with(Arc::clone(&driver) as Arc<dyn Driver>),
+            Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
+            None,
+        );
+        let (store, conn) = connected(store).await;
+
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            |s| !s.busy.is_empty(),
+        )
+        .await;
+        let busy = snap.busy[0].id;
+
+        let snap = settled(&store, Action::Cancel(busy), move |s| {
+            s.query(id).is_some_and(QueryView::is_settled)
+        })
+        .await;
+        assert!(snap.busy.is_empty(), "the spinner outlived the cancel");
+        assert_eq!(
+            snap.query(id).unwrap().data.error(),
+            Some(CANCELLED),
+            "the query has to be left in a state somebody can act on"
+        );
+
+        // The driver was unwound, not merely abandoned. Without this the test
+        // would pass against a store that stopped listening while the query
+        // ran on.
+        for _ in 0..50 {
+            if driver.cancelled() == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the driver was never told: {} unwound", driver.cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_connection_answers_again_after_a_query_is_cancelled() {
+        // The actor is the one thing every call on a connection goes through,
+        // so a cancel that left it awaiting the abandoned query would take the
+        // whole connection with it.
+        let store = store(Behaviour {
+            query_latency: Duration::from_millis(400),
+            ..Behaviour::instant()
+        });
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            |s| !s.busy.is_empty(),
+        )
+        .await;
+        store.dispatch(Action::Cancel(snap.busy[0].id));
+
+        let second = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: second,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(second).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        assert!(snap.query(second).unwrap().data.ready().is_some());
     }
 
     #[tokio::test]
