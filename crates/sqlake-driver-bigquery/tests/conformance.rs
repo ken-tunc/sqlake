@@ -164,22 +164,28 @@ impl Respond for Queries {
             ],
         });
 
-        // The suite's broken query, refused the way BigQuery refuses one: 400
-        // with the position in the message.
-        if let Some(at) = sql.find("no_such_column") {
+        // The suite's broken query, refused the way BigQuery refuses one: an
+        // HTTP 400 with the position written into the message.
+        //
+        // Only the real run. A dry run of it is refused the same way, but the
+        // suite gives up on a subject whose estimate fails — so a fixture that
+        // refused both would leave the case it is here for untested.
+        if body["dryRun"].as_bool() != Some(true)
+            && let Some(at) = sql.find("no_such_column")
+        {
             // The position BigQuery would report, worked out from the
             // statement rather than hardcoded: a fixture that always said
             // `[1:8]` would let a driver reading the wrong number pass.
             let before = &sql[..at];
             let line = before.matches('\n').count() + 1;
             let column = before.rsplit('\n').next().map_or(0, str::len) + 1;
-            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "kind": "bigquery#queryResponse",
-                "jobComplete": true,
-                "errors": [{
-                    "reason": "invalidQuery",
+            return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
                     "message": format!("Unrecognized name: no_such_column at [{line}:{column}]"),
-                }],
+                    "errors": [],
+                }
             }));
         }
 

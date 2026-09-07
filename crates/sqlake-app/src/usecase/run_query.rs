@@ -6,6 +6,7 @@
 //! not look at.
 
 use async_trait::async_trait;
+use sqlake_core::driver::DriverError;
 use sqlake_core::result::ResultSet;
 use sqlake_core::sql::{ApprovedQuery, Estimate, InvalidSql, OverBudget, RawSql, ValidatedSql};
 
@@ -55,12 +56,23 @@ impl UseCase for RunQuery {
         // is the only thing that knows how its server reads a backslash.
         let escaping = self.session.capabilities().escaping;
         let sql = ValidatedSql::parse(&input.sql, escaping).map_err(invalid)?;
-        let estimate = self.session.estimate(sql.clone()).await?;
+        // Either step can be where the server says no: PostgreSQL plans the
+        // statement during the estimate, and a driver that estimates by dry
+        // run refuses a broken one there too.
+        let estimate = self
+            .session
+            .estimate(sql.clone())
+            .await
+            .map_err(|err| in_source(err, &sql))?;
 
-        match ApprovedQuery::within(sql, input.max_rows, estimate, input.budget) {
+        match ApprovedQuery::within(sql.clone(), input.max_rows, estimate, input.budget) {
             Ok(approved) => Ok(RunQueryOutput::Ran {
                 estimate,
-                result: self.session.execute(approved).await?,
+                result: self
+                    .session
+                    .execute(approved)
+                    .await
+                    .map_err(|err| in_source(err, &sql))?,
             }),
             Err(over) => Ok(RunQueryOutput::NeedsApproval(Box::new(over))),
         }
@@ -84,12 +96,35 @@ impl UseCase for RunApproved {
 
     async fn execute(&self, refused: Self::Input) -> AppResult<Self::Output> {
         let estimate = refused.estimate;
+        let sql = refused.sql.clone();
         let approved = ApprovedQuery::by_hand(refused);
         Ok(RunQueryOutput::Ran {
             estimate,
-            result: self.session.execute(approved).await?,
+            result: self
+                .session
+                .execute(approved)
+                .await
+                .map_err(|err| in_source(err, &sql))?,
         })
     }
+}
+
+/// A driver reports where the failure was in the statement it sent, which is
+/// the buffer with the whitespace around it dropped. The front-end draws the
+/// buffer, so the position has to come back into its coordinates before it
+/// leaves here — the last place that holds both.
+fn in_source(err: AppError, sql: &ValidatedSql) -> AppError {
+    let AppError::Driver(DriverError::Query {
+        message,
+        at: Some(at),
+    }) = err
+    else {
+        return err;
+    };
+    AppError::Driver(DriverError::Query {
+        message,
+        at: Some(sql.in_source(at)),
+    })
 }
 
 /// A statement this could not accept, as something the user reads.
@@ -184,6 +219,26 @@ mod tests {
         };
         assert!(result.row_count() > 0);
         assert_eq!(text, "select * from public.users");
+    }
+
+    #[tokio::test]
+    async fn a_position_comes_back_in_the_coordinates_of_what_was_typed() {
+        // The statement sent is the buffer with the blank lines above it
+        // dropped, so a driver counting from line two of *that* is talking
+        // about line four of what the front-end is drawing.
+        let uc = use_case(
+            Behaviour {
+                failing_sql: vec!["nope".to_owned()],
+                ..Behaviour::instant()
+            },
+            sqlake_driver_mock::CAPABILITIES,
+        )
+        .await;
+        let err = uc
+            .execute(input("\n\nselect\n  nope\nfrom public.users", None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.at().map(|at| at.line), Some(4), "{err}");
     }
 
     #[tokio::test]

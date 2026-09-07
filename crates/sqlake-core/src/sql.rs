@@ -62,7 +62,16 @@ pub enum InvalidSql {
 /// The only way to make one is [`ValidatedSql::parse`], so the invariant cannot
 /// be asserted into existence somewhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedSql(String);
+pub struct ValidatedSql {
+    text: String,
+    /// Where in the text this was parsed out of the statement begins.
+    ///
+    /// Kept because [`parse`](ValidatedSql::parse) drops the whitespace before
+    /// it: a server counts an error position from the statement it was sent,
+    /// and a buffer that opens with a blank line would have every one of them
+    /// marked a line above where it belongs.
+    start: Position,
+}
 
 impl ValidatedSql {
     /// Check that `raw` is one statement, reading literals the way a server
@@ -85,7 +94,13 @@ impl ValidatedSql {
             // an error position counted from the start still lands.
             1 => {
                 let (start, end) = spans[0];
-                Ok(Self(text[start..end].trim().to_owned()))
+                let span = &text[start..end];
+                let kept = span.trim_start();
+                let before = &text[..start + (span.len() - kept.len())];
+                Ok(Self {
+                    text: kept.trim_end().to_owned(),
+                    start: Position::after_str(before),
+                })
             }
             count => Err(InvalidSql::Several { count }),
         }
@@ -93,13 +108,35 @@ impl ValidatedSql {
 
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.0
+        &self.text
+    }
+
+    /// A position the server counted from this statement, as a position in the
+    /// text it was parsed out of.
+    ///
+    /// Applied here rather than in a front-end because this is what knows how
+    /// much was dropped; a driver only ever sees the statement.
+    #[must_use]
+    pub const fn in_source(&self, at: Position) -> Position {
+        if at.line == 1 {
+            Position::new(
+                self.start.line,
+                self.start
+                    .column
+                    .saturating_add(at.column.saturating_sub(1)),
+            )
+        } else {
+            Position::new(
+                self.start.line.saturating_add(at.line.saturating_sub(1)),
+                at.column,
+            )
+        }
     }
 }
 
 impl fmt::Display for ValidatedSql {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
@@ -133,16 +170,31 @@ impl Position {
     #[must_use]
     pub fn of_offset(text: &str, offset: u32) -> Option<Self> {
         let offset = usize::try_from(offset).ok()?;
-        if offset == 0 || offset > text.chars().count() {
-            return None;
+        let mut at = Self::new(1, 1);
+        for (seen, ch) in text.chars().enumerate() {
+            // Checked before consuming the character, so an offset one past
+            // the last one falls out of the loop rather than landing on it.
+            if seen + 1 == offset {
+                return Some(at);
+            }
+            at = at.after(ch);
         }
-        let before: String = text.chars().take(offset - 1).collect();
-        let line = before.matches('\n').count() + 1;
-        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-        Some(Self {
-            line: u32::try_from(line).unwrap_or(u32::MAX),
-            column: u32::try_from(column).unwrap_or(u32::MAX),
-        })
+        None
+    }
+
+    /// Where the character after `text` would be.
+    #[must_use]
+    fn after_str(text: &str) -> Self {
+        text.chars().fold(Self::new(1, 1), Self::after)
+    }
+
+    #[must_use]
+    const fn after(self, ch: char) -> Self {
+        if ch == '\n' {
+            Self::new(self.line.saturating_add(1), 1)
+        } else {
+            Self::new(self.line, self.column.saturating_add(1))
+        }
     }
 }
 
@@ -677,6 +729,22 @@ mod tests {
             Position::of_offset("select é, bad", 11),
             Some(Position::new(1, 11))
         );
+    }
+
+    #[test]
+    fn a_position_in_the_statement_is_a_position_in_what_was_typed() {
+        // The blank lines above the statement never reached the server, so
+        // its line two is line four of the buffer somebody is looking at.
+        let sql = one("\n\nselect\n  bad\nfrom t").unwrap();
+        assert_eq!(sql.in_source(Position::new(2, 3)), Position::new(4, 3));
+
+        // On the statement's own first line the column moves as well.
+        let sql = one("   select bad").unwrap();
+        assert_eq!(sql.in_source(Position::new(1, 8)), Position::new(1, 11));
+
+        // And nothing dropped means nothing moved.
+        let sql = one("select bad").unwrap();
+        assert_eq!(sql.in_source(Position::new(1, 8)), Position::new(1, 8));
     }
 
     #[test]

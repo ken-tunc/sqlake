@@ -6,6 +6,7 @@
 //! before agreeing to be charged.
 
 use gcp_bigquery_client::Client;
+use gcp_bigquery_client::error::BQError;
 use gcp_bigquery_client::model::query_request::QueryRequest;
 use gcp_bigquery_client::model::query_response::QueryResponse;
 use gcp_bigquery_client::model::table_field_schema::TableFieldSchema;
@@ -13,7 +14,7 @@ use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
 use sqlake_core::sql::{ApprovedQuery, Estimate, Position, ValidatedSql};
 
-use crate::error::{driver_error, listing_failed};
+use crate::error::driver_error;
 use crate::value;
 
 /// The bytes the query would be billed for, without running it.
@@ -40,7 +41,7 @@ pub async fn estimate(
         .job()
         .query(project, request)
         .await
-        .map_err(listing_failed)?;
+        .map_err(refused)?;
 
     // Unknown rather than an error when the field is missing or unreadable: a
     // number this could not parse is a reason to say nothing about the cost,
@@ -78,7 +79,7 @@ pub async fn execute(
         .job()
         .query(project, request)
         .await
-        .map_err(listing_failed)?;
+        .map_err(refused)?;
 
     // A job that has not finished inside the synchronous call's own timeout
     // answers with no rows and `jobComplete: false`. Reporting that as an
@@ -105,6 +106,19 @@ pub async fn execute(
     Ok(result_set(&response))
 }
 
+/// The API refusing to run the statement.
+///
+/// Separate from `error::listing_failed`, which is the same `BQError` with
+/// nowhere to point: a refused statement arrives as an HTTP 400 whose message carries
+/// the position, and mapping it the same way as a failed `tables.list` would
+/// throw that away — which is what the `errors` array below does not, and the
+/// reason both paths exist.
+fn refused(err: BQError) -> DriverError {
+    let message = crate::error::describe(err);
+    let at = position_in(&message);
+    DriverError::Query { message, at }
+}
+
 /// BigQuery writes the position into the message, as `[line:column]`.
 ///
 /// Read out of the text because that is the only place it is: the REST error
@@ -116,9 +130,7 @@ pub async fn execute(
 /// applied to errors: this crate knows its own dialect, and the UI must not
 /// have to.
 fn position_in(message: &str) -> Option<Position> {
-    let (before, rest) = message.rsplit_once('[')?;
-    let _ = before;
-    let inside = rest.split_once(']')?.0;
+    let inside = message.rsplit_once('[')?.1.split_once(']')?.0;
     let (line, column) = inside.split_once(':')?;
     Some(Position::new(
         line.trim().parse().ok()?,
