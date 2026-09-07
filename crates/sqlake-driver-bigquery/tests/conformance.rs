@@ -87,6 +87,7 @@ async fn the_bigquery_driver_conforms() {
         )
         .await;
     google.answers_rows(DATASET, TABLE, Window).await;
+    google.answers_queries(Queries).await;
 
     // Everything else in the dataset is missing, which is what the suite's
     // last case asks about. Mounted after the table so the specific answer
@@ -99,6 +100,8 @@ async fn the_bigquery_driver_conforms() {
         profile: profile(google.key_file()),
         relation: TableRef::new([PROJECT, DATASET, TABLE]),
         missing: TableRef::new([PROJECT, DATASET, "no_such_relation"]),
+        query: format!("select * from `{PROJECT}.{DATASET}.{TABLE}` order by id"),
+        broken_query: format!("select no_such_column from `{PROJECT}.{DATASET}.{TABLE}`"),
     })
     .await;
 }
@@ -136,6 +139,72 @@ impl Respond for Window {
             "kind": "bigquery#tableDataList",
             "totalRows": ROWS.to_string(),
             "rows": rows,
+        }))
+    }
+}
+
+/// `jobs.query`, answering a dry run with a byte count and a real one with
+/// rows.
+///
+/// The two are told apart by the body rather than by the path, because that is
+/// how BigQuery tells them apart — a fixture that used two endpoints would let
+/// a driver forgetting `dryRun` still pass, which is the mistake that ends in
+/// a bill.
+struct Queries;
+
+impl Respond for Queries {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        let sql = body["query"].as_str().unwrap_or_default();
+        let schema = serde_json::json!({
+            "fields": [
+                { "name": "id", "type": "INTEGER", "mode": "REQUIRED" },
+                { "name": "email", "type": "STRING" },
+                { "name": "signed_up", "type": "DATE" },
+            ],
+        });
+
+        // The suite's broken query, refused the way BigQuery refuses one: 400
+        // with the position in the message.
+        if sql.contains("no_such_column") {
+            return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 400,
+                    "status": "INVALID_ARGUMENT",
+                    "message": format!(
+                        "Unrecognized name: no_such_column at [1:8]"
+                    ),
+                    "errors": [],
+                }
+            }));
+        }
+
+        if body["dryRun"].as_bool() == Some(true) {
+            // No rows and no job id, which is what a dry run answers.
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "bigquery#queryResponse",
+                "jobComplete": true,
+                "schema": schema,
+                "totalBytesProcessed": "2048",
+            }));
+        }
+
+        let limit = body["maxResults"].as_i64().unwrap_or(ROWS as i64).max(0) as usize;
+        let rows: Vec<serde_json::Value> = (0..ROWS.min(limit))
+            .map(|row| {
+                serde_json::json!({ "f": [
+                    { "v": (row + 1).to_string() },
+                    { "v": format!("{}@example.com", (b'a' + row as u8) as char) },
+                    { "v": format!("2026-01-{:02}", row + 2) },
+                ]})
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "schema": schema,
+            "rows": rows,
+            "totalRows": ROWS.to_string(),
         }))
     }
 }

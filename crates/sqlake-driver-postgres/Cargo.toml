@@ -15,6 +15,7 @@ async-trait.workspace = true
 postgres-protocol.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
+futures.workspace = true
 serde_json.workspace = true
 sqlake-core.workspace = true
 time.workspace = true

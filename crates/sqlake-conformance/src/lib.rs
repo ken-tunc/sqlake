@@ -23,6 +23,7 @@ use sqlake_core::driver::{Driver, DriverError, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef};
 use sqlake_core::profile::ResolvedProfile;
 use sqlake_core::result::{PageRequest, ResultSet, Sort, SortDir};
+use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
 use sqlake_core::value::Value;
 
 /// What a driver has to supply to be put through the suite.
@@ -39,6 +40,19 @@ pub struct Subject {
     /// A relation that is not there. Same shape as `relation`, so the failure
     /// is about the name rather than about the path having the wrong depth.
     pub missing: TableRef,
+    /// A statement in this driver's own dialect returning at least one row and
+    /// one column.
+    ///
+    /// Supplied rather than written here: the point of the suite is that
+    /// `sqlake-app` drives every driver the same way, not that the three speak
+    /// one SQL. A statement over `relation` is the natural choice, and quoting
+    /// differs between them.
+    pub query: String,
+    /// A statement the server refuses.
+    ///
+    /// The failure has to be the *server's*, so a driver that never sent it —
+    /// or that reported a refusal as an empty result — is caught.
+    pub broken_query: String,
 }
 
 /// Every case, in order. Panics with the case's name on the first failure.
@@ -62,8 +76,146 @@ pub async fn run(subject: &Subject) {
     sorting_does_what_is_claimed(&*session, &relation, capabilities, kind).await;
     a_page_past_the_end_still_has_columns(&*session, &relation, kind).await;
     a_relation_that_is_not_there_is_an_error(&*session, subject, kind).await;
+    estimating_answers_what_the_capability_claims(&*session, subject, capabilities, kind).await;
+    a_query_comes_back_with_its_columns(&*session, subject, kind).await;
+    a_row_cap_is_honoured(&*session, subject, kind).await;
+    a_statement_the_server_refuses_is_an_error(&*session, subject, kind).await;
 
     session.close().await;
+}
+
+/// One statement, or a panic naming the case — the suite's own inputs being
+/// wrong is not something to discover as a confusing failure three cases later.
+fn validated(text: &str, capabilities: Capabilities, kind: &str, what: &str) -> ValidatedSql {
+    ValidatedSql::parse(&RawSql::new(text), capabilities.escaping)
+        .unwrap_or_else(|err| panic!("{kind}: the suite's {what} is not one statement: {err}"))
+}
+
+/// Estimate and approve, which is the only way to reach [`Session::execute`].
+async fn approved(
+    session: &dyn Session,
+    text: &str,
+    max_rows: Option<u32>,
+    kind: &str,
+    what: &str,
+) -> ApprovedQuery {
+    let sql = validated(text, session.capabilities(), kind, what);
+    let estimate = session
+        .estimate(&sql)
+        .await
+        .unwrap_or_else(|err| panic!("{kind}: estimating the {what}: {err}"));
+    // No budget: the suite is about the driver answering, not about the policy
+    // over it, and a byte threshold would make the case pass or fail on how
+    // big somebody's fixture table happens to be.
+    ApprovedQuery::within(sql, max_rows, estimate, None)
+        .unwrap_or_else(|_| unreachable!("no budget cannot be exceeded"))
+}
+
+/// `cost_estimate` is a promise, and this is where it is kept.
+///
+/// A driver claiming to estimate and answering [`Estimate::Unknown`] would put
+/// a number-less dialog in front of somebody about to be billed; one that does
+/// not claim it and answers a number is inventing one.
+async fn estimating_answers_what_the_capability_claims(
+    session: &dyn Session,
+    subject: &Subject,
+    capabilities: Capabilities,
+    kind: &str,
+) {
+    let sql = validated(&subject.query, capabilities, kind, "query");
+    let estimate = session
+        .estimate(&sql)
+        .await
+        .unwrap_or_else(|err| panic!("{kind}: estimating: {err}"));
+
+    if capabilities.cost_estimate {
+        assert_ne!(
+            estimate,
+            Estimate::Unknown,
+            "{kind}: claims to estimate and then does not"
+        );
+    } else {
+        assert_eq!(
+            estimate,
+            Estimate::Unknown,
+            "{kind}: does not claim to estimate and answered anyway"
+        );
+    }
+}
+
+/// A query answers with the columns of its result, even before any row is read.
+async fn a_query_comes_back_with_its_columns(session: &dyn Session, subject: &Subject, kind: &str) {
+    let query = approved(session, &subject.query, None, kind, "query").await;
+    let result = session
+        .execute(&query)
+        .await
+        .unwrap_or_else(|err| panic!("{kind}: running the query: {err}"));
+
+    assert!(
+        result.column_count() > 0,
+        "{kind}: a result with no columns draws nothing at all, which reads as a failure"
+    );
+    assert!(
+        result.row_count() > 0,
+        "{kind}: the suite's query is supposed to match something"
+    );
+    for row in result.rows.iter() {
+        assert_eq!(
+            row.len(),
+            result.column_count(),
+            "{kind}: a row that does not line up under the headers"
+        );
+    }
+}
+
+/// The cap is on the fetch, and the statement is not rewritten to carry it.
+async fn a_row_cap_is_honoured(session: &dyn Session, subject: &Subject, kind: &str) {
+    let query = approved(session, &subject.query, Some(1), kind, "query").await;
+    assert_eq!(query.text(), subject.query.trim_end_matches(';').trim());
+
+    let result = session
+        .execute(&query)
+        .await
+        .unwrap_or_else(|err| panic!("{kind}: running the capped query: {err}"));
+    assert!(
+        result.row_count() <= 1,
+        "{kind}: asked for one row and got {}",
+        result.row_count()
+    );
+}
+
+/// A statement the server refuses comes back as an error rather than as
+/// nothing.
+///
+/// The case worth having: a driver that reported a refusal as an empty result
+/// would look like a query that matched no rows, and somebody would go looking
+/// at their `WHERE` clause.
+async fn a_statement_the_server_refuses_is_an_error(
+    session: &dyn Session,
+    subject: &Subject,
+    kind: &str,
+) {
+    let sql = validated(
+        &subject.broken_query,
+        session.capabilities(),
+        kind,
+        "broken query",
+    );
+    // Either half may be where it is refused: PostgreSQL plans it during the
+    // estimate, and a driver that estimates nothing only finds out on the way
+    // in. Both are the server saying no, which is what this is about.
+    let Ok(estimate) = session.estimate(&sql).await else {
+        return;
+    };
+    let query = ApprovedQuery::within(sql, None, estimate, None)
+        .unwrap_or_else(|_| unreachable!("no budget cannot be exceeded"));
+    let err = session.execute(&query).await.err().unwrap_or_else(|| {
+        panic!("{kind}: the server was sent something it cannot run and said nothing")
+    });
+    assert!(
+        !matches!(err, DriverError::Unsupported(_)),
+        "{kind}: reported the server's refusal as the driver not supporting it: {err}"
+    );
 }
 
 /// The tree has exactly as many levels as [`Capabilities::hierarchy`] claims.

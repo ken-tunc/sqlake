@@ -11,15 +11,17 @@
 pub mod catalog;
 pub mod config;
 pub mod preview;
+pub mod query;
 pub mod tls;
 pub mod value;
 
 use async_trait::async_trait;
-use sqlake_core::capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
+use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet};
+use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
 use tokio_postgres::{Client, Config};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -50,6 +52,11 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     free_preview: false,
     sortable_preview: true,
     quote_style: QuoteStyle::DoubleQuote,
+    // `standard_conforming_strings` has been on by default since 9.1, so a
+    // backslash in an ordinary literal is an ordinary character. `E'\n'` opts
+    // back in per literal, which nothing here has to know: the scanner's job
+    // is only to find where the literal ends, and `E` does not change that.
+    escaping: Escaping::None,
 };
 
 #[derive(Debug)]
@@ -196,6 +203,14 @@ impl Session for PgSession {
 
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
         preview::preview(&self.client, &self.database, table, req).await
+    }
+
+    async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {
+        query::estimate(&self.client, sql).await
+    }
+
+    async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet> {
+        query::execute(&self.client, query).await
     }
 
     async fn close(self: Box<Self>) {

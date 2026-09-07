@@ -24,6 +24,25 @@ impl DriverKind {
     }
 }
 
+/// Whether a backslash escapes the next character inside a string literal.
+///
+/// The two dialects differ, and the difference is not cosmetic: it decides
+/// where a string ends, and therefore where a *statement* ends. BigQuery
+/// honours `\'`; PostgreSQL with `standard_conforming_strings` — on by default
+/// since 9.1 — does not, and reads the backslash as an ordinary character.
+///
+/// Getting it wrong is wrong in both directions. Honouring a backslash where
+/// the server does not merges two statements into one, which is the dangerous
+/// way; ignoring one where the server honours it splits a valid statement in
+/// two and refuses it, which is the merely annoying way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Escaping {
+    /// `\'` is a quote inside the literal.
+    Backslash,
+    /// A backslash is an ordinary character, and `''` is the only escape.
+    None,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuoteStyle {
     /// `"ident"` — PostgreSQL and the SQL standard.
@@ -73,6 +92,9 @@ pub struct Capabilities {
     /// and sorting means `SELECT … ORDER BY`, which is billed.
     pub sortable_preview: bool,
     pub quote_style: QuoteStyle,
+    /// How a string literal escapes a quote, which is what decides where a
+    /// statement ends. See [`Escaping`].
+    pub escaping: Escaping,
 }
 
 impl Capabilities {
@@ -113,6 +135,7 @@ mod tests {
         free_preview: false,
         sortable_preview: true,
         quote_style: QuoteStyle::DoubleQuote,
+        escaping: Escaping::None,
     };
 
     const BQ: Capabilities = Capabilities {
@@ -132,6 +155,7 @@ mod tests {
         free_preview: true,
         sortable_preview: false,
         quote_style: QuoteStyle::Backtick,
+        escaping: Escaping::Backslash,
     };
 
     #[test]

@@ -108,7 +108,7 @@ partitioning and clustering and leaves the rest empty.
 
 ---
 
-## 4. Staged types (`sqlake-app`)
+## 4. Staged types
 
 Every operation in the app layer is a `UseCase` (`crates/sqlake-app/src/usecase/`) whose input
 and output are expressed as types, so a skipped step is a compile error rather than a runtime
@@ -122,25 +122,38 @@ that do not exist to state them.
 
 | Pipeline | Stages | Where |
 | --- | --- | --- |
-| SQL | `RawSql` → `ValidatedSql` → `PreparedSql` → **`ApprovedQuery`** | M4 |
+| SQL | `RawSql` → `ValidatedSql` → **`ApprovedQuery`** | Built: `sqlake-core` |
 | Connection info | `Profile` → **`ResolvedProfile`** | Built: `sqlake-config`, `sqlake-core` |
 | Templates | `Template` → `BoundTemplate` → **`RawSql`** | M7 |
+
+A stage goes wherever the type that enforces it lives, which for SQL is `sqlake-core`: the
+guarantee *is* the signature of `Session::execute`, and a trait here cannot name a type from
+the crate above it. `Ident → QuotedIdent` is there for the same reason. The policy over it —
+what the budget is, and who is asked — stays in `sqlake-app` and `sqlake-config`.
+
+`PreparedSql` was to sit between the two, carrying bound parameters. There are none until
+templates arrive in M7, so it would hold nothing, and §15 says to add a stage only when
+skipping it would cause a real accident. M7 puts it back with something in it.
 
 The guarantees each stage carries:
 
 | Type | Invariant |
 | --- | --- |
-| `ValidatedSql` | Parsed; single vs. multiple statements determined |
-| `PreparedSql` | Parameters bound; implicit `LIMIT` applied |
-| `ApprovedQuery` | Estimated cost within threshold, or explicitly approved by the user |
+| `ValidatedSql` | One statement, and nothing that runs off the end of the text |
+| `ApprovedQuery` | Estimated, and either inside the budget or answered for by a person |
 | `ResolvedProfile` | Secrets resolved from keyring or command; subject to `zeroize` |
 
 `Session::execute` accepts only an `ApprovedQuery`, so **there is no code path that executes
 without estimating.** The BigQuery billing accident is prevented structurally.
 
+The row cap is not one of these. It rides on `ApprovedQuery` and is applied to the *fetch*:
+appending a `LIMIT` would change the statement the user wrote and the offsets its errors are
+reported at, and is wrong outright for a CTE ending in `INSERT … RETURNING`. Both servers take
+a cap on the response — `query_raw` and `maxResults` — so nothing has to rewrite any text.
+
 Conversions go through `TryFrom` or a dedicated function carrying a failure reason, and
-**constructors are not `pub`**: `ApprovedQuery::new` is callable only from the approval logic
-in the same module. The stages already built — `Ident → QuotedIdent` and
+**constructors are not `pub`**: `ApprovedQuery::new` is private, and the two ways to reach it
+both require an estimate. The stages already built — `Ident → QuotedIdent` and
 `ResultSet → PagedResult → RenderedGrid`/`RenderedDetail` — follow the same pattern and state
 their own invariants.
 

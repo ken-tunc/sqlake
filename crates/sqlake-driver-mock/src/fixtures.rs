@@ -52,6 +52,22 @@ impl Catalog {
     }
 
     #[must_use]
+    /// The first `schema.table` in `text` that this catalogue has.
+    ///
+    /// A scan for a known name rather than anything resembling parsing: the
+    /// mock is not a SQL engine, and the only question it needs answered is
+    /// which fixture a query is plainly about.
+    pub fn name_in(&self, text: &str) -> Option<(&'static str, &'static str)> {
+        let lower = text.to_lowercase();
+        self.schemas.iter().find_map(|schema| {
+            schema.tables.iter().find_map(|table| {
+                lower
+                    .contains(&format!("{}.{}", schema.name, table.name))
+                    .then_some((schema.name, table.name))
+            })
+        })
+    }
+
     pub fn table(&self, schema: &str, table: &str) -> Option<&Table> {
         self.schema(schema)?.tables.iter().find(|t| t.name == table)
     }

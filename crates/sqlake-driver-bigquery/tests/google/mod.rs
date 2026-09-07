@@ -218,6 +218,18 @@ impl Google {
             .await;
     }
 
+    /// `jobs.query`, which serves both the dry run and the real thing — the
+    /// driver sends the same endpoint with `dryRun` flipped, so a responder
+    /// that wants to tell them apart reads the body.
+    pub async fn answers_queries(&self, response: impl wiremock::Respond + 'static) {
+        Mock::given(method("POST"))
+            .and(path(format!("/projects/{PROJECT}/queries")))
+            .and(header("authorization", "Bearer a-token"))
+            .respond_with(response)
+            .mount(&self.server)
+            .await;
+    }
+
     pub async fn answers_any_rows(&self, response: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path_regex(
