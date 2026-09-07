@@ -36,6 +36,8 @@ than reuse — which is what the peer relationship in architecture §2 is protec
 Modelled on herdr: a long-lived process holding session state, a socket API against it, and
 thin noun-verb subcommands over that API.
 
+Built, as of A1:
+
 ```
 sqlake                          launch the TUI (unchanged)
 sqlake --session work           launch the TUI and listen on a named socket
@@ -43,13 +45,20 @@ sqlake --session work           launch the TUI and listen on a named socket
 sqlake api snapshot             print the live Snapshot as JSON
 sqlake api schema               print the request/response schema
 
-sqlake connection list|open|close
+sqlake connection list
 sqlake schema list              namespaces in a connection
-sqlake table list|describe|preview
-sqlake query estimate|run|status|cancel|wait
-sqlake history search
+sqlake table list|preview
+```
 
-sqlake mcp                      speak MCP on stdio
+Planned, with the milestone that brings each:
+
+```
+sqlake connection open|close    A2
+sqlake table describe           M5
+sqlake query estimate|run|status|cancel|wait
+                                A2
+sqlake history search           M8
+sqlake mcp                      A3, speaks MCP on stdio
 ```
 
 Every subcommand prints JSON on stdout and diagnostics on stderr, so output is consumable
@@ -59,8 +68,8 @@ without parsing prose.
 
 | Mode | When | How |
 | --- | --- | --- |
-| **Attached** | A `sqlake` session is running | Connect to its socket. Reuses live connections, live tunnels and already-satisfied auth |
-| **One-shot** | No session, or `--no-attach` | Start the store in-process, run the command, tear down |
+| **Attached** | A session is listening on the socket `--session`/`$SQLAKE_SESSION` names, and the command needs one | Connect to its socket. Reuses live connections, live tunnels and already-satisfied auth |
+| **One-shot** | Nothing is listening on the socket the name resolves to | Start the store in-process, run the command, tear down |
 
 Attached mode is the reason a server exists at all. Connections behind a bastion, an MFA
 prompt or a `gcloud auth` flow are expensive to establish; making an agent re-establish them
@@ -205,7 +214,7 @@ keeps M1–M8 aligned one-to-one with the eight features.
 | # | Lands after | Content | Done when |
 | --- | --- | --- | --- |
 | **A1** | M2 | Read-only CLI and socket API — **built**, in `sqlake-api` | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
-| **A2** | M4 | Query execution over the API | `query estimate\|run\|status\|wait\|cancel`, the byte budget and `NeedsApproval`, read-only enforcement, `issuer` in history |
+| **A2** | M4 | Query execution over the API | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close` — running SQL is the first thing that needs a connection the caller chose. The byte budget and `NeedsApproval`, read-only enforcement, `issuer` in history |
 | **A3** | A2 | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
 Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
