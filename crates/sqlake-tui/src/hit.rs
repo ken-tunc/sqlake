@@ -79,6 +79,8 @@ pub enum ButtonId {
     /// The explorer's search box. Clicking it closes it, which is the only
     /// thing a pointer can usefully do to a box it cannot type into.
     Filter,
+    /// The `+` at the end of the tab bar, which opens a SQL tab.
+    NewSqlTab,
 }
 
 /// What a rectangle on screen belongs to.

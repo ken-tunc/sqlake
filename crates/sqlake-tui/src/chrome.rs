@@ -221,10 +221,22 @@ pub fn scrollbar(
 }
 
 const CLOSE_WIDTH: u16 = 2;
+/// The `+` that opens a SQL tab, and the space after it.
+const NEW_TAB: &str = " + ";
 /// The `[×]` that stops a running job.
 const CANCEL_WIDTH: u16 = 3;
 
-pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, ui: &UiState) {
+/// `connected` is whether there is a connection to open a SQL tab on. Drawn
+/// only then: `+` on a client with nothing open would be an affordance that
+/// answers a click with nothing, and the reason — there is nowhere to run a
+/// query — is not one the bar can explain.
+pub fn tab_bar(
+    frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    area: Rect,
+    ui: &UiState,
+    connected: bool,
+) {
     hits.push(area, Z_BASE, Target::Pane(PaneId::TabBar));
     frame.render_widget(
         Paragraph::new("").style(Style::new().bg(Color::Black)),
@@ -237,7 +249,7 @@ pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, ui: &UiStat
         // A relation's name is data: it can carry a newline, and it is measured
         // in terminal columns rather than characters, or a double-width name
         // would be cut in half and take its close box out of position.
-        let mut label = format!(" {} ", sanitise(tab.table.name()));
+        let mut label = format!(" {} ", sanitise(&tab.title()));
         let mut width = display_width(&label);
         let room = area.right().saturating_sub(x);
         // Stop at the edge rather than drawing a tab half off the screen. The
@@ -268,6 +280,20 @@ pub fn tab_bar(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, ui: &UiStat
         hits.push(close_rect, Z_CHROME, Target::TabClose(tab.id));
 
         x += width + CLOSE_WIDTH;
+    }
+
+    // After the tabs, and skipped rather than squeezed when they have filled
+    // the bar: a `+` drawn over the last tab's close box would take a click
+    // meant for it. `n` still opens one, which is why dropping it is only a
+    // missing affordance and not a missing capability.
+    let new_tab = display_width(NEW_TAB);
+    if connected && area.right().saturating_sub(x) >= new_tab {
+        let rect = Rect::new(x, area.y, new_tab, 1);
+        frame.render_widget(
+            Paragraph::new(NEW_TAB).style(Style::new().fg(Color::Gray)),
+            rect,
+        );
+        hits.push(rect, Z_CHROME, Target::Button(ButtonId::NewSqlTab));
     }
 }
 
@@ -410,7 +436,7 @@ mod tests {
     use sqlake_core::node::TableRef;
 
     use super::*;
-    use crate::ui::OpenTab;
+    use crate::ui::{OpenTab, TabContent};
 
     fn snapshot(busy: usize) -> Snapshot {
         let conn = ConnId::new();
@@ -451,7 +477,7 @@ mod tests {
             ui.tabs.push(OpenTab {
                 id: TabId::new(i as u32),
                 conn: ConnId::new(),
-                table: TableRef::new(["public", &format!("t{i}")]),
+                content: TabContent::Preview(TableRef::new(["public", &format!("t{i}")])),
             });
         }
         ui.active_tab = ui.tabs.first().map(|t| t.id);
@@ -466,7 +492,7 @@ mod tests {
         ui.tabs.push(OpenTab {
             id,
             conn: ConnId::new(),
-            table: TableRef::new(["public", title]),
+            content: TabContent::Preview(TableRef::new(["public", title])),
         });
         ui.active_tab = Some(id);
         ui
@@ -613,7 +639,7 @@ mod tests {
     fn every_tab_offers_its_own_close_box() {
         let ui = ui_with_tabs(3);
         let area = Rect::new(0, 0, 60, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 60, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui, true), 60, 1);
 
         let mut seen_titles = 0;
         let mut seen_closes = 0;
@@ -635,7 +661,7 @@ mod tests {
         // holds five of them with one cell spare, and the sixth is dropped
         // rather than drawn with its close box off the edge.
         let area = Rect::new(0, 0, 31, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 31, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui, true), 31, 1);
 
         let mut tabs = std::collections::BTreeSet::new();
         for x in 0..31 {
@@ -658,7 +684,7 @@ mod tests {
         // to the left of the × the user is aiming at.
         let ui = ui_with_tab_named("ユーザー");
         let area = Rect::new(0, 0, 30, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 30, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui, true), 30, 1);
 
         // " ユーザー " is ten columns wide, so the cross starts at ten.
         assert_eq!(
@@ -677,7 +703,7 @@ mod tests {
         // no close box to click.
         let ui = ui_with_tab_named("a_very_long_relation_name");
         let area = Rect::new(0, 0, 12, 1);
-        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui), 12, 1);
+        let hits = draw(|frame, hits| tab_bar(frame, hits, area, &ui, true), 12, 1);
 
         let closes = (0..12)
             .filter(|x| matches!(hits.at(Position::new(*x, 0)), Some(Target::TabClose(_))))

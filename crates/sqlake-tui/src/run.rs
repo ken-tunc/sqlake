@@ -36,7 +36,7 @@ use crate::mouse::MouseState;
 use crate::overlay;
 use crate::terminal::Tui;
 use crate::tree;
-use crate::ui::UiState;
+use crate::ui::{TabContent, UiState};
 
 /// Run until the store says to quit or the terminal closes.
 ///
@@ -290,7 +290,13 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     }
 
     let frames = chrome::layout(area, ui);
-    chrome::tab_bar(frame, hits, frames.tab_bar, ui);
+    chrome::tab_bar(
+        frame,
+        hits,
+        frames.tab_bar,
+        ui,
+        !snapshot.connections.is_empty(),
+    );
 
     let explorer = chrome::pane(
         frame,
@@ -326,10 +332,10 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     let active = ui
         .active_tab
         .and_then(|id| ui.tabs.iter().find(|t| t.id == id))
-        .map(|t| (t.id, t.conn, t.table.clone()));
+        .map(|t| (t.id, t.conn, t.content.clone()));
     let title = active.as_ref().map_or_else(
         || "Preview".to_owned(),
-        |(_, _, table)| table.name().to_owned(),
+        |(_, _, content)| content.title().into_owned(),
     );
     let grid = chrome::pane(
         frame,
@@ -344,7 +350,14 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     // row short of the end.
     ui.set_viewport(PaneId::Grid, datagrid::body_area(grid));
     let mut detail = None;
-    if let Some((id, conn, table)) = active
+    if let Some((_, _, TabContent::Sql { text, .. })) = &active {
+        // The whole pane, not `body_area`: there is no header row and no
+        // scrollbar column to leave out, because there is no grid.
+        ui.set_viewport(PaneId::Grid, grid);
+        ui.set_sql_lines(crate::sql::line_count(text));
+        crate::sql::render(frame, grid, text, ui.sql_offset());
+    }
+    if let Some((id, conn, TabContent::Preview(table))) = active
         && let Some(preview) = snapshot.preview(conn, &table)
     {
         // A driver that cannot order a preview — BigQuery — makes the header
@@ -1414,6 +1427,31 @@ mod tests {
         let _ = render(&snap, &mut ui, 100, 30);
         let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
         insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    #[tokio::test]
+    async fn screen_with_a_sql_tab_beside_a_preview() {
+        // Both kinds of tab on one bar, and the pane showing a buffer instead
+        // of a grid — which is the whole of what T1 changes on screen.
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+        store.dispatch(Action::PreviewTable {
+            conn,
+            table: table.clone(),
+        });
+        until(&mut rx, |s| {
+            s.preview(conn, &table)
+                .is_some_and(|p| p.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        let mut ui = UiState::new();
+        let _ = ui.apply(crate::intent::ViewCmd::OpenTab { conn, table }, &snap);
+        let _ = ui.apply(crate::intent::ViewCmd::OpenSqlTab { conn }, &snap);
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 20));
     }
 
     #[tokio::test]
