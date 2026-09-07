@@ -94,7 +94,9 @@ impl SettingsFile {
             ));
         }
         let editor = self.editor;
-        let editor_args = self.editor_args.unwrap_or(defaults.editor_args.clone());
+        let editor_args = self
+            .editor_args
+            .unwrap_or_else(|| defaults.editor_args.clone());
         let page_size = self.page_size.unwrap_or(defaults.page_size);
         match page_size {
             0 => Err(ConfigError::invalid(

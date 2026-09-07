@@ -181,11 +181,10 @@ fn main() -> Result<std::process::ExitCode> {
         None => None,
     };
 
-    // Before the screen is taken over: resolving it reads the environment and
-    // can fail on a machine with no state directory, and that is a message
-    // somebody can read here rather than a dialog over a client they have not
-    // seen yet.
-    let editor = editor(&settings)?;
+    // Before the screen is taken over: it reads the environment, and doing it
+    // per keystroke would let a variable changed in another shell take effect
+    // halfway through a session, with the file moving under it.
+    let editor = editor(&settings);
 
     let (mut _guard, mut terminal) = TerminalGuard::enter(!args.no_mouse)?;
     assert!(
@@ -240,15 +239,19 @@ fn listen(
 /// Resolved once, here, rather than per keystroke: a variable changed in
 /// another shell must not take effect halfway through a session, and the file
 /// would move with it.
-fn editor(settings: &Settings) -> Result<sqlake_tui::editor::Editor> {
+fn editor(settings: &Settings) -> sqlake_tui::editor::Editor {
+    // A temporary directory when there is nowhere else, for the reason
+    // `log_dir` gives: no `$HOME` and no `$XDG_STATE_HOME` is not a reason to
+    // refuse to start, and here it would be a refusal over a feature this run
+    // may never use. The file only has to outlive the editor.
     let scratch = sqlake_config::paths::scratch_dir(
-        &sqlake_config::paths::state_dir().context("finding the state directory")?,
+        &sqlake_config::paths::state_dir().unwrap_or_else(|_| std::env::temp_dir().join("sqlake")),
     );
-    Ok(sqlake_tui::editor::Editor::new(
+    sqlake_tui::editor::Editor::new(
         settings.editor_program(std::env::var_os("VISUAL"), std::env::var_os("EDITOR")),
         settings.editor_args.clone(),
         scratch,
-    ))
+    )
 }
 
 /// Every driver this build can talk to.

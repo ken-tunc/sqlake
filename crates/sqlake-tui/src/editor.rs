@@ -107,14 +107,7 @@ impl Editor {
             Ok(back) => back,
             Err(why) => return Edited::Failed(format!("could not read {}: {why}", path.display())),
         };
-
-        if back != text {
-            return Edited::Changed(back);
-        }
-        if elapsed < TOO_QUICK {
-            return Edited::Returned;
-        }
-        Edited::Unchanged
+        outcome(text, back, elapsed)
     }
 
     /// The message for [`Edited::Returned`], which names the setting that
@@ -127,6 +120,24 @@ impl Editor {
             self.program
         )
     }
+}
+
+/// What the file coming back means.
+///
+/// Separate from the spawn so the timing rule has an exact test: asserting it
+/// through a real `sh` would be a race with [`TOO_QUICK`] on a loaded machine,
+/// and the version of that assertion which never flakes is the one that no
+/// longer checks the rule.
+fn outcome(before: &str, after: String, elapsed: Duration) -> Edited {
+    // Ahead of the timing: an editor that saved something was used, however
+    // fast. Only an unchanged file leaves the question open.
+    if after != before {
+        return Edited::Changed(after);
+    }
+    if elapsed < TOO_QUICK {
+        return Edited::Returned;
+    }
+    Edited::Unchanged
 }
 
 fn write(path: &Path, text: &str) -> io::Result<()> {
@@ -177,12 +188,33 @@ mod tests {
     }
 
     #[test]
-    fn an_editor_that_returns_at_once_is_reported() {
+    fn an_editor_that_returns_at_once_with_nothing_saved_is_reported() {
+        let quick = TOO_QUICK / 2;
+        let slow = TOO_QUICK * 2;
+        assert_eq!(
+            outcome("select 1", "select 1".to_owned(), quick),
+            Edited::Returned
+        );
+        assert_eq!(
+            outcome("select 1", "select 1".to_owned(), slow),
+            Edited::Unchanged
+        );
+    }
+
+    #[test]
+    fn saving_something_settles_it_whatever_the_clock_says() {
+        // The timing is a guess about a GUI editor that forked; a file that
+        // changed is not a guess about anything.
+        assert_eq!(
+            outcome("select 1", "select 2".to_owned(), Duration::ZERO),
+            Edited::Changed("select 2".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_hurried_message_names_the_setting_that_fixes_it() {
         let dir = tmp();
-        let e = editor("true", dir.path());
-        let path = e.path_for(TabId::new(1));
-        assert_eq!(e.edit(&path, "select 1"), Edited::Returned);
-        assert!(e.hurried().contains("editor_args"));
+        assert!(editor("true", dir.path()).hurried().contains("editor_args"));
     }
 
     #[test]

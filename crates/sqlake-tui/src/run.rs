@@ -153,7 +153,17 @@ pub async fn run(
                 // is drawn until it comes back, which is the point: the editor
                 // owns the screen while it runs.
                 Intent::Handover(Handover::Edit(tab)) => {
-                    hand_over(terminal, guard, editor, &mut ui, tab)?;
+                    // The event stream goes first, and a fresh one comes back
+                    // after. Its reader thread sits in a blocking read on
+                    // `/dev/tty` from the moment the stream returns `Pending`,
+                    // and nothing about handing the screen over stops it: the
+                    // first key typed into the editor would be eaten there and
+                    // then delivered here as a command once the screen is back,
+                    // which is how a `q` meant for vim quits the client.
+                    drop(events);
+                    let handed = hand_over(terminal, guard, editor, &mut ui, tab);
+                    events = EventStream::new();
+                    handed?;
                     dirty = true;
                 }
             }

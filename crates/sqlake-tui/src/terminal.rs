@@ -79,8 +79,11 @@ impl TerminalGuard {
         // Recorded before `f` runs: if re-entry fails half way, `Drop` must not
         // try to disable a capture that is not on.
         self.mouse = false;
-        let out = f();
+        // Before `f`, not after: an editor started on a terminal still in raw
+        // mode on the alternate screen is one nobody can type into, and the
+        // client is on its way out either way.
         released?;
+        let out = f();
 
         enable_raw_mode()?;
         let mut stdout = io::stdout();

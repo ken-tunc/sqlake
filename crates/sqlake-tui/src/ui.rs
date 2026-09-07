@@ -609,11 +609,7 @@ impl UiState {
     /// The active tab's SQL, or `None` when it is a preview.
     #[must_use]
     pub fn active_sql(&self) -> Option<&str> {
-        let id = self.active_tab?;
-        match &self.tabs.iter().find(|t| t.id == id)?.content {
-            TabContent::Sql { text, .. } => Some(text),
-            TabContent::Preview(_) => None,
-        }
+        self.buffer_of(self.active_tab?)
     }
 
     fn push_toast(&mut self, severity: Severity, text: impl Into<String>) {
