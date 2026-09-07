@@ -4052,6 +4052,7 @@ dependencies = [
  "sqlake-app",
  "sqlake-core",
  "sqlake-driver-mock",
+ "tempfile",
  "time",
  "tokio",
  "tracing",

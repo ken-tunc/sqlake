@@ -181,13 +181,24 @@ fn main() -> Result<std::process::ExitCode> {
         None => None,
     };
 
-    let (_guard, mut terminal) = TerminalGuard::enter(!args.no_mouse)?;
+    // Before the screen is taken over: it reads the environment, and doing it
+    // per keystroke would let a variable changed in another shell take effect
+    // halfway through a session, with the file moving under it.
+    let editor = editor(&settings);
+
+    let (mut _guard, mut terminal) = TerminalGuard::enter(!args.no_mouse)?;
     assert!(
         !args.panic_test,
         "--panic-test: the terminal should come back"
     );
 
-    let result = runtime.block_on(sqlake_tui::run(&mut terminal, &store, !args.no_mouse));
+    let result = runtime.block_on(sqlake_tui::run(
+        &mut terminal,
+        &mut _guard,
+        &store,
+        !args.no_mouse,
+        &editor,
+    ));
 
     // The user asked to quit, so the client goes.
     //
@@ -223,6 +234,26 @@ fn listen(
     Ok(listener.spawn_on(runtime, Arc::new(sqlake_api::Service::new(store.clone()))))
 }
 
+/// What `e` hands the buffer to, and where the working files go.
+///
+/// Resolved once, here, rather than per keystroke: a variable changed in
+/// another shell must not take effect halfway through a session, and the file
+/// would move with it.
+fn editor(settings: &Settings) -> sqlake_tui::editor::Editor {
+    // A temporary directory when there is nowhere else, for the reason
+    // `log_dir` gives: no `$HOME` and no `$XDG_STATE_HOME` is not a reason to
+    // refuse to start, and here it would be a refusal over a feature this run
+    // may never use. The file only has to outlive the editor.
+    let scratch = sqlake_config::paths::scratch_dir(
+        &sqlake_config::paths::state_dir().unwrap_or_else(|_| std::env::temp_dir().join("sqlake")),
+    );
+    sqlake_tui::editor::Editor::new(
+        settings.editor_program(std::env::var_os("VISUAL"), std::env::var_os("EDITOR")),
+        settings.editor_args.clone(),
+        scratch,
+    )
+}
+
 /// Every driver this build can talk to.
 ///
 /// All of them, always: which one a connection needs is a fact about its
@@ -243,7 +274,7 @@ fn configuration(args: &Args) -> Result<(Arc<dyn Profiles>, Settings)> {
     // message on a terminal that still works, instead of an error raised into
     // a client that has already taken the screen over.
     let config = Config::load().context("reading the configuration")?;
-    let settings = config.settings;
+    let settings = config.settings.clone();
     Ok((Arc::new(config), settings))
 }
 

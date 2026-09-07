@@ -528,15 +528,22 @@ impl UiState {
         }
     }
 
-    /// A closed connection takes its tabs with it.
+    /// A closed connection takes its *preview* tabs with it.
     ///
     /// `Disconnect` drops the connection's previews, and a tab left pointing
     /// at one shows a blank pane for ever: nothing to fetch, and no session
-    /// left to fetch it with.
+    /// left to fetch it with. Reopening it fetches the rows again, so nothing
+    /// is lost by closing it.
+    ///
+    /// A SQL tab is kept. Its buffer is the user's own writing rather than a
+    /// copy of something the database still has, and closing the connection is
+    /// not a reason to throw away what somebody typed — it stays readable and
+    /// copyable, and what it cannot do is run.
     pub fn close_disconnected_tabs(&mut self, snapshot: &Snapshot) {
         let closed: Vec<TabId> = self
             .tabs
             .iter()
+            .filter(|t| t.table().is_some())
             .filter(|t| {
                 snapshot
                     .connection(t.conn)
@@ -561,14 +568,48 @@ impl UiState {
         self.active_tab = Some(id);
     }
 
-    /// The active tab's SQL, or `None` when it is a preview.
+    /// One tab's SQL, or `None` when it is a preview or gone.
     #[must_use]
-    pub fn active_sql(&self) -> Option<&str> {
-        let id = self.active_tab?;
-        match &self.tabs.iter().find(|t| t.id == id)?.content {
+    pub fn buffer_of(&self, tab: TabId) -> Option<&str> {
+        match &self.tabs.iter().find(|t| t.id == tab)?.content {
             TabContent::Sql { text, .. } => Some(text),
             TabContent::Preview(_) => None,
         }
+    }
+
+    /// Replace one tab's SQL with what came back from the editor.
+    ///
+    /// By id rather than "the active one": the editor had the terminal, and a
+    /// snapshot arriving while it ran can have closed the tab underneath it.
+    pub fn set_buffer(&mut self, tab: TabId, text: String) {
+        if let Some(TabContent::Sql { text: buffer, .. }) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .map(|t| &mut t.content)
+        {
+            *buffer = text;
+        }
+    }
+
+    /// A passing notice, for something that went differently rather than
+    /// wrongly.
+    pub fn warn(&mut self, text: impl Into<String>) {
+        self.push_toast(Severity::Warning, text);
+    }
+
+    /// A dialog, for something that has to be read before carrying on.
+    pub fn raise_error(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        // The menu sits above the modal, so one left open would float over the
+        // dialog — the same reason `raise_connection_failure` closes it.
+        self.menu = None;
+        self.modal = Some(crate::overlay::Modal::error(title, body));
+    }
+
+    /// The active tab's SQL, or `None` when it is a preview.
+    #[must_use]
+    pub fn active_sql(&self) -> Option<&str> {
+        self.buffer_of(self.active_tab?)
     }
 
     fn push_toast(&mut self, severity: Severity, text: impl Into<String>) {
@@ -1863,6 +1904,76 @@ mod tests {
             &snap,
         );
         assert!(fetch.is_none(), "{fetch:?}");
+    }
+
+    #[test]
+    fn a_closed_connection_keeps_a_sql_tab_and_its_buffer() {
+        // The buffer is the user's own writing rather than a copy of
+        // something the database still has. Closing the connection is not a
+        // reason to throw away what somebody typed.
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let sql = ui.active_tab.expect("a tab");
+        ui.set_buffer(sql, "select 1".to_owned());
+        let _ = ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+
+        snap.connections[0].status = ConnStatus::Closed;
+        ui.close_disconnected_tabs(&snap);
+
+        assert_eq!(ui.tabs.len(), 1, "the preview should have gone");
+        assert_eq!(ui.buffer_of(sql), Some("select 1"));
+    }
+
+    #[test]
+    fn a_buffer_is_set_by_id_rather_than_by_which_tab_is_active() {
+        // The editor had the terminal, and a snapshot arriving while it ran
+        // can have moved the focus — or closed the tab underneath it.
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let first = ui.active_tab.expect("a tab");
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let second = ui.active_tab.expect("a tab");
+
+        ui.set_buffer(first, "select 1".to_owned());
+        assert_eq!(ui.buffer_of(first), Some("select 1"));
+        assert_eq!(ui.buffer_of(second), Some(""));
+
+        // A tab that is gone swallows the text rather than putting it
+        // somewhere else.
+        let _ = ui.apply(ViewCmd::CloseTab(first), &snap);
+        ui.set_buffer(first, "select 2".to_owned());
+        assert_eq!(ui.buffer_of(second), Some(""));
+    }
+
+    #[test]
+    fn a_preview_tab_has_no_buffer_to_write_to() {
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        let tab = ui.active_tab.expect("a tab");
+        assert_eq!(ui.buffer_of(tab), None);
+        // Silently, because the input layer already refuses to produce the
+        // handover for a preview — this is the second half of that, so a
+        // caller that got it wrong cannot turn rows into text.
+        ui.set_buffer(tab, "select 1".to_owned());
+        assert_eq!(ui.buffer_of(tab), None);
     }
 
     #[test]

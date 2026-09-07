@@ -27,4 +27,5 @@ unicode-width.workspace = true
 # run against them here rather than against values written to suit it.
 insta.workspace = true
 sqlake-driver-mock.workspace = true
+tempfile.workspace = true
 time = { workspace = true, features = ["macros"] }

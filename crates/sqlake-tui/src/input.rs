@@ -15,7 +15,7 @@ use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::TableRef;
 
 use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
-use crate::intent::{Context, Intent, IntentKind, ViewCmd};
+use crate::intent::{Context, Handover, Intent, IntentKind, ViewCmd};
 use crate::mouse::Gesture;
 use crate::ui::{Filter, OpenTab, Toast};
 
@@ -293,6 +293,16 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::LoadMore,
     },
     KeyBinding {
+        // Global rather than in the grid: the pane it acts on is the grid's,
+        // but a query being written is what the whole client is doing at that
+        // point, and needing focus in the pane first is a step with nothing
+        // behind it. `e` is free everywhere, and design.md has reserved it
+        // since before there was a SQL tab to spend it on.
+        keys: &[key('e')],
+        context: Context::Global,
+        kind: IntentKind::EditExternally,
+    },
+    KeyBinding {
         // `n` for a new one. Global rather than in the grid: the gesture it
         // matches is the `+` on the tab bar, which no pane owns, and a tab
         // opened only while the grid has focus would be unreachable from the
@@ -440,6 +450,17 @@ impl InputContext<'_> {
         })
     }
 
+    /// The active tab, when it is one with a buffer to edit.
+    fn editable_tab(&self) -> Option<TabId> {
+        let id = self.active_tab?;
+        self.tabs
+            .iter()
+            .find(|t| t.id == id)?
+            .table()
+            .is_none()
+            .then_some(id)
+    }
+
     /// The relation the active tab points at, if any.
     fn active_preview(&self) -> Option<(ConnId, TableRef)> {
         let id = self.active_tab?;
@@ -526,6 +547,16 @@ pub fn on_mouse(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec
 fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Vec<Intent> {
     match (target, gesture) {
         (Target::Pane(pane), Gesture::Click) => vec![ViewCmd::FocusPane(pane).into()],
+        // A SQL tab draws no cells, so the pane itself is what a pointer lands
+        // on — which makes double-clicking the buffer the obvious way to open
+        // it, and the reason design.md called it "a click on the editor area".
+        // On a preview the pane is covered by cells, so this is never reached
+        // there; the `table().is_none()` check is what makes that a fact rather
+        // than an assumption about layout.
+        (Target::Pane(PaneId::Grid), Gesture::DoubleClick) => ctx
+            .editable_tab()
+            .map(|tab| vec![Handover::Edit(tab).into()])
+            .unwrap_or_default(),
         // The wheel over the part of a pane its content does not fill. Without
         // this, a five-row result in a forty-row grid ignores the wheel
         // everywhere below the last row.
@@ -1056,6 +1087,12 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .sql_connection()
             .map(|conn| vec![ViewCmd::OpenSqlTab { conn }.into()])
             .unwrap_or_default(),
+        // Only a SQL tab has a buffer. On a preview this does nothing rather
+        // than opening an editor on the rows, which is not a thing to edit.
+        IntentKind::EditExternally => ctx
+            .editable_tab()
+            .map(|tab| vec![Handover::Edit(tab).into()])
+            .unwrap_or_default(),
         IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
             .map(|tab| vec![ViewCmd::SelectTab(tab).into()])
             .unwrap_or_default(),
@@ -1271,6 +1308,17 @@ mod tests {
                 conn,
                 content: TabContent::Preview(TableRef::new(["public", "empty"])),
             },
+            // A SQL tab, so the sweep reaches the bindings that only fire on
+            // one — and, just as much, so it sees the ones that must *not*
+            // fire on one.
+            OpenTab {
+                id: TabId::new(3),
+                conn,
+                content: TabContent::Sql {
+                    number: 1,
+                    text: "select 1".to_owned(),
+                },
+            },
         ];
 
         let snapshot = Snapshot {
@@ -1290,11 +1338,14 @@ mod tests {
             explorer,
             previews: tabs
                 .iter()
-                .map(|t| PreviewView {
+                // A SQL tab has no relation, so the store holds nothing for
+                // it — which is the shape being pinned down here.
+                .filter_map(|t| Some((t.conn, t.table()?.clone())))
+                .map(|(conn, table)| PreviewView {
                     exhausted: false,
                     attempts: 0,
-                    conn: t.conn,
-                    table: t.table().expect("a preview tab").clone(),
+                    conn,
+                    table,
                     sort: None,
                     loaded_rows: 0,
                     data: LoadState::Idle,
@@ -1944,6 +1995,36 @@ mod tests {
     }
 
     #[test]
+    fn e_edits_a_sql_tab_and_leaves_a_preview_alone() {
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        // The fixture's first tab is a preview: nothing to edit there, and
+        // opening an editor on the rows is not a thing to do to them.
+        assert!(on_key(press(KeyCode::Char('e')), &c).is_empty());
+
+        c.active_tab = Some(TabId::new(3));
+        assert_eq!(
+            on_key(press(KeyCode::Char('e')), &c),
+            [Intent::Handover(Handover::Edit(TabId::new(3)))]
+        );
+    }
+
+    #[test]
+    fn double_clicking_the_buffer_does_what_e_does() {
+        // A SQL tab draws no cells, so the pane itself is what a pointer
+        // lands on.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(TabId::new(3));
+        assert_eq!(
+            on_mouse(Target::Pane(PaneId::Grid), Gesture::DoubleClick, &c),
+            [Intent::Handover(Handover::Edit(TabId::new(3)))]
+        );
+        c.active_tab = Some(TabId::new(1));
+        assert!(on_mouse(Target::Pane(PaneId::Grid), Gesture::DoubleClick, &c).is_empty());
+    }
+
+    #[test]
     fn closing_a_sql_tab_forgets_nothing() {
         // A `ForgetPreview` here would drop the cache of whatever relation
         // happened to be reachable, on a tab that never had one.
@@ -2137,9 +2218,11 @@ mod tests {
             on_key(press(KeyCode::Char(']')), &c),
             [Intent::View(ViewCmd::SelectTab(TabId::new(2)))]
         );
+        // With only two tabs open both directions gave the same answer, so
+        // this could not tell them apart. The third makes it a test.
         assert_eq!(
             on_key(press(KeyCode::Char('[')), &c),
-            [Intent::View(ViewCmd::SelectTab(TabId::new(2)))],
+            [Intent::View(ViewCmd::SelectTab(TabId::new(3)))],
             "from the first tab, backwards wraps to the last"
         );
     }
@@ -2598,11 +2681,16 @@ mod tests {
                     // can only fire while it is open, and a sweep that never
                     // opens it would report those bindings as dead.
                     for filter in [None, Some(&f.searches[0]), Some(&f.searches[1])] {
-                        let mut c = f.ctx(focus);
-                        c.tree_selection = selection;
-                        c.modal_open = modal_open;
-                        c.filter = filter;
-                        out.push(c);
+                        // Both kinds of tab: `e` fires only on a SQL one, and
+                        // a sweep that never focused one would report it dead.
+                        for tab in f.tabs.iter().map(|t| t.id) {
+                            let mut c = f.ctx(focus);
+                            c.tree_selection = selection;
+                            c.modal_open = modal_open;
+                            c.filter = filter;
+                            c.active_tab = Some(tab);
+                            out.push(c);
+                        }
                     }
                 }
             }

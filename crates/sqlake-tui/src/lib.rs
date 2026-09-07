@@ -15,6 +15,7 @@ pub mod chrome;
 pub mod copy;
 pub mod datagrid;
 pub mod detail;
+pub mod editor;
 pub mod grid;
 pub mod hit;
 pub mod input;

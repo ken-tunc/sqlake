@@ -5,6 +5,13 @@
 //! panic, and (from M4) handing the terminal to `$EDITOR`. Every one of those
 //! goes through [`restore`], so there is exactly one thing to get right.
 //!
+//! [`TerminalGuard::suspended`] has no test of its own, deliberately: it
+//! enables raw mode on the real terminal, and a test that ran it would put the
+//! terminal running the tests into raw mode. What it is made of is covered
+//! instead — `restore` here, and `editor::edit` in its own module — leaving
+//! only the order of the two, which is what `--panic-test` proves for the
+//! sibling path through the same function.
+//!
 //! SIGTERM is the gap: a signal does not unwind, so `Drop` never runs and the
 //! terminal is left in raw mode on the alternate screen. Closing it means a
 //! signal handler that calls [`restore`], which nothing needs yet.
@@ -45,6 +52,48 @@ impl TerminalGuard {
         }
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         Ok((guard, terminal))
+    }
+
+    /// Give the terminal back for the duration of `f`, then take it again.
+    ///
+    /// The `$EDITOR` handoff, and the reason `restore` is a free function
+    /// rather than only a `Drop`: the editor needs raw mode off, the main
+    /// screen back and the cursor visible, which is precisely what quitting
+    /// does — and doing it any other way would be a second teardown to keep
+    /// in step with this one.
+    ///
+    /// The screen is redrawn from scratch on the way back in. The editor wrote
+    /// over the alternate screen's contents, and ratatui's buffer still
+    /// believes what it drew last, so without a clear the next frame updates
+    /// only the cells it thinks changed and leaves the editor's output around
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Anything the terminal refuses. `f` has already run when a re-entry
+    /// error is returned, so its effect is not undone — the caller is expected
+    /// to stop drawing, which is what leaves `Drop` to tidy up.
+    pub fn suspended<T>(&mut self, terminal: &mut Tui, f: impl FnOnce() -> T) -> io::Result<T> {
+        let released = restore(self.mouse);
+        let wanted_mouse = self.mouse;
+        // Recorded before `f` runs: if re-entry fails half way, `Drop` must not
+        // try to disable a capture that is not on.
+        self.mouse = false;
+        // Before `f`, not after: an editor started on a terminal still in raw
+        // mode on the alternate screen is one nobody can type into, and the
+        // client is on its way out either way.
+        released?;
+        let out = f();
+
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        if wanted_mouse {
+            execute!(stdout, EnableMouseCapture)?;
+            self.mouse = true;
+        }
+        terminal.clear()?;
+        Ok(out)
     }
 }
 

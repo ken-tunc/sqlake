@@ -18,10 +18,10 @@ use crate::grid::sanitise;
 
 /// Shown in place of the buffer while it is empty.
 ///
-/// Names no key on purpose: there is no way to fill the buffer until the
-/// `$EDITOR` handoff arrives, and a hint pointing at a binding that does not
-/// exist is the same failure as a comment describing code that is not there.
-const EMPTY: &str = "Nothing to run yet.";
+/// Names the key, now that `e` is bound to something. The double-click that
+/// does the same thing is deliberately not mentioned: a terminal that cannot
+/// deliver one is exactly the terminal this line has to be useful on.
+const EMPTY: &str = "Press e to write a query.";
 
 /// `offset` is the first line drawn, so a buffer longer than the pane can be
 /// scrolled through the same way everything else is.
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_buffer_says_it_is_empty() {
+    fn an_empty_buffer_says_how_to_fill_it() {
         assert!(drawn("", 0, 3).contains(EMPTY));
         // Whitespace is not a query either, and a pane showing three blank
         // lines is one nobody can tell from a broken one.

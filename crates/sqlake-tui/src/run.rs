@@ -29,12 +29,14 @@ use tokio::sync::watch;
 
 use crate::chrome;
 use crate::datagrid;
+use crate::editor::{Edited, Editor};
 use crate::hit::{HitMap, PaneId, Target};
 use crate::input::{self, InputContext};
+use crate::intent::Handover;
 use crate::intent::Intent;
 use crate::mouse::MouseState;
 use crate::overlay;
-use crate::terminal::Tui;
+use crate::terminal::{TerminalGuard, Tui};
 use crate::tree;
 use crate::ui::{TabContent, UiState};
 
@@ -44,7 +46,13 @@ use crate::ui::{TabContent, UiState};
 ///
 /// Propagates terminal write failures. The caller still holds the
 /// `TerminalGuard`, so the screen is restored either way.
-pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::Result<()> {
+pub async fn run(
+    terminal: &mut Tui,
+    guard: &mut TerminalGuard,
+    store: &Store,
+    mouse_enabled: bool,
+    editor: &Editor,
+) -> io::Result<()> {
     let mut mouse = MouseState::new();
     let mut events = EventStream::new();
     let mut snapshots = store.subscribe();
@@ -141,8 +149,73 @@ pub async fn run(terminal: &mut Tui, store: &Store, mouse_enabled: bool) -> io::
                 Intent::App(action) => {
                     store.dispatch(action);
                 }
+                // With the terminal handed over and the loop stopped. Nothing
+                // is drawn until it comes back, which is the point: the editor
+                // owns the screen while it runs.
+                Intent::Handover(Handover::Edit(tab)) => {
+                    // The event stream goes first, and a fresh one comes back
+                    // after. Its reader thread sits in a blocking read on
+                    // `/dev/tty` from the moment the stream returns `Pending`,
+                    // and nothing about handing the screen over stops it: the
+                    // first key typed into the editor would be eaten there and
+                    // then delivered here as a command once the screen is back,
+                    // which is how a `q` meant for vim quits the client.
+                    drop(events);
+                    let handed = hand_over(terminal, guard, editor, &mut ui, tab);
+                    events = EventStream::new();
+                    handed?;
+                    dirty = true;
+                }
             }
         }
+    }
+}
+
+/// Write the tab's buffer out, run the editor on it, and take back what came
+/// back.
+///
+/// The store's task keeps running throughout — a query still streaming is
+/// still consumed, and the display catches up when the screen returns.
+///
+/// # Errors
+///
+/// Only a terminal that could not be given back or taken again. Everything
+/// about the editor itself — missing, refused, exited without saving — is a
+/// message to the user, because none of it is a reason to stop the client.
+fn hand_over(
+    terminal: &mut Tui,
+    guard: &mut TerminalGuard,
+    editor: &Editor,
+    ui: &mut UiState,
+    tab: sqlake_core::id::TabId,
+) -> io::Result<()> {
+    let Some(text) = ui.buffer_of(tab).map(str::to_owned) else {
+        return Ok(());
+    };
+    let path = editor.path_for(tab);
+    let outcome = guard.suspended(terminal, || editor.edit(&path, &text))?;
+    apply_edit(ui, editor, tab, outcome);
+    Ok(())
+}
+
+/// What the screen does with each way an edit can end.
+///
+/// Split from `hand_over` so it can be tested: the half above it takes the
+/// terminal over, and a test that ran it would put the terminal running the
+/// tests into raw mode.
+fn apply_edit(ui: &mut UiState, editor: &Editor, tab: sqlake_core::id::TabId, outcome: Edited) {
+    match outcome {
+        Edited::Changed(back) => ui.set_buffer(tab, back),
+        // Nothing to say. Closing without saving is how somebody says no, and
+        // a message about it is a message about a decision already made.
+        Edited::Unchanged => {}
+        // A notice rather than a dialog: the buffer is as it was, so there is
+        // nothing to answer — only a setting worth knowing about.
+        Edited::Returned => ui.warn(editor.hurried()),
+        // A dialog, because nothing happened and the reason is a sentence
+        // wider than the status bar: `$EDITOR` naming a program that is not
+        // installed reads as `e` doing nothing at all.
+        Edited::Failed(why) => ui.raise_error("The editor", why),
     }
 }
 
@@ -1427,6 +1500,78 @@ mod tests {
         let _ = render(&snap, &mut ui, 100, 30);
         let _ = ui.apply(crate::intent::ViewCmd::SelectCell { row: 2, col: 1 }, &snap);
         insta::assert_snapshot!(screen(&snap, &mut ui, 100, 30));
+    }
+
+    fn an_editor() -> Editor {
+        Editor::new(
+            "vi".into(),
+            Vec::new(),
+            std::path::PathBuf::from("/scratch"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_saved_buffer_reaches_the_tab_it_was_edited_for() {
+        let (_store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let mut ui = UiState::new();
+        let _ = ui.apply(crate::intent::ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+
+        apply_edit(
+            &mut ui,
+            &an_editor(),
+            tab,
+            Edited::Changed("select 1".to_owned()),
+        );
+        assert_eq!(ui.buffer_of(tab), Some("select 1"));
+        assert!(ui.toasts.is_empty() && ui.modal.is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_the_editor_without_saving_says_nothing() {
+        // It is how somebody says no, and a message about it is a message
+        // about a decision already made.
+        let (_store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let mut ui = UiState::new();
+        let _ = ui.apply(crate::intent::ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+
+        apply_edit(&mut ui, &an_editor(), tab, Edited::Unchanged);
+        assert_eq!(ui.buffer_of(tab), Some(""));
+        assert!(ui.toasts.is_empty() && ui.modal.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_editor_that_forked_is_a_notice_and_a_broken_one_is_a_dialog() {
+        // The first left the buffer as it was and only wants a setting
+        // changed; the second did nothing at all, and `e` appearing to do
+        // nothing is what the dialog is for.
+        let (_store, snap) = connected().await;
+        let conn = snap.connections[0].id;
+        let mut ui = UiState::new();
+        let _ = ui.apply(crate::intent::ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+
+        apply_edit(&mut ui, &an_editor(), tab, Edited::Returned);
+        assert_eq!(ui.toasts.len(), 1);
+        assert!(ui.toasts[0].text.contains("editor_args"), "{:?}", ui.toasts);
+        assert!(ui.modal.is_none());
+
+        apply_edit(
+            &mut ui,
+            &an_editor(),
+            tab,
+            Edited::Failed("no such file".to_owned()),
+        );
+        assert!(
+            ui.modal
+                .as_ref()
+                .is_some_and(|m| m.body.contains("no such file")),
+            "{:?}",
+            ui.modal
+        );
     }
 
     #[tokio::test]
