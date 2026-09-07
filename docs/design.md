@@ -39,8 +39,8 @@ sqlake/
     ├── sqlake-app/               # use cases, state, actions. UI-agnostic and testable
     ├── sqlake-tui/               # rendering and input, on ratatui
     ├── sqlake-api/               # agent surface: protocol, schema, socket client and server
-    ├── sqlake-config/            # profile and settings persistence, secret resolution
     ├── sqlake-conformance/       # one suite every driver has to pass, run per driver
+    ├── sqlake-config/            # profile and settings persistence, secret resolution
     ├── sqlake-driver-postgres/
     ├── sqlake-driver-bigquery/
     └── sqlake-driver-mock/       # for UI development and tests. Every screen works with no DB
@@ -51,22 +51,32 @@ sqlake/
 ```
 
 `crates/` is the list of what exists; the rest are created by the milestone that first needs
-one. An empty placeholder crate is dead weight and hides which parts are real — so this list
-is checked against `ls crates/` rather than kept by hand.
+one. An empty placeholder crate is dead weight and hides which parts are real, so the unbuilt
+ones sit below the tree as comments instead of in it.
+
+That much is checked: `the_workspace_layout_lists_the_crates_that_exist` reads this tree and
+compares it with `crates/`, and fails in both directions. A list nothing checks is one that
+drifts — this one already had, which is what the test is for.
 
 Dependencies flow one way:
 
 ```
               ┌ sqlake-tui ┐
 sqlake(bin) ──┤            ├──→ sqlake-app ──→ sqlake-core ←── sqlake-driver-*
-              └ sqlake-api ┘         ↘ sqlake-config, sqlake-store
+              └ sqlake-api ┘ ↘ sqlake-config
                     ↑
               sqlake-mcp
 ```
 
+`sqlake-config` is reached by the bin and by `sqlake-api`, not by `sqlake-app`: resolving a
+profile happens before the app layer, which is handed the result. `sqlake-mcp` (A3) and
+`sqlake-store` (M7, M8) are in the diagram as the shape they will take, not as crates that
+exist; the store will hang off `sqlake-app`.
+
 `sqlake-tui` and `sqlake-api` are **peers**: two front-ends over the same application layer,
-neither depending on the other (§8). The TUI only needs to know how to start a listener, which
-is `sqlake-api`'s job.
+neither depending on the other (§8). Neither does the TUI start the listener — the bin does,
+because a socket is opened by whoever parsed `--session`, and the TUI is then one more thing
+sharing the store behind it.
 
 ---
 
@@ -104,17 +114,17 @@ Every operation in the app layer is a `UseCase` (`crates/sqlake-app/src/usecase/
 and output are expressed as types, so a skipped step is a compile error rather than a runtime
 surprise.
 
-The SQL pipeline below is M4's and does not exist yet; the connection and template ones are
-noted where they stand. What is built is in the crates, and the invariants each stage carries
-are on the types themselves — this section is here for the ones that are not.
+Each pipeline below carries the milestone that builds it, or the crate it is already in. What
+is built states its invariants on the types themselves — this section is here for the ones
+that do not exist to state them.
 
 ### 4.1 Stages as types
 
-| Pipeline | Stages |
-| --- | --- |
-| SQL | `RawSql` → `ValidatedSql` → `PreparedSql` → **`ApprovedQuery`** |
-| Connection info | `Profile` → **`ResolvedProfile`** |
-| Templates | `Template` → `BoundTemplate` → **`RawSql`** |
+| Pipeline | Stages | Where |
+| --- | --- | --- |
+| SQL | `RawSql` → `ValidatedSql` → `PreparedSql` → **`ApprovedQuery`** | M4 |
+| Connection info | `Profile` → **`ResolvedProfile`** | Built: `sqlake-config`, `sqlake-core` |
+| Templates | `Template` → `BoundTemplate` → **`RawSql`** | M7 |
 
 The guarantees each stage carries:
 
@@ -131,8 +141,8 @@ without estimating.** The BigQuery billing accident is prevented structurally.
 Conversions go through `TryFrom` or a dedicated function carrying a failure reason, and
 **constructors are not `pub`**: `ApprovedQuery::new` is callable only from the approval logic
 in the same module. The stages already built — `Ident → QuotedIdent` and
-`RowBatch → ResultSet → PagedResult → RenderedGrid` — follow the same pattern and state their
-own invariants.
+`ResultSet → PagedResult → RenderedGrid`/`RenderedDetail` — follow the same pattern and state
+their own invariants.
 
 ### 4.2 "Needs approval" is an output, not an error
 
