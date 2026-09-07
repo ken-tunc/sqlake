@@ -16,7 +16,7 @@ pub mod tls;
 pub mod value;
 
 use async_trait::async_trait;
-use sqlake_core::capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
+use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ResolvedProfile};
@@ -52,6 +52,11 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     free_preview: false,
     sortable_preview: true,
     quote_style: QuoteStyle::DoubleQuote,
+    // `standard_conforming_strings` has been on by default since 9.1, so a
+    // backslash in an ordinary literal is an ordinary character. `E'\n'` opts
+    // back in per literal, which nothing here has to know: the scanner's job
+    // is only to find where the literal ends, and `E` does not change that.
+    escaping: Escaping::None,
 };
 
 #[derive(Debug)]

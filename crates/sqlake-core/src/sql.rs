@@ -20,6 +20,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::capability::Escaping;
+
 /// What somebody typed, believed about not at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawSql(String);
@@ -57,32 +59,41 @@ pub enum InvalidSql {
 
 /// Exactly one statement, and nothing that runs off the end of the text.
 ///
-/// The only way to make one is [`TryFrom<RawSql>`], so the invariant cannot be
-/// asserted into existence somewhere else.
+/// The only way to make one is [`ValidatedSql::parse`], so the invariant cannot
+/// be asserted into existence somewhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedSql(String);
 
 impl ValidatedSql {
+    /// Check that `raw` is one statement, reading literals the way a server
+    /// with this [`Escaping`] does.
+    ///
+    /// Not a `TryFrom`: where a string literal ends depends on which server
+    /// this is for, and a conversion with nowhere to say would have to guess —
+    /// in a direction that is wrong for somebody whichever way it went.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidSql`], naming which of the three things it is.
+    pub fn parse(raw: &RawSql, escaping: Escaping) -> Result<Self, InvalidSql> {
+        let text = raw.text();
+        let spans = statement_spans(text, escaping)?;
+        match spans.len() {
+            0 => Err(InvalidSql::Empty),
+            // Surrounding whitespace and a trailing `;` go: what is kept is the
+            // statement, so `select 1;` and `select 1` are the same query and
+            // an error position counted from the start still lands.
+            1 => {
+                let (start, end) = spans[0];
+                Ok(Self(text[start..end].trim().to_owned()))
+            }
+            count => Err(InvalidSql::Several { count }),
+        }
+    }
+
     #[must_use]
     pub fn text(&self) -> &str {
         &self.0
-    }
-}
-
-impl TryFrom<RawSql> for ValidatedSql {
-    type Error = InvalidSql;
-
-    fn try_from(raw: RawSql) -> Result<Self, Self::Error> {
-        let text = raw.0;
-        let ends = statement_ends(&text)?;
-        match ends.len() {
-            0 => Err(InvalidSql::Empty),
-            // Trailing whitespace and a trailing `;` go: what is kept is the
-            // statement, so `select 1;` and `select 1` are the same query and
-            // an error position counted from the start still lands.
-            1 => Ok(Self(text[..ends[0]].trim().to_owned())),
-            count => Err(InvalidSql::Several { count }),
-        }
     }
 }
 
@@ -260,8 +271,13 @@ impl ApprovedQuery {
     }
 }
 
-/// Where each statement ends, as byte offsets one past its final `;` — or one
-/// past its last character, for a final statement with no semicolon.
+/// Each statement as a byte range: from just after the previous boundary to
+/// the offset of its own `;`, or to the end of the text for a final statement
+/// with no semicolon.
+///
+/// A range rather than an end offset because a `;` that closed nothing is a
+/// boundary all the same: `; select 1` is one statement, and starting it at
+/// zero would hand the server a leading semicolon it will refuse.
 ///
 /// A scanner rather than a parser. Nothing here needs a syntax tree: the
 /// question is only where a statement ends, and the things that can hide a `;`
@@ -270,9 +286,10 @@ impl ApprovedQuery {
 /// same question with a dialect list to keep correct, and would put an AST in
 /// reach of code that has no business branching on what kind of statement this
 /// is. That is the server's judgement, not ours.
-fn statement_ends(text: &str) -> Result<Vec<usize>, InvalidSql> {
+fn statement_spans(text: &str, escaping: Escaping) -> Result<Vec<(usize, usize)>, InvalidSql> {
     let bytes = text.as_bytes();
     let mut ends = Vec::new();
+    let mut start = 0;
     let mut i = 0;
     // Whether anything but whitespace and comments has been seen since the
     // last boundary. A file of nothing but comments is not one statement, and
@@ -286,20 +303,36 @@ fn statement_ends(text: &str) -> Result<Vec<usize>, InvalidSql> {
                 let quote = bytes[i];
                 i += 1;
                 loop {
-                    let Some(at) = memchr(bytes, quote, i) else {
+                    // A backslash takes the next byte with it, so a quote
+                    // behind one is not the end. Only where the server says so:
+                    // reading `\\` as an escape against PostgreSQL would run
+                    // the literal past its real end and merge two statements
+                    // into one, which is the direction that runs something
+                    // nobody asked for.
+                    if escaping == Escaping::Backslash
+                        && bytes.get(i) == Some(&b'\\')
+                        && i + 1 < bytes.len()
+                    {
+                        i += 2;
+                        continue;
+                    }
+                    let Some(&c) = bytes.get(i) else {
                         return Err(InvalidSql::Unterminated(match quote {
                             b'\'' => "string",
                             _ => "quoted name",
                         }));
                     };
-                    // A doubled quote is an escaped one and the literal goes
-                    // on. Both dialects spell it this way, and neither treats
-                    // a backslash as an escape by default.
-                    if bytes.get(at + 1) == Some(&quote) {
-                        i = at + 2;
+                    if c != quote {
+                        i += 1;
                         continue;
                     }
-                    i = at + 1;
+                    // A doubled quote is an escaped one and the literal goes
+                    // on. Both dialects spell it this way.
+                    if bytes.get(i + 1) == Some(&quote) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
                     break;
                 }
             }
@@ -334,9 +367,10 @@ fn statement_ends(text: &str) -> Result<Vec<usize>, InvalidSql> {
                     // The offset *of* the semicolon, so the statement kept is
                     // the one the user wrote and an error position counted
                     // from its start still lands.
-                    ends.push(i);
+                    ends.push((start, i));
                 }
                 code = false;
+                start = i + 1;
                 i += 1;
             }
             c => {
@@ -348,7 +382,7 @@ fn statement_ends(text: &str) -> Result<Vec<usize>, InvalidSql> {
 
     // A last statement with no semicolon after it.
     if code {
-        ends.push(bytes.len());
+        ends.push((start, bytes.len()));
     }
     Ok(ends)
 }
@@ -394,8 +428,14 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// The PostgreSQL reading: a backslash is an ordinary character.
     fn one(text: &str) -> Result<ValidatedSql, InvalidSql> {
-        ValidatedSql::try_from(RawSql::new(text))
+        ValidatedSql::parse(&RawSql::new(text), Escaping::None)
+    }
+
+    /// The BigQuery reading: a backslash escapes what follows it.
+    fn one_escaped(text: &str) -> Result<ValidatedSql, InvalidSql> {
+        ValidatedSql::parse(&RawSql::new(text), Escaping::Backslash)
     }
 
     #[test]
@@ -418,6 +458,16 @@ mod tests {
         ] {
             assert_eq!(one(empty), Err(InvalidSql::Empty), "{empty:?}");
         }
+    }
+
+    #[test]
+    fn a_semicolon_that_closed_nothing_is_not_part_of_the_statement() {
+        // A stray leading `;` — left over from the statement above it, or from
+        // a selection that started one character early. Keeping it would send
+        // the server text it refuses for a reason that is not the user's.
+        assert_eq!(one("; select 1").unwrap().text(), "select 1");
+        assert_eq!(one(";;\nselect 1;").unwrap().text(), "select 1");
+        assert_eq!(one("-- a\n;\nselect 1").unwrap().text(), "select 1");
     }
 
     #[test]
@@ -461,6 +511,42 @@ mod tests {
         assert!(
             one("select 'a''; select 2").is_err(),
             "the string never ends"
+        );
+    }
+
+    #[test]
+    fn a_backslash_ends_a_literal_or_not_depending_on_the_server() {
+        // One BigQuery statement: the escaped quote is inside the string, and
+        // so is the semicolon after it.
+        let bq = "select '\\'; select 1'";
+        assert_eq!(one_escaped(bq).unwrap().text(), bq);
+
+        // The same text against PostgreSQL, where `standard_conforming_strings`
+        // makes the backslash ordinary: the literal ends at the second quote,
+        // the `;` after it is a real boundary, and what follows opens a quote
+        // that never closes. Which is also what the server sees — so the two
+        // readings disagree about this text because the two servers do.
+        assert_eq!(one(bq), Err(InvalidSql::Unterminated("string")));
+    }
+
+    #[test]
+    fn a_literal_ending_in_an_escaped_quote_is_not_unterminated() {
+        assert_eq!(one_escaped("select '\\''").unwrap().text(), "select '\\''");
+        // A trailing backslash with nothing after it escapes nothing, and the
+        // string is genuinely unterminated rather than swallowing the end.
+        assert_eq!(
+            one_escaped("select 'a\\"),
+            Err(InvalidSql::Unterminated("string"))
+        );
+    }
+
+    #[test]
+    fn a_doubled_quote_still_works_where_backslashes_are_escapes() {
+        // BigQuery has both spellings, and adding one must not remove the
+        // other.
+        assert_eq!(
+            one_escaped("select 'it''s; fine'").unwrap().text(),
+            "select 'it''s; fine'"
         );
     }
 

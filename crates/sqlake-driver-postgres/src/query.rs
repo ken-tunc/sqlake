@@ -21,23 +21,35 @@ use crate::value::RawValue;
 ///
 /// `EXPLAIN` without `ANALYZE`, so the statement is planned and not run — the
 /// distinction the whole estimate rests on.
+///
+/// A statement `EXPLAIN` will not take is [`Estimate::Unknown`], not an error:
+/// PostgreSQL only plans optimizable statements, so `create table`, `set`,
+/// `begin`, `grant` and every other utility statement come back as a syntax
+/// error here. Refusing on that would make them impossible to run at all —
+/// [`Session::execute`] is reachable only through an estimate — and would blame
+/// the user's statement for a wrapper they never wrote. What the server thinks
+/// of the statement is answered by sending it.
+///
+/// [`Session::execute`]: sqlake_core::driver::Session::execute
 pub async fn estimate(client: &Client, sql: &ValidatedSql) -> DriverResult<Estimate> {
     let text = format!("EXPLAIN (FORMAT JSON) {}", sql.text());
-    let rows = client
-        .query(&text, &[])
-        .await
-        // Reported as the query failing, which is what it is: a statement
-        // `EXPLAIN` refuses is one the server will refuse too, and saying so
-        // now is better than saying it after the estimate appeared to pass.
-        .map_err(|err| DriverError::Query(crate::describe(&err)))?;
+    let rows = match client.query(&text, &[]).await {
+        Ok(rows) => rows,
+        // Logged rather than silent. Most of these are a utility statement,
+        // which is ordinary; a connection that has died is not, and it would
+        // otherwise reappear as a puzzling failure one round trip later with
+        // nothing to say it had happened twice.
+        Err(err) => {
+            tracing::debug!(error = %crate::describe(&err), "EXPLAIN would not take the statement");
+            return Ok(Estimate::Unknown);
+        }
+    };
 
-    let plan: serde_json::Value = rows
-        .first()
-        .ok_or_else(|| DriverError::Query("EXPLAIN returned nothing".to_owned()))?
-        .try_get(0)
-        .map_err(|err| DriverError::Query(crate::describe(&err)))?;
-
-    total_cost(&plan).map_or(Ok(Estimate::Unknown), |cost| Ok(Estimate::Cost(cost)))
+    let plan: Option<serde_json::Value> = rows.first().and_then(|row| row.try_get(0).ok());
+    Ok(plan
+        .as_ref()
+        .and_then(total_cost)
+        .map_or(Estimate::Unknown, Estimate::Cost))
 }
 
 /// `[{"Plan": {"Total Cost": 1.23, ...}}]`, which is the shape every version
@@ -78,10 +90,12 @@ pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<Res
 
     let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
     let mut rows: Vec<Row> = Vec::new();
-    while let Some(row) = stream.next().await {
-        if rows.len() >= cap {
-            break;
-        }
+    // Before the await, not after: asking for one more row than the cap and
+    // then discarding it is a round trip nobody wanted, and with a cap of zero
+    // it is the *only* round trip.
+    while rows.len() < cap
+        && let Some(row) = stream.next().await
+    {
         let row = row.map_err(|err| DriverError::Query(crate::describe(&err)))?;
         rows.push(
             (0..row.len())
@@ -90,10 +104,11 @@ pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<Res
         );
     }
 
-    // `None` rather than the number fetched: with a cap in force that would
-    // say the result *is* fifty rows, and the grid would show "50 rows" for a
-    // query that matched a million.
-    Ok(ResultSet::new(columns, rows, None))
+    // Uncapped, the stream ran to the end and the count is the whole answer.
+    // Capped, it is not: `None` rather than fifty, which the grid would show as
+    // "50 rows" for a query that matched a million.
+    let total = query.max_rows().is_none().then_some(rows.len() as u64);
+    Ok(ResultSet::new(columns, rows, total))
 }
 
 #[cfg(test)]

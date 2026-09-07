@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::client_builder::ClientBuilder;
 use gcp_bigquery_client::dataset::ListOptions;
-use sqlake_core::capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
+use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{BigQueryAuth, BigQueryParams, Params, ResolvedProfile};
@@ -57,6 +57,10 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     free_preview: true,
     sortable_preview: false,
     quote_style: QuoteStyle::Backtick,
+    // BigQuery honours `\'` inside a quoted string, so a scanner that did not
+    // would read `select '\'; select 1'` — one statement — as two, and refuse
+    // valid SQL.
+    escaping: Escaping::Backslash,
 };
 
 /// How long a call to Google has to answer.

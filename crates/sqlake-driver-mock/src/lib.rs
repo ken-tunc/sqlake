@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlake_core::capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
+use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::id::ProfileId;
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
@@ -142,12 +142,16 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     free_preview: true,
     sortable_preview: true,
     quote_style: QuoteStyle::DoubleQuote,
+    escaping: Escaping::None,
 };
 
 /// The pair BigQuery will answer, before there is a BigQuery driver to answer
 /// it: a preview that costs nothing and cannot be ordered.
 pub const NO_SORT: Capabilities = Capabilities {
     sortable_preview: false,
+    // BigQuery's escaping too, so the scanner's backslash path is exercised
+    // where the mock is the only driver.
+    escaping: Escaping::Backslash,
     ..CAPABILITIES
 };
 

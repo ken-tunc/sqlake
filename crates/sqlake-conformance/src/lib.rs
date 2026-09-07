@@ -86,8 +86,8 @@ pub async fn run(subject: &Subject) {
 
 /// One statement, or a panic naming the case — the suite's own inputs being
 /// wrong is not something to discover as a confusing failure three cases later.
-fn validated(text: &str, kind: &str, what: &str) -> ValidatedSql {
-    ValidatedSql::try_from(RawSql::new(text))
+fn validated(text: &str, capabilities: Capabilities, kind: &str, what: &str) -> ValidatedSql {
+    ValidatedSql::parse(&RawSql::new(text), capabilities.escaping)
         .unwrap_or_else(|err| panic!("{kind}: the suite's {what} is not one statement: {err}"))
 }
 
@@ -99,7 +99,7 @@ async fn approved(
     kind: &str,
     what: &str,
 ) -> ApprovedQuery {
-    let sql = validated(text, kind, what);
+    let sql = validated(text, session.capabilities(), kind, what);
     let estimate = session
         .estimate(&sql)
         .await
@@ -122,7 +122,7 @@ async fn estimating_answers_what_the_capability_claims(
     capabilities: Capabilities,
     kind: &str,
 ) {
-    let sql = validated(&subject.query, kind, "query");
+    let sql = validated(&subject.query, capabilities, kind, "query");
     let estimate = session
         .estimate(&sql)
         .await
@@ -195,7 +195,12 @@ async fn a_statement_the_server_refuses_is_an_error(
     subject: &Subject,
     kind: &str,
 ) {
-    let sql = validated(&subject.broken_query, kind, "broken query");
+    let sql = validated(
+        &subject.broken_query,
+        session.capabilities(),
+        kind,
+        "broken query",
+    );
     // Either half may be where it is refused: PostgreSQL plans it during the
     // estimate, and a driver that estimates nothing only finds out on the way
     // in. Both are the server saying no, which is what this is about.

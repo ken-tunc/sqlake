@@ -67,7 +67,12 @@ pub async fn execute(
 ) -> DriverResult<ResultSet> {
     let mut request = QueryRequest::new(query.text());
     request.location = location.map(ToOwned::to_owned);
-    request.max_results = query.max_rows().and_then(|n| i32::try_from(n).ok());
+    // Clamped rather than dropped: a cap too large for the field is still a
+    // cap, and `and_then(try_from)` would turn it into no cap at all — the one
+    // direction to fail in is the one that pulls the whole result over.
+    request.max_results = query
+        .max_rows()
+        .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
 
     let response = client
         .job()
@@ -77,8 +82,10 @@ pub async fn execute(
 
     // A job that has not finished inside the synchronous call's own timeout
     // answers with no rows and `jobComplete: false`. Reporting that as an
-    // empty result would be a query that quietly returned nothing.
-    if response.job_complete == Some(false) {
+    // empty result would be a query that quietly returned nothing — and so
+    // would a response with no `jobComplete` at all, which is why anything but
+    // an explicit `true` is treated as unfinished.
+    if response.job_complete != Some(true) {
         return Err(driver_error(
             "the query is still running — a job that outlives the request needs polling, \
              which is not built yet",
