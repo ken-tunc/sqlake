@@ -17,7 +17,11 @@ use ratatui::widgets::Paragraph;
 use crate::grid::sanitise;
 
 /// Shown in place of the buffer while it is empty.
-const EMPTY: &str = "Press e to write a query.";
+///
+/// Names no key on purpose: there is no way to fill the buffer until the
+/// `$EDITOR` handoff arrives, and a hint pointing at a binding that does not
+/// exist is the same failure as a comment describing code that is not there.
+const EMPTY: &str = "Nothing to run yet.";
 
 /// `offset` is the first line drawn, so a buffer longer than the pane can be
 /// scrolled through the same way everything else is.
@@ -45,14 +49,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, text: &str, offset: usize) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// How many lines the buffer has, for the scrollbar and the clamp.
+/// How many lines the buffer has, which is what the scroll clamp measures
+/// against.
 #[must_use]
 pub fn line_count(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.lines().count()
-    }
+    text.lines().count()
 }
 
 #[cfg(test)]
@@ -71,11 +72,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_buffer_says_how_to_fill_it() {
-        assert!(drawn("", 0, 3).contains("Press e"));
+    fn an_empty_buffer_says_it_is_empty() {
+        assert!(drawn("", 0, 3).contains(EMPTY));
         // Whitespace is not a query either, and a pane showing three blank
         // lines is one nobody can tell from a broken one.
-        assert!(drawn("\n  \n", 0, 3).contains("Press e"));
+        assert!(drawn("\n  \n", 0, 3).contains(EMPTY));
     }
 
     #[test]
@@ -97,8 +98,8 @@ mod tests {
 
     #[test]
     fn an_empty_buffer_has_no_lines_to_scroll() {
-        // `"".lines()` yields nothing, but `"\n".lines()` yields one — the
-        // clamp needs the first answer, not `1`.
+        // The clamp subtracts one from this, so an empty buffer answering `1`
+        // would leave the pane scrollable past a line that is not there.
         assert_eq!(line_count(""), 0);
         assert_eq!(line_count("one"), 1);
         assert_eq!(line_count("one\ntwo\n"), 2);

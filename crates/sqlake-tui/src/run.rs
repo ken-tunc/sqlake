@@ -295,7 +295,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         hits,
         frames.tab_bar,
         ui,
-        !snapshot.connections.is_empty(),
+        snapshot.connections.iter().any(ConnectionView::is_live),
     );
 
     let explorer = chrome::pane(

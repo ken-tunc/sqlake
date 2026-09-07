@@ -9,7 +9,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::{ConnStatus, Snapshot};
+use sqlake_app::snapshot::{ConnectionView, Snapshot};
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::TableRef;
@@ -385,9 +385,10 @@ impl InputContext<'_> {
     fn connectable_profile(&self) -> Option<ProfileId> {
         let profiles = &self.snapshot.profiles;
         let live = |id: &ProfileId| {
-            self.snapshot.connections.iter().any(|c| {
-                &c.profile == id && matches!(c.status, ConnStatus::Connecting | ConnStatus::Ready)
-            })
+            self.snapshot
+                .connections
+                .iter()
+                .any(|c| &c.profile == id && c.is_live())
         };
         profiles
             .iter()
@@ -412,6 +413,31 @@ impl InputContext<'_> {
 
     fn active_tab(&self) -> Option<TabId> {
         self.active_tab
+    }
+
+    /// A connection a SQL tab can be opened on: the selected row's, and
+    /// otherwise the first that is still live.
+    ///
+    /// Not [`Self::connection`] as it stands, which falls back to the first row
+    /// whatever its status. A closed connection keeps its row, so after
+    /// disconnecting the last one that fallback still answers — and the tab it
+    /// mints is taken away again by `close_disconnected_tabs` on the next
+    /// frame, which is a `+` that answers a click with nothing. The fallback to
+    /// the first *live* one is what keeps this and the bar's own `+` agreeing
+    /// on when there is somewhere to run a query.
+    fn sql_connection(&self) -> Option<ConnId> {
+        let live = |id: ConnId| {
+            self.snapshot
+                .connection(id)
+                .is_some_and(ConnectionView::is_live)
+        };
+        self.connection.filter(|c| live(*c)).or_else(|| {
+            self.snapshot
+                .connections
+                .iter()
+                .find(|c| c.is_live())
+                .map(|c| c.id)
+        })
     }
 
     /// The relation the active tab points at, if any.
@@ -686,7 +712,7 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
             })
             .unwrap_or_default(),
         (Target::Button(ButtonId::NewSqlTab), Gesture::Click) => ctx
-            .connection
+            .sql_connection()
             .map(|conn| vec![ViewCmd::OpenSqlTab { conn }.into()])
             .unwrap_or_default(),
         (Target::Button(ButtonId::DismissModal), Gesture::Click) => {
@@ -1024,11 +1050,10 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .active_preview()
             .map(|(conn, table)| vec![Action::LoadMore { conn, table }.into()])
             .unwrap_or_default(),
-        // The same connection `c` and `D` act on: the selected row's, falling
-        // back to the first. With nothing open there is nowhere to run a
-        // query, and a tab that could never run one is a tab that lies.
+        // With nothing live there is nowhere to run a query, and a tab that
+        // could never run one is a tab that lies.
         IntentKind::OpenSqlTab => ctx
-            .connection
+            .sql_connection()
             .map(|conn| vec![ViewCmd::OpenSqlTab { conn }.into()])
             .unwrap_or_default(),
         IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
@@ -1974,11 +1999,44 @@ mod tests {
     fn a_sql_tab_needs_somewhere_to_run() {
         // With no connection there is nowhere to send a query, and a tab that
         // could never run one is a tab that lies.
-        let f = fixture();
+        let mut f = fixture();
+        f.snapshot.connections.clear();
         let mut c = f.ctx(PaneId::Grid);
         c.connection = None;
         assert!(on_key(press(KeyCode::Char('n')), &c).is_empty());
         assert!(on_mouse(Target::Button(ButtonId::NewSqlTab), Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn a_closed_connection_is_not_somewhere_to_run_either() {
+        // A closed connection keeps its row so the user can see what happened
+        // to it. Opening a SQL tab on one mints a tab that
+        // `close_disconnected_tabs` takes away on the next frame, which is a
+        // `+` that answers a click with nothing.
+        let mut f = fixture();
+        f.snapshot.connections[0].status = ConnStatus::Closed;
+        let c = f.ctx(PaneId::Grid);
+        assert!(on_key(press(KeyCode::Char('n')), &c).is_empty());
+        assert!(on_mouse(Target::Button(ButtonId::NewSqlTab), Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn a_new_sql_tab_skips_a_dead_connection_for_a_live_one() {
+        // The selected row's connection is the one to use, but only while it
+        // is one: with a closed connection selected and a live one open, `n`
+        // opens on the live one rather than on nothing.
+        let mut f = fixture();
+        let live = ConnId::new();
+        f.snapshot.connections[0].status = ConnStatus::Closed;
+        let mut second = f.snapshot.connections[0].clone();
+        second.id = live;
+        second.status = ConnStatus::Ready;
+        f.snapshot.connections.push(second);
+        let c = f.ctx(PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char('n')), &c),
+            [Intent::View(ViewCmd::OpenSqlTab { conn: live })]
+        );
     }
 
     #[test]
