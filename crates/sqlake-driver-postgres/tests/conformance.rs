@@ -293,6 +293,8 @@ const MARKER: &str = "sqlake_cancel_probe";
 
 #[tokio::test]
 async fn abandoning_a_query_stops_it_at_the_server() {
+    use std::future::Future as _;
+
     use sqlake_core::capability::Escaping;
     use sqlake_core::driver::Driver as _;
     use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
@@ -331,24 +333,27 @@ async fn abandoning_a_query_stops_it_at_the_server() {
             .unwrap_or(0)
     };
 
-    // Started, then dropped — which is what the store does when somebody
-    // cancels.
-    let handle = tokio::spawn(async move {
-        let _ = session.execute(&query).await;
-        session
-    });
-    for _ in 0..100 {
-        if running().await > 0 {
-            break;
+    // Started, then dropped in place — which is exactly what the session
+    // actor's `select` does when the caller goes away. Through a `spawn` and
+    // an `abort` it would be, too, but with the runtime's own cancellation
+    // machinery in the middle of what is being tested.
+    {
+        let mut running_query = std::pin::pin!(session.execute(&query));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut started = false;
+        for _ in 0..100 {
+            let _ = running_query.as_mut().poll(&mut cx);
+            if running().await > 0 {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(started, "the probe query never started");
     }
-    assert!(running().await > 0, "the probe query never started");
 
-    handle.abort();
-
-    // The cancel goes out on a second connection from a spawned task, so it
-    // is not instantaneous — but it is not `pg_sleep(120)` either.
+    // The cancel goes out on a second connection from a spawned task, so it is
+    // not instantaneous — but it is not `pg_sleep(120)` either.
     for _ in 0..100 {
         if running().await == 0 {
             return;
