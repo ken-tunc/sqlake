@@ -81,6 +81,14 @@ pub enum ButtonId {
     Filter,
     /// The `+` at the end of the tab bar, which opens a SQL tab.
     NewSqlTab,
+    /// One of the open dialog's answers, by position in its own list.
+    ModalChoice {
+        index: usize,
+    },
+    /// Runs the active SQL tab's buffer. In the status bar, beside the cancel
+    /// button for whatever is already running — which is where somebody
+    /// already looks to see what this client is doing.
+    RunQuery,
 }
 
 /// What a rectangle on screen belongs to.

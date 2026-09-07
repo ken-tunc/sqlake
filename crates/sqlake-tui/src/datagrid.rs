@@ -13,6 +13,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use std::sync::Arc;
+
+use sqlake_app::PagedResult;
 use sqlake_app::snapshot::{LoadState, PreviewView};
 use sqlake_core::result::{Sort, SortDir};
 
@@ -60,35 +63,53 @@ pub fn render(
         LoadState::Idle => message(frame, area, "select a table", Color::DarkGray),
         LoadState::Loading => message(frame, area, "loading…", Color::Yellow),
         LoadState::Failed(why) => message(frame, area, why, Color::Red),
-        LoadState::Ready(rows) => {
-            // Built through the `&mut`, then read through a shared reborrow.
-            // Cloning it instead would reallocate every column name on every
-            // frame, which is the cost this module exists to avoid.
-            ui.grid(rows);
-            let ui = &*ui;
-            let Some(grid) = ui.rendered() else {
-                return;
-            };
-            if grid.is_empty() {
-                // The columns are still worth drawing: an empty relation with
-                // its headers reads as "nothing here", and one without reads
-                // as "nothing happened". The header goes down first so the
-                // message lands under it rather than being painted over.
-                header(frame, hits, area, grid, ui, tab.sort, sortable);
-                if area.height > 1 {
-                    let below = Rect::new(
-                        area.x,
-                        area.y.saturating_add(1),
-                        area.width,
-                        area.height - 1,
-                    );
-                    message(frame, below, "no rows", Color::DarkGray);
-                }
-                return;
-            }
-            body(frame, hits, area, grid, ui, tab.sort, sortable);
-        }
+        LoadState::Ready(rows) => render_rows(frame, hits, area, rows, ui, sortable, tab.sort),
     }
+}
+
+/// Rows, whatever they are of.
+///
+/// Split from [`render`] because a query's result is drawn by the same code as
+/// a relation's page and has no `PreviewView` to arrive in: it is not sorted by
+/// this client, not paged, and not keyed by a name.
+pub fn render_rows(
+    frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    area: Rect,
+    rows: &Arc<PagedResult>,
+    ui: &mut GridUi,
+    sortable: bool,
+    sort: Option<Sort>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // Built through the `&mut`, then read through a shared reborrow. Cloning it
+    // instead would reallocate every column name on every frame, which is the
+    // cost this module exists to avoid.
+    ui.grid(rows);
+    let ui = &*ui;
+    let Some(grid) = ui.rendered() else {
+        return;
+    };
+    if grid.is_empty() {
+        // The columns are still worth drawing: an empty result with its
+        // headers reads as "nothing here", and one without reads as "nothing
+        // happened". The header goes down first so the message lands under it
+        // rather than being painted over.
+        header(frame, hits, area, grid, ui, sort, sortable);
+        if area.height > 1 {
+            let below = Rect::new(
+                area.x,
+                area.y.saturating_add(1),
+                area.width,
+                area.height - 1,
+            );
+            message(frame, below, "no rows", Color::DarkGray);
+        }
+        return;
+    }
+    body(frame, hits, area, grid, ui, sort, sortable);
 }
 
 fn message(frame: &mut Frame<'_>, area: Rect, text: &str, colour: Color) {

@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use sqlake_core::id::{ConnId, ProfileId};
+use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 
 /// Identifies one long-running operation, so it can be shown and cancelled.
@@ -102,6 +102,31 @@ pub enum Action {
         table: TableRef,
     },
 
+    /// Run a statement, under an id the caller chose.
+    ///
+    /// The id for the same reason `Connect` carries one: two runs of the same
+    /// SQL are two different things with two different results, so there is no
+    /// name to wait on afterwards.
+    ///
+    /// No budget: that is the user's own ceiling, and a front-end that could
+    /// name its own would be one that could raise it.
+    RunQuery {
+        conn: ConnId,
+        query: QueryId,
+        sql: String,
+        /// Rows to fetch back, or all of them.
+        max_rows: Option<u32>,
+    },
+
+    /// Run a query that stopped over the budget, because somebody said yes.
+    ///
+    /// Names only the query: what runs is the statement the refusal kept, not
+    /// one rebuilt from a buffer that may have moved on since.
+    ApproveQuery(QueryId),
+
+    /// A front-end is no longer showing this query's result anywhere.
+    ForgetQuery(QueryId),
+
     /// Cancel a running operation.
     Cancel(BusyId),
 
@@ -122,6 +147,9 @@ impl fmt::Display for Action {
             Self::SortPreview { table, column, .. } => write!(f, "sort({table}, col {column})"),
             Self::LoadMore { table, .. } => write!(f, "load_more({table})"),
             Self::ForgetPreview { table, .. } => write!(f, "forget_preview({table})"),
+            Self::RunQuery { query, .. } => write!(f, "run({})", query.short()),
+            Self::ApproveQuery(id) => write!(f, "approve({})", id.short()),
+            Self::ForgetQuery(id) => write!(f, "forget_query({})", id.short()),
             Self::Cancel(id) => write!(f, "cancel({})", id.get()),
             Self::Quit => f.write_str("quit"),
         }

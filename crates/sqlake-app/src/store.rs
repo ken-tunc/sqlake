@@ -15,10 +15,11 @@ use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
-use sqlake_core::id::{ConnId, ProfileId};
+use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
+use sqlake_core::sql::RawSql;
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
@@ -27,12 +28,13 @@ use crate::error::{AppError, AppResult};
 use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
-    BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewView, Snapshot,
+    BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewView, QueryView, Snapshot,
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
     Connect, ConnectInput, ConnectOutput, ExpandNode, ExpandNodeInput, ExpandNodeOutput,
-    PreviewTable, PreviewTableInput, PreviewTableOutput, UseCase,
+    PreviewTable, PreviewTableInput, PreviewTableOutput, RunApproved, RunQuery, RunQueryInput,
+    RunQueryOutput, UseCase,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -101,7 +103,12 @@ impl Store {
     /// rows leaves an offset that `next_page` never advances, so the relation
     /// could never be read and nothing on screen would say why.
     #[must_use]
-    pub fn spawn(drivers: Drivers, profiles: Arc<dyn Profiles>, page_size: u32) -> Self {
+    pub fn spawn(
+        drivers: Drivers,
+        profiles: Arc<dyn Profiles>,
+        page_size: u32,
+        budget: Option<u64>,
+    ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let mut runtime = Runtime {
@@ -112,9 +119,11 @@ impl Store {
             profile_list: Arc::new(profiles.list()),
             profiles,
             page_size: page_size.max(1),
+            budget,
             events: event_tx,
             conns: Vec::new(),
             previews: Vec::new(),
+            queries: Vec::new(),
             busy: Vec::new(),
             tasks: HashMap::new(),
             next_id: 1,
@@ -179,6 +188,11 @@ enum Event {
         node: NodeRef,
         busy: BusyId,
         result: AppResult<ExpandNodeOutput>,
+    },
+    Ran {
+        query: QueryId,
+        busy: BusyId,
+        result: AppResult<RunQueryOutput>,
     },
     Previewed {
         conn: ConnId,
@@ -294,9 +308,21 @@ struct Runtime {
     profiles: Arc<dyn Profiles>,
     profile_list: Arc<Vec<ProfileSummary>>,
     page_size: u32,
+    /// Bytes a query may cost before somebody has to say yes, or `None` for no
+    /// ceiling.
+    ///
+    /// Here rather than on the action, so raising it is a config change rather
+    /// than something a caller can do per request.
+    budget: Option<u64>,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     previews: Vec<Preview>,
+    /// Every run this session has started, in order.
+    ///
+    /// Kept rather than replaced: a front-end may have several SQL tabs, and
+    /// each of them is looking at a different one. `ForgetQuery` is how one
+    /// goes, the way `ForgetPreview` already works for a relation.
+    queries: Vec<QueryView>,
     busy: Vec<BusyItem>,
     tasks: HashMap<BusyId, AbortHandle>,
     next_id: u64,
@@ -406,6 +432,14 @@ impl Runtime {
             }
             Action::LoadMore { conn, table } => self.load_more(conn, table),
             Action::ForgetPreview { conn, table } => self.forget_preview(conn, &table),
+            Action::RunQuery {
+                conn,
+                query,
+                sql,
+                max_rows,
+            } => self.run_query(conn, query, sql, max_rows),
+            Action::ApproveQuery(query) => self.approve_query(query),
+            Action::ForgetQuery(query) => self.queries.retain(|q| q.id != query),
             Action::Cancel(id) => self.cancel(id),
             Action::Quit => self.should_quit = true,
         }
@@ -507,6 +541,9 @@ impl Runtime {
             .filter(|b| match &b.owner {
                 BusyOwner::Connection(c) | BusyOwner::Node { conn: c, .. } => *c == id,
                 BusyOwner::Preview { conn, .. } => *conn == id,
+                BusyOwner::Query(query) => {
+                    self.queries.iter().any(|q| q.id == *query && q.conn == id)
+                }
             })
             .map(|b| b.id)
             .collect();
@@ -517,6 +554,10 @@ impl Runtime {
         // Previews belong to a connection; leaving them behind would show
         // stale rows with no way to refresh them.
         self.previews.retain(|p| p.conn != id);
+        // A query's rows do not: they are an answer that was given, and the
+        // connection closing does not make it untrue. What it does make
+        // impossible is running it again, which is a fact about the connection
+        // and is already visible there.
     }
 
     fn open_node(&mut self, conn_id: ConnId, node: NodeRef, how: Open) {
@@ -718,6 +759,105 @@ impl Runtime {
         self.fetch_page(conn_id, table, next, true);
     }
 
+    /// Start a run, under an id the caller chose.
+    ///
+    /// The budget comes from this store rather than from the caller: it is the
+    /// user's own ceiling, and a front-end that could name its own would be a
+    /// front-end that could raise it.
+    fn run_query(&mut self, conn_id: ConnId, id: QueryId, sql: String, max_rows: Option<u32>) {
+        let Some(session) = self.session(conn_id) else {
+            return;
+        };
+        // An id already in use is a caller that lost track of one, and reusing
+        // it would replace an answer somebody may still be reading.
+        if self.queries.iter().any(|q| q.id == id) {
+            tracing::warn!(query = %id.short(), "run: that query id is already in use");
+            return;
+        }
+
+        self.queries.push(QueryView {
+            id,
+            conn: conn_id,
+            sql: sql.clone(),
+            estimate: None,
+            needs_approval: None,
+            data: LoadState::Loading,
+        });
+
+        let busy = self.begin_busy(BusyOwner::Query(id), "running a query");
+        let events = self.events.clone();
+        let budget = self.budget;
+        self.spawn_task(busy, async move {
+            let result = RunQuery { session }
+                .execute(RunQueryInput {
+                    sql: RawSql::new(sql),
+                    max_rows,
+                    budget,
+                })
+                .await;
+            let _ = events.send(Event::Ran {
+                query: id,
+                busy,
+                result,
+            });
+        });
+    }
+
+    /// Run what a person has just said yes to.
+    ///
+    /// The statement comes out of the `OverBudget` the refusal left behind, so
+    /// what runs is what was estimated — not whatever the buffer says now,
+    /// which after an `$EDITOR` round trip need not be the same thing.
+    fn approve_query(&mut self, id: QueryId) {
+        let Some(query) = self.queries.iter_mut().find(|q| q.id == id) else {
+            return;
+        };
+        let Some(refused) = query.needs_approval.take() else {
+            // Nothing is waiting on an answer. An approval arriving twice — a
+            // double click, or an agent retrying — must not run it twice.
+            return;
+        };
+        let conn_id = query.conn;
+        query.data = LoadState::Loading;
+        let Some(session) = self.session(conn_id) else {
+            return;
+        };
+
+        let busy = self.begin_busy(BusyOwner::Query(id), "running an approved query");
+        let events = self.events.clone();
+        self.spawn_task(busy, async move {
+            let refused = Arc::try_unwrap(refused).unwrap_or_else(|shared| (*shared).clone());
+            let result = RunApproved { session }.execute(refused).await;
+            let _ = events.send(Event::Ran {
+                query: id,
+                busy,
+                result,
+            });
+        });
+    }
+
+    fn ran(&mut self, id: QueryId, result: AppResult<RunQueryOutput>) {
+        let Some(query) = self.queries.iter_mut().find(|q| q.id == id) else {
+            return;
+        };
+        match result {
+            Ok(RunQueryOutput::Ran { estimate, result }) => {
+                query.estimate = Some(estimate);
+                query.data = LoadState::Ready(Arc::new(PagedResult::new(&result)));
+            }
+            Ok(RunQueryOutput::NeedsApproval(over)) => {
+                query.estimate = Some(over.estimate);
+                query.needs_approval = Some(Arc::new(*over));
+                // Not `Loading`: nothing is on its way, and a spinner over a
+                // question nobody has answered is the client waiting for
+                // itself. `Idle` is "not requested", which is what this is
+                // until somebody says yes.
+                query.data = LoadState::Idle;
+            }
+            Err(err) => query.data = LoadState::Failed(err.user_message()),
+        }
+    }
+
     fn forget_preview(&mut self, conn_id: ConnId, table: &TableRef) {
         // Otherwise the busy row outlives its reader: "loading …" for
         // something nobody is looking at, until a reply nothing wants lands.
@@ -816,6 +956,11 @@ impl Runtime {
                     conn.view = Arc::new(conn.tree.flatten(conn.id));
                 }
             }
+            BusyOwner::Query(id) => {
+                if let Some(query) = self.queries.iter_mut().find(|q| q.id == *id) {
+                    query.data = LoadState::Failed(reason.to_owned());
+                }
+            }
             BusyOwner::Preview { conn, table } => {
                 if let Some(preview) = self.preview_mut(*conn, table) {
                     preview.pending = None;
@@ -849,6 +994,14 @@ impl Runtime {
             } => {
                 self.end_busy(busy);
                 self.expanded(conn, node, result);
+            }
+            Event::Ran {
+                query,
+                busy,
+                result,
+            } => {
+                self.end_busy(busy);
+                self.ran(query, result);
             }
             Event::Previewed {
                 conn,
@@ -1085,6 +1238,9 @@ impl Runtime {
                     last_error: p.last_error.clone(),
                 })
                 .collect(),
+            // Cloned wholesale: a `QueryView` is already the shape a front-end
+            // wants, and the rows behind it are an `Arc`.
+            queries: self.queries.clone(),
             busy: self.busy.clone(),
             should_quit: self.should_quit,
         }
@@ -1094,6 +1250,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use sqlake_core::node::NodeKind;
+    use sqlake_core::sql::Estimate;
     use sqlake_core::value::Value;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, NO_SORT};
 
@@ -1108,11 +1265,25 @@ mod tests {
         store_of(MockDriver::new(behaviour), page_size)
     }
 
+    /// A store with a byte ceiling, and a driver that answers a number to
+    /// compare against it.
+    fn store_with_budget(behaviour: Behaviour, budget: Option<u64>) -> Store {
+        Store::spawn(
+            Drivers::new().with(Arc::new(
+                MockDriver::new(behaviour).with_capabilities(sqlake_driver_mock::ESTIMATES),
+            )),
+            Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
+            budget,
+        )
+    }
+
     fn store_of(driver: MockDriver, page_size: u32) -> Store {
         Store::spawn(
             Drivers::new().with(Arc::new(driver)),
             Arc::new(MockProfiles::default()),
             page_size,
+            None,
         )
     }
 
@@ -1189,6 +1360,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_query_runs_and_its_rows_reach_the_snapshot() {
+        let (store, conn) = connected_store().await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+
+        let query = snap.query(id).expect("the query");
+        let rows = query.data.ready().expect("rows");
+        assert!(rows.row_count() > 0 && !rows.columns().is_empty());
+        assert_eq!(query.sql, "select * from public.users");
+        assert!(query.needs_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn two_runs_of_the_same_sql_are_two_answers() {
+        // Which is why a query is keyed by an id the caller chose: there is no
+        // name to look one up by.
+        let (store, conn) = connected_store().await;
+        let (a, b) = (QueryId::new(), QueryId::new());
+        for id in [a, b] {
+            store.dispatch(Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            });
+        }
+        let snap = until(&store, |s| {
+            [a, b]
+                .iter()
+                .all(|id| s.query(*id).is_some_and(QueryView::is_settled))
+        })
+        .await;
+        assert_eq!(snap.queries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_id_already_in_use_starts_nothing() {
+        // Reusing one would replace an answer somebody may still be reading.
+        let (store, conn) = connected_store().await;
+        let id = QueryId::new();
+        let run = |sql: &str| Action::RunQuery {
+            conn,
+            query: id,
+            sql: sql.to_owned(),
+            max_rows: None,
+        };
+        let _ = settled(&store, run("select * from public.users"), move |s| {
+            s.query(id).is_some_and(QueryView::is_settled)
+        })
+        .await;
+        let snap = settled(&store, run("select * from public.orders"), move |s| {
+            s.query(id).is_some()
+        })
+        .await;
+        assert_eq!(snap.queries.len(), 1);
+        assert_eq!(snap.query(id).unwrap().sql, "select * from public.users");
+    }
+
+    #[tokio::test]
+    async fn a_query_over_the_budget_waits_for_an_answer_rather_than_failing() {
+        let store = store_with_budget(
+            Behaviour {
+                estimate_bytes: 5_000,
+                ..Behaviour::instant()
+            },
+            Some(1_000),
+        );
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
+        )
+        .await;
+
+        let query = snap.query(id).unwrap();
+        // Idle, not Loading: nothing is on its way, and a spinner over a
+        // question nobody has answered is the client waiting for itself.
+        assert!(matches!(query.data, LoadState::Idle), "{:?}", query.data);
+        assert_eq!(query.estimate, Some(Estimate::Bytes(5_000)));
+
+        // And saying yes runs it.
+        let snap = settled(&store, Action::ApproveQuery(id), move |s| {
+            s.query(id).is_some_and(|q| q.data.ready().is_some())
+        })
+        .await;
+        let query = snap.query(id).unwrap();
+        assert!(query.needs_approval.is_none(), "the question stayed open");
+        assert!(query.data.ready().is_some_and(|r| r.row_count() > 0));
+    }
+
+    #[tokio::test]
+    async fn approving_twice_runs_it_once() {
+        // A double click, or an agent retrying. The second must not spend the
+        // money again.
+        let store = store_with_budget(
+            Behaviour {
+                estimate_bytes: 5_000,
+                ..Behaviour::instant()
+            },
+            Some(1_000),
+        );
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let _ = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
+        )
+        .await;
+        let after_one = settled(&store, Action::ApproveQuery(id), move |s| {
+            s.query(id).is_some_and(|q| q.data.ready().is_some())
+        })
+        .await
+        .applied;
+        let snap = settled(&store, Action::ApproveQuery(id), move |s| {
+            s.applied > after_one
+        })
+        .await;
+        assert_eq!(snap.queries.len(), 1);
+        assert!(
+            snap.busy.is_empty(),
+            "the second approval started something"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_is_not_one_statement_never_reaches_the_server() {
+        let (store, conn) = connected_store().await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "drop table x; select 1".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        let why = snap.query(id).unwrap().data.error().expect("a failure");
+        assert!(why.contains('2'), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_query_leaves_nothing_behind() {
+        let (store, conn) = connected_store().await;
+        let id = QueryId::new();
+        let _ = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        let snap = settled(&store, Action::ForgetQuery(id), move |s| {
+            s.query(id).is_none()
+        })
+        .await;
+        assert!(snap.queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_keeps_the_answer_it_already_gave() {
+        // The rows are an answer that was given, and closing the connection
+        // does not make it untrue. What it makes impossible is running it
+        // again, which is a fact about the connection.
+        let (store, conn) = connected_store().await;
+        let id = QueryId::new();
+        let _ = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        let snap = settled(&store, Action::Disconnect(conn), move |s| {
+            s.connection(conn)
+                .is_some_and(|c| c.status == ConnStatus::Closed)
+        })
+        .await;
+        assert!(snap.query(id).is_some_and(|q| q.data.ready().is_some()));
+    }
+
+    #[tokio::test]
     async fn connecting_populates_the_tree() {
         let (_store, id) = connected_store().await;
         let _ = id;
@@ -1205,6 +1591,7 @@ mod tests {
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::new(["replica", "staging"])),
             PageRequest::DEFAULT_LIMIT,
+            None,
         );
         store.dispatch(Action::Connect {
             profile: pid("replica"),
@@ -1252,6 +1639,7 @@ mod tests {
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::new(["replica", "staging"])),
             PageRequest::DEFAULT_LIMIT,
+            None,
         );
         store.dispatch(Action::Connect {
             profile: pid("replica"),
@@ -1359,6 +1747,7 @@ mod tests {
             Drivers::new(),
             Arc::new(UnservedProfile(DriverKind::Postgres)),
             PageRequest::DEFAULT_LIMIT,
+            None,
         );
         let conn = ConnId::new();
         let snap = settled(
@@ -1429,6 +1818,7 @@ mod tests {
             Drivers::new(),
             Arc::new(UnservedProfile(DriverKind::Postgres)),
             PageRequest::DEFAULT_LIMIT,
+            None,
         );
         store.dispatch(Action::Connect {
             profile: pid("unserved"),

@@ -209,6 +209,7 @@ mod tests {
             Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
             PageRequest::DEFAULT_LIMIT,
+            None,
         );
         let conn = ConnId::new();
         let snapshot = store

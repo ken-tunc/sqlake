@@ -162,7 +162,12 @@ fn main() -> Result<std::process::ExitCode> {
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let store = runtime.block_on(async {
-        let store = Store::spawn(drivers(), profiles, settings.page_size);
+        let store = Store::spawn(
+            drivers(),
+            profiles,
+            settings.page_size,
+            settings.max_bytes_billed,
+        );
         for profile in opening {
             store.dispatch(Action::Connect {
                 profile,

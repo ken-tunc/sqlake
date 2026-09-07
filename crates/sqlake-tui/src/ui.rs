@@ -25,11 +25,11 @@ use sqlake_app::PagedResult;
 
 use crate::detail::RenderedDetail;
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::{ConnStatus, LoadState, Snapshot};
+use sqlake_app::snapshot::{ConnStatus, ConnectionView, LoadState, Snapshot};
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_app::tree::VisibleNode;
-use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::id::{ConnId, QueryId, TabId};
 use sqlake_core::node::TableRef;
 use sqlake_core::result::Sort;
 
@@ -52,9 +52,14 @@ pub enum TabContent {
     /// person's half-finished sentence, and what crosses into `sqlake-app` is
     /// the text of a query somebody asked to run. Empty until the `$EDITOR`
     /// handoff fills it.
+    ///
+    /// `query` is the run this tab last started, once it has started one. The
+    /// id rather than the result: the result is the store's, and a copy here
+    /// would be a second answer to go stale.
     Sql {
         number: u32,
         text: String,
+        query: Option<QueryId>,
     },
 }
 
@@ -159,6 +164,25 @@ const DEFAULT_EXPLORER_PERMILLE: u32 = 280;
 /// tall terminal that would exceed a page and ask before the previous page had
 /// anywhere to go.
 const LOAD_MARGIN_ROWS: usize = 20;
+
+/// A byte count somebody is about to be charged for, in units they price in.
+///
+/// Truncating rather than rounding: this is shown next to a limit, and a
+/// number that rounded up to the limit would read as being at it.
+fn bytes(n: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (1 << 40, "TB"),
+        (1 << 30, "GB"),
+        (1 << 20, "MB"),
+        (1 << 10, "KB"),
+    ];
+    for (scale, unit) in UNITS {
+        if n >= scale {
+            return format!("{:.1} {unit}", n as f64 / scale as f64);
+        }
+    }
+    format!("{n} B")
+}
 
 /// Rows the detail pane takes.
 ///
@@ -320,6 +344,9 @@ pub struct UiState {
     /// the last leaves a second connection's failure unreported, because the
     /// first stays in the list and is what a search keeps finding.
     pub reported_failures: HashSet<ConnId>,
+    /// The queries whose cost has already been put as a question, so that
+    /// dismissing it is final.
+    asked_approval: HashSet<QueryId>,
     /// The explorer's search, or `None` when there is not one.
     ///
     /// Screen state, not application state: it decides which rows *this*
@@ -528,6 +555,58 @@ impl UiState {
         }
     }
 
+    /// Ask about a query the budget stopped, once per query.
+    ///
+    /// Once, because a snapshot is republished for reasons that have nothing
+    /// to do with this — a spinner tick will do it — and a dialog re-raised on
+    /// each one could never be dismissed.
+    pub fn raise_approvals(&mut self, snapshot: &Snapshot) {
+        // Only about a query one of this screen's tabs is showing: an agent
+        // running something over the socket is not this person's question to
+        // answer, and a dialog about it would appear out of nowhere.
+        let mine: Vec<QueryId> = self
+            .tabs
+            .iter()
+            .filter_map(|t| self.query_of(t.id))
+            .collect();
+        let asking = snapshot
+            .queries
+            .iter()
+            .filter(|q| mine.contains(&q.id) && !self.asked_approval.contains(&q.id))
+            .find_map(|q| {
+                q.needs_approval
+                    .as_ref()
+                    .map(|over| (q.id, Arc::clone(over)))
+            });
+        let Some((id, over)) = asking else {
+            // Nothing to ask. If a dialog is up about a question the store no
+            // longer has open — because it was answered — it goes: the screen
+            // follows the snapshot rather than closing itself, which is also
+            // what keeps an answer from being given twice.
+            if self.modal.as_ref().is_some_and(|m| !m.choices.is_empty()) {
+                self.modal = None;
+            }
+            return;
+        };
+        self.asked_approval.insert(id);
+        // The menu sits above the modal, so one left open would float over the
+        // dialog — the same reason `raise_connection_failure` closes it.
+        self.menu = None;
+        self.modal = Some(crate::overlay::Modal::asking(
+            "This query costs more than the limit",
+            format!(
+                "It would read {}, and the limit is {}.\n\n{}",
+                bytes(over.estimate.bytes().unwrap_or(0)),
+                bytes(over.budget),
+                over.sql.text()
+            ),
+            vec![crate::overlay::Choice {
+                label: "Run it anyway".to_owned(),
+                intent: Action::ApproveQuery(id).into(),
+            }],
+        ));
+    }
+
     /// A closed connection takes its *preview* tabs with it.
     ///
     /// `Disconnect` drops the connection's previews, and a tab left pointing
@@ -577,6 +656,27 @@ impl UiState {
         }
     }
 
+    /// The run a tab is showing, if it has started one.
+    #[must_use]
+    pub fn query_of(&self, tab: TabId) -> Option<QueryId> {
+        match &self.tabs.iter().find(|t| t.id == tab)?.content {
+            TabContent::Sql { query, .. } => *query,
+            TabContent::Preview(_) => None,
+        }
+    }
+
+    /// Record which run a tab started, so its rows can be found again.
+    pub fn set_query(&mut self, tab: TabId, id: QueryId) {
+        if let Some(TabContent::Sql { query, .. }) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .map(|t| &mut t.content)
+        {
+            *query = Some(id);
+        }
+    }
+
     /// Replace one tab's SQL with what came back from the editor.
     ///
     /// By id rather than "the active one": the editor had the terminal, and a
@@ -604,6 +704,27 @@ impl UiState {
         // dialog — the same reason `raise_connection_failure` closes it.
         self.menu = None;
         self.modal = Some(crate::overlay::Modal::error(title, body));
+    }
+
+    /// Whether the active tab has something to run, and somewhere to run it.
+    ///
+    /// The same question the input layer asks before producing the action, so
+    /// the button is drawn exactly when pressing it would do something.
+    #[must_use]
+    pub fn can_run(&self, snapshot: &Snapshot) -> bool {
+        let Some(tab) = self
+            .active_tab
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+        else {
+            return false;
+        };
+        let TabContent::Sql { text, .. } = &tab.content else {
+            return false;
+        };
+        !text.trim().is_empty()
+            && snapshot
+                .connection(tab.conn)
+                .is_some_and(ConnectionView::is_live)
     }
 
     /// The active tab's SQL, or `None` when it is a preview.
@@ -755,6 +876,7 @@ impl UiState {
                     TabContent::Sql {
                         number: self.next_sql,
                         text: String::new(),
+                        query: None,
                     },
                 );
             }
@@ -1101,7 +1223,13 @@ impl UiState {
     fn rows_of<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
         let tab = self.active_tab?;
         let open = self.tabs.iter().find(|t| t.id == tab)?;
-        snapshot.preview(open.conn, open.table()?)?.data.ready()
+        match &open.content {
+            TabContent::Preview(table) => snapshot.preview(open.conn, table)?.data.ready(),
+            // A run this screen started. `None` while it is still running, or
+            // before there has been one, which is what makes the pane show the
+            // buffer instead.
+            TabContent::Sql { query, .. } => snapshot.query((*query)?)?.data.ready(),
+        }
     }
 
     fn row_count(&self, snapshot: &Snapshot) -> usize {
@@ -1162,7 +1290,7 @@ mod tests {
     use sqlake_driver_mock::mock_summary;
     use std::sync::Arc;
 
-    use sqlake_app::snapshot::{LoadState, PreviewView};
+    use sqlake_app::snapshot::{LoadState, PreviewView, QueryView};
     use sqlake_app::tree::{NodeState, VisibleNode};
     use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeKind, NodeRef, TableRef};
@@ -1173,6 +1301,28 @@ mod tests {
 
     fn table() -> TableRef {
         TableRef::new(["public", "users"])
+    }
+
+    /// A query the budget stopped, as the store would publish it.
+    fn over_budget(conn: ConnId, id: QueryId) -> QueryView {
+        let sql = sqlake_core::sql::ValidatedSql::parse(
+            &sqlake_core::sql::RawSql::new("select * from big"),
+            sqlake_core::capability::Escaping::None,
+        )
+        .expect("one statement");
+        QueryView {
+            id,
+            conn,
+            sql: sql.text().to_owned(),
+            estimate: Some(sqlake_core::sql::Estimate::Bytes(5_000_000_000)),
+            needs_approval: Some(Arc::new(sqlake_core::sql::OverBudget {
+                sql,
+                max_rows: None,
+                estimate: sqlake_core::sql::Estimate::Bytes(5_000_000_000),
+                budget: 1_000_000_000,
+            })),
+            data: LoadState::Idle,
+        }
     }
 
     fn rows(count: usize, columns: usize) -> Arc<PagedResult> {
@@ -1224,6 +1374,7 @@ mod tests {
                 data: LoadState::Ready(rows(grid_rows, grid_cols)),
                 last_error: None,
             }],
+            queries: Vec::new(),
             busy: Vec::new(),
             should_quit: false,
         }
@@ -1904,6 +2055,124 @@ mod tests {
             &snap,
         );
         assert!(fetch.is_none(), "{fetch:?}");
+    }
+
+    #[test]
+    fn a_question_about_cost_is_asked_once_and_stays_dismissed() {
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+        let id = QueryId::new();
+        ui.set_query(tab, id);
+        snap.queries.push(over_budget(conn, id));
+
+        ui.raise_approvals(&snap);
+        let modal = ui.modal.clone().expect("a dialog");
+        assert_eq!(modal.choices.len(), 1);
+        assert!(!modal.grave, "a question about money is not a failure");
+
+        // A snapshot is republished for reasons that have nothing to do with
+        // this — a spinner tick will do it — and a dialog re-raised on each
+        // one could never be dismissed.
+        ui.modal = None;
+        ui.raise_approvals(&snap);
+        assert!(
+            ui.modal.is_none(),
+            "the question came back after being dismissed"
+        );
+    }
+
+    #[test]
+    fn the_dialog_goes_when_the_store_stops_asking() {
+        // It follows the snapshot rather than closing itself, which is what
+        // keeps an answer from being given twice.
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+        let id = QueryId::new();
+        ui.set_query(tab, id);
+        snap.queries.push(over_budget(conn, id));
+        ui.raise_approvals(&snap);
+        assert!(ui.modal.is_some());
+
+        snap.queries[0].needs_approval = None;
+        ui.raise_approvals(&snap);
+        assert!(ui.modal.is_none());
+    }
+
+    #[test]
+    fn a_question_about_somebody_elses_query_is_not_raised_here() {
+        // An agent running something over the socket is not this person's
+        // question to answer, and a dialog about it would appear out of
+        // nowhere.
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        snap.queries.push(over_budget(conn, QueryId::new()));
+        ui.raise_approvals(&snap);
+        assert!(ui.modal.is_none());
+    }
+
+    #[test]
+    fn a_sql_tab_shows_the_rows_of_the_run_it_started() {
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+        assert!(ui.rows_of(&snap).is_none(), "before there is a run");
+
+        let id = QueryId::new();
+        ui.set_query(tab, id);
+        snap.queries.push(QueryView {
+            id,
+            conn,
+            sql: "select 1".to_owned(),
+            estimate: None,
+            needs_approval: None,
+            data: LoadState::Ready(rows(4, 2)),
+        });
+        assert_eq!(ui.rows_of(&snap).map(|r| r.row_count()), Some(4));
+    }
+
+    #[test]
+    fn the_run_button_shows_exactly_when_pressing_it_would_do_something() {
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        assert!(!ui.can_run(&snap), "with no tab at all");
+
+        let _ = ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        assert!(!ui.can_run(&snap), "on a preview");
+
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        assert!(!ui.can_run(&snap), "with an empty buffer");
+
+        let tab = ui.active_tab.expect("a tab");
+        ui.set_buffer(tab, "select 1".to_owned());
+        assert!(ui.can_run(&snap));
+    }
+
+    #[test]
+    fn a_byte_count_reads_in_the_units_somebody_prices_in() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(999), "999 B");
+        assert_eq!(bytes(1 << 20), "1.0 MB");
+        assert_eq!(bytes(20 * (1 << 30)), "20.0 GB");
+        // Truncating rather than rounding: shown next to a limit, a number
+        // that rounded up to the limit would read as being at it.
+        assert_eq!(bytes((1 << 30) - 1), "1024.0 MB");
     }
 
     #[test]

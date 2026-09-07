@@ -25,6 +25,14 @@ pub enum AppError {
 
     #[error("no such connection")]
     UnknownConnection,
+
+    /// Refused here, before anything was sent. Kept apart from
+    /// [`AppError::Driver`] because the difference is where to go looking: a
+    /// driver error is in the server's log, and this one is not — saying the
+    /// server refused something it never saw sends somebody to read a log with
+    /// nothing in it.
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl AppError {

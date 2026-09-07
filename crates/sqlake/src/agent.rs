@@ -329,7 +329,9 @@ async fn one_shot(
     page_size: u32,
     connect: Option<ProfileId>,
 ) -> Result<Response> {
-    let service = Service::new(Store::spawn(drivers, profiles, page_size));
+    // No budget: an agent runs nothing yet, and A2 is where the answer
+    // to "who says yes for one" is decided rather than assumed here.
+    let service = Service::new(Store::spawn(drivers, profiles, page_size, None));
     let connection = if command.needs() == Needs::Nothing {
         String::new()
     } else {

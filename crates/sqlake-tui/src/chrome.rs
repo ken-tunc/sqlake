@@ -299,17 +299,45 @@ pub fn tab_bar(
 
 /// Running work, with a way to stop it, and the hints that have to be visible
 /// rather than discovered.
+///
+/// `runnable` is whether the active tab has something to run, which is what
+/// puts a `Run` here: beside the cancel buttons is already where somebody
+/// looks to see what this client is doing.
 pub fn status_bar(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
     area: Rect,
     snapshot: &Snapshot,
     selection: Option<(usize, usize)>,
+    runnable: bool,
 ) {
     hits.push(area, Z_BASE, Target::Pane(PaneId::StatusBar));
 
     let mut spans = Vec::new();
     let mut x = area.x;
+
+    // A span in the same line as everything else, not a widget of its own:
+    // the `Paragraph` at the bottom of this function covers the whole bar, so
+    // anything drawn separately is painted over by it.
+    if runnable {
+        const RUN: &str = " Run ";
+        let width = display_width(RUN);
+        if width <= area.width {
+            hits.push(
+                Rect::new(x, area.y, width, 1),
+                Z_CHROME,
+                Target::Button(ButtonId::RunQuery),
+            );
+            spans.push(Span::styled(
+                RUN,
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            x += width;
+        }
+    }
 
     for item in &snapshot.busy {
         // A label carries a relation's name, so it goes through the same
@@ -456,6 +484,7 @@ mod tests {
                 tree: std::sync::Arc::default(),
             }],
             previews: Vec::new(),
+            queries: Vec::new(),
             busy: (0..busy)
                 .map(|i| BusyItem {
                     id: BusyId::new(i as u64),
@@ -716,7 +745,7 @@ mod tests {
         let snap = snapshot(1);
         let area = Rect::new(0, 0, 60, 1);
         let hits = draw(
-            |frame, hits| status_bar(frame, hits, area, &snap, None),
+            |frame, hits| status_bar(frame, hits, area, &snap, None, false),
             60,
             1,
         );
@@ -736,7 +765,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap, None))
+            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap, None, false))
             .unwrap();
 
         let cross = terminal
@@ -758,7 +787,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         let mut hits = HitMap::new();
         terminal
-            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap, None))
+            .draw(|frame| status_bar(frame, &mut hits, Rect::new(0, 0, 60, 1), &snap, None, false))
             .unwrap();
 
         let rendered: String = terminal

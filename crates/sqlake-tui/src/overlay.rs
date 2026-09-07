@@ -16,14 +16,36 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use crate::chrome;
 use crate::grid::{display_width, sanitise};
 use crate::hit::{ButtonId, HitMap, Target, Z_BACKDROP, Z_CHROME, Z_MODAL};
+use crate::intent::Intent;
 use crate::ui::{Severity, Toast};
+
+/// One of a dialog's buttons.
+///
+/// Carries an `Intent` rather than a name to match on later, which is what puts
+/// a dialog under the same coverage rule as everything else: a button that
+/// could not be described as an intent is one the keyboard has no route to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    pub label: String,
+    pub intent: Intent,
+}
 
 /// A dialog's contents. Held by `UiState`, because whether a dialog is open is
 /// a fact about this screen and not about the data.
+///
+/// One rectangle for both kinds. A confirmation is the same shape as a notice
+/// with a second button on it, and a separate type for it would be a second
+/// backdrop, a second hit-map order and a second thing to get wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Modal {
     pub title: String,
     pub body: String,
+    /// What can be answered, left to right. Empty for a dialog that only tells
+    /// — dismissing is always available and is not one of these.
+    pub choices: Vec<Choice>,
+    /// Whether the border and title read as a failure. A question about money
+    /// is not one.
+    pub grave: bool,
 }
 
 impl Modal {
@@ -32,6 +54,19 @@ impl Modal {
         Self {
             title: title.into(),
             body: body.into(),
+            choices: Vec::new(),
+            grave: true,
+        }
+    }
+
+    /// A dialog with something to answer.
+    #[must_use]
+    pub fn asking(title: impl Into<String>, body: impl Into<String>, choices: Vec<Choice>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            choices,
+            grave: false,
         }
     }
 }
@@ -45,6 +80,11 @@ pub fn modal(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, dialog: &Moda
     // Everything, so nothing behind can be clicked.
     hits.push(area, Z_BACKDROP, Target::Backdrop);
 
+    let colour = if dialog.grave {
+        Color::Red
+    } else {
+        Color::Cyan
+    };
     let width = MODAL_WIDTH.min(area.width);
     let body = sanitise(&dialog.body);
     // Two rows of border, one for the button, one to breathe.
@@ -58,10 +98,10 @@ pub fn modal(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, dialog: &Moda
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Red))
+        .border_style(Style::new().fg(colour))
         .title(Span::styled(
             format!(" {} ", sanitise(&dialog.title)),
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(colour).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -77,24 +117,47 @@ pub fn modal(frame: &mut Frame<'_>, hits: &mut HitMap, area: Rect, dialog: &Moda
     );
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), text_area);
 
-    // A dialog reachable only by `Esc` is one a pointer cannot leave.
-    let button_width = display_width(DISMISS);
-    let button = Rect::new(
-        inner.x + inner.width.saturating_sub(button_width),
-        inner.bottom().saturating_sub(1),
-        button_width.min(inner.width),
-        1,
-    );
-    hits.push(button, Z_MODAL, Target::Button(ButtonId::DismissModal));
-    frame.render_widget(
-        Paragraph::new(DISMISS).style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD),
-        ),
-        button,
-    );
+    // Right to left from the edge, so dismissing is always in the same place
+    // whatever else the dialog offers. A dialog reachable only by `Esc` is one
+    // a pointer cannot leave.
+    let row = inner.bottom().saturating_sub(1);
+    let mut right = inner.right();
+    let mut place = |label: &str, style: Style, target: Target, hits: &mut HitMap| {
+        let wanted = display_width(label);
+        if wanted > right.saturating_sub(inner.x) {
+            return None;
+        }
+        right -= wanted;
+        let rect = Rect::new(right, row, wanted, 1);
+        hits.push(rect, Z_MODAL, target);
+        Some((rect, label.to_owned(), style))
+    };
+
+    let mut buttons = Vec::new();
+    let dismiss_style = Style::new()
+        .fg(Color::Black)
+        .bg(colour)
+        .add_modifier(Modifier::BOLD);
+    buttons.extend(place(
+        DISMISS,
+        dismiss_style,
+        Target::Button(ButtonId::DismissModal),
+        hits,
+    ));
+    // Reversed, because they are placed from the right: the first choice ends
+    // up leftmost, which is the order it was written in.
+    for (index, choice) in dialog.choices.iter().enumerate().rev() {
+        let label = format!(" {} ", sanitise(&choice.label));
+        buttons.extend(place(
+            &label,
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+            Target::Button(ButtonId::ModalChoice { index }),
+            hits,
+        ));
+    }
+    for (rect, label, style) in buttons {
+        frame.render_widget(Paragraph::new(label).style(style), rect);
+    }
 }
 
 /// Transient messages, newest at the bottom, stacked up from above the status
