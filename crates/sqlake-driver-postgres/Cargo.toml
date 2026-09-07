@@ -25,6 +25,10 @@ tokio-postgres-rustls.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The cancel path reports itself through `tracing` and nothing else — a
+# request that went out and was refused looks exactly like one that was never
+# sent. This is what makes the difference visible when the test fails.
+tracing-subscriber.workspace = true
 bytes.workspace = true
 sqlake-conformance.workspace = true
 sqlake-driver-mock.workspace = true

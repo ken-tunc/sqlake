@@ -15,6 +15,8 @@ pub mod query;
 pub mod tls;
 pub mod value;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
@@ -22,6 +24,7 @@ use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet};
 use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use tokio::sync::Mutex;
 use tokio_postgres::{Client, Config};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -126,7 +129,12 @@ impl Driver for PgDriver {
         // tree's top node is this database, and a relation from another one
         // cannot be read over this connection at all.
         let database = current_database(&client).await?;
-        Ok(Box::new(PgSession { client, database }))
+        Ok(Box::new(PgSession {
+            client,
+            database,
+            tls: tls::Verification::of(params.sslmode),
+            cancels: Arc::default(),
+        }))
     }
 }
 
@@ -189,6 +197,18 @@ pub struct PgSession {
     /// The database this connection is attached to. PostgreSQL has no
     /// cross-database queries, so this is a fact about the whole session.
     database: String,
+    /// How this connection was secured, kept because a cancel request opens a
+    /// second one and has to be secured the same way.
+    tls: Option<tls::Verification>,
+    /// Held while anything is running on this connection, and held by a cancel
+    /// request until it has been written.
+    ///
+    /// A cancel names the *backend*, not the statement, so one still in flight
+    /// when the next call starts cancels that instead — the user who cancels
+    /// and immediately runs again loses the second query. Waiting keeps the
+    /// window down to the server's own (the postmaster signals the backend
+    /// after it has read the packet, which no client can wait for).
+    cancels: Arc<Mutex<()>>,
 }
 
 #[async_trait]
@@ -198,19 +218,23 @@ impl Session for PgSession {
     }
 
     async fn children(&self, of: &NodeRef) -> DriverResult<Vec<TreeNode>> {
+        let _running = self.cancels.lock().await;
         catalog::children(&self.client, &self.database, of).await
     }
 
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
+        let _running = self.cancels.lock().await;
         preview::preview(&self.client, &self.database, table, req).await
     }
 
     async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {
+        let _running = self.cancels.lock().await;
         query::estimate(&self.client, sql).await
     }
 
     async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet> {
-        query::execute(&self.client, query).await
+        let running = Arc::clone(&self.cancels).lock_owned().await;
+        query::execute(&self.client, self.tls, running, query).await
     }
 
     async fn close(self: Box<Self>) {

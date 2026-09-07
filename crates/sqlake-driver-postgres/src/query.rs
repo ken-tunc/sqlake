@@ -9,8 +9,11 @@ use futures::{StreamExt as _, pin_mut};
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
 use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
-use tokio_postgres::Client;
+use tokio::sync::OwnedMutexGuard;
+use tokio_postgres::{CancelToken, Client};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::tls;
 use crate::value::RawValue;
 
 /// The planner's total cost for the statement.
@@ -60,7 +63,89 @@ fn total_cost(plan: &serde_json::Value) -> Option<f64> {
     plan.get(0)?.get("Plan")?.get("Total Cost")?.as_f64()
 }
 
-pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<ResultSet> {
+/// Tells the server to stop, if it is dropped while a query is still running.
+///
+/// A cancel request is a *second connection* carrying the backend's process id
+/// and secret — it cannot be sent down the socket the query is occupying, which
+/// is exactly why it works while the first one is busy.
+///
+/// Dropping is the signal because dropping is what already happens: the layer
+/// above stops awaiting, the future unwinds, and this runs. Asking the driver
+/// to take a cancellation handle instead would mean threading one through a
+/// trait so that it could be triggered from a task that has already let go.
+struct StopsTheQuery {
+    token: Option<CancelToken>,
+    tls: Option<tls::Verification>,
+    /// The connection's lock, handed to the cancel request so that the next
+    /// call on this connection waits for it. A cancel names the backend rather
+    /// than the statement, so one still opening its socket when the next query
+    /// starts would cancel *that*.
+    running: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for StopsTheQuery {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let tls = self.tls;
+        let running = self.running.take();
+        // Spawned, because `Drop` cannot await. A runtime already shutting
+        // down refuses it, and there is nothing useful to do about that: the
+        // process is going, and the server drops the query with the socket.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            // Dropped at the end of this task, not before: holding it is what
+            // makes the next caller wait — and therefore what would wedge the
+            // whole connection if this never finished. `connect_timeout`
+            // bounds the socket and nothing after it, which is the gap
+            // `config::DEADLINE` exists for on the connection this mirrors.
+            let _running = running;
+            // The connection this goes down has to be secured the same way the
+            // first one was: a server requiring TLS refuses a plaintext cancel
+            // request, and one that is not expecting TLS refuses the handshake.
+            let request = async {
+                match tls {
+                    None => token.cancel_query(tokio_postgres::NoTls).await,
+                    Some(verification) => match tls::client_config(verification) {
+                        Ok(config) => token.cancel_query(MakeRustlsConnect::new(config)).await,
+                        Err(why) => {
+                            tracing::warn!(%why, "cancel: no TLS configuration to send it with");
+                            Ok(())
+                        }
+                    },
+                }
+            };
+            let Ok(sent) = tokio::time::timeout(crate::config::DEADLINE, request).await else {
+                tracing::warn!("cancel request gave up; the connection is usable again");
+                return;
+            };
+            match sent {
+                // PostgreSQL answers nothing at all to a cancel request — it
+                // acts on it or ignores it, and never says which — so this
+                // says only that the request went out.
+                Ok(()) => tracing::info!("asked postgres to cancel the running query"),
+                Err(err) => tracing::warn!(error = %crate::describe(&err), "cancel request failed"),
+            }
+        });
+    }
+}
+
+impl StopsTheQuery {
+    /// The query finished on its own, so there is nothing to cancel.
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+pub async fn execute(
+    client: &Client,
+    tls: Option<tls::Verification>,
+    running: OwnedMutexGuard<()>,
+    query: &ApprovedQuery,
+) -> DriverResult<ResultSet> {
     // Prepared first, so the columns come from the *statement*. Reading them
     // off the first row costs nothing until the result is empty, and then the
     // grid is handed a result with no columns and draws nothing at all — which
@@ -78,6 +163,18 @@ pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<Res
         // becomes authoritative.
         .map(|column| Column::new(column.name(), column.type_().name(), true))
         .collect();
+
+    // Armed *before* the statement goes out, not after the await that sends
+    // it: Bind, Execute and Sync are pipelined, so the server can already be
+    // running the query while this side is still waiting to hear that the bind
+    // succeeded. A guard armed after that await is unarmed for part of the
+    // window it exists for. The cost of arming early is at most a cancel
+    // request for a query that never ran, which the server ignores.
+    let mut guard = StopsTheQuery {
+        token: Some(client.cancel_token()),
+        tls,
+        running: Some(running),
+    };
 
     // `query_raw` rather than `query`: it streams, so a cap of fifty on a
     // statement matching a million rows stops after fifty instead of
@@ -103,6 +200,14 @@ pub async fn execute(client: &Client, query: &ApprovedQuery) -> DriverResult<Res
                 .collect(),
         );
     }
+
+    // Nobody is waiting on this statement any more — every row that was asked
+    // for has arrived, and under a cap the rest are drained with the stream.
+    // A failure inside the loop above leaves it armed, which sends a request
+    // the server ignores — the alternative is deciding whether each error
+    // means the statement ended, which is a question only the server can
+    // answer and which it answers by ignoring the request.
+    guard.disarm();
 
     // Uncapped, the stream ran to the end and the count is the whole answer.
     // Capped, it is not: `None` rather than fifty, which the grid would show as

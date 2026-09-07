@@ -40,6 +40,12 @@ enum SessionCmd {
     Execute {
         query: Box<ApprovedQuery>,
         reply: oneshot::Sender<DriverResult<ResultSet>>,
+        /// Resolves when the caller has gone, which is the whole cancellation
+        /// mechanism. It arrives *with* the command rather than as a later one
+        /// of its own: the actor serialises access, so a cancel sent down the
+        /// same channel would queue behind the query it is meant to stop and
+        /// arrive after it finished.
+        cancel: oneshot::Receiver<()>,
     },
     Close,
 }
@@ -102,12 +108,24 @@ impl SessionHandle {
             .map_err(Into::into)
     }
 
+    /// Run a query, and stop it at the server if this future is dropped.
+    ///
+    /// Dropping is how cancellation is expressed, because it is what already
+    /// happens: the store aborts the task waiting here. The sender below lives
+    /// exactly as long as this future, so aborting it closes the channel, the
+    /// actor's `select` fires, and the driver's own future is dropped mid-call
+    /// — which is where a driver that can reach its server does so.
     pub async fn execute(&self, query: ApprovedQuery) -> AppResult<ResultSet> {
         let (reply, answer) = oneshot::channel();
+        // Held for the whole of this function. Named rather than `_`, which
+        // would drop it immediately and cancel every query the moment it
+        // started.
+        let (_alive, cancel) = oneshot::channel();
         self.tx
             .send(SessionCmd::Execute {
                 query: Box::new(query),
                 reply,
+                cancel,
             })
             .await
             .map_err(|_| AppError::SessionClosed)?;
@@ -139,8 +157,27 @@ async fn run(session: Box<dyn Session>, mut rx: mpsc::Receiver<SessionCmd>) {
             SessionCmd::Estimate { sql, reply } => {
                 let _ = reply.send(session.estimate(&sql).await);
             }
-            SessionCmd::Execute { query, reply } => {
-                let _ = reply.send(session.execute(&query).await);
+            SessionCmd::Execute {
+                query,
+                reply,
+                cancel,
+            } => {
+                tokio::select! {
+                    // Biased, so a caller that gave up while this command sat
+                    // in the queue behind another one never reaches the driver
+                    // at all. Left to chance, half of those send a statement to
+                    // the server before the cancel branch is looked at.
+                    biased;
+                    // The caller is gone. Falling out of the select drops the
+                    // driver's future half-way through its call, which is the
+                    // signal a driver turns into a cancel request of its own.
+                    _ = cancel => {
+                        tracing::debug!("a query was abandoned; the driver is being unwound");
+                    }
+                    result = session.execute(&query) => {
+                        let _ = reply.send(result);
+                    }
+                }
             }
             SessionCmd::Close => break,
         }

@@ -50,7 +50,17 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     // what a query costs.
     partitioning: true,
     transactions: false,
-    cancel: true,
+    // False, and this is the honest answer rather than an oversight. Cancelling
+    // a BigQuery job means `jobs.cancel` with its id, and the synchronous
+    // `jobs.query` this driver uses does not hand one over until it returns —
+    // by which time there is nothing to cancel. Making it true means the
+    // asynchronous path, `jobs.insert` and polling `getQueryResults`, which is
+    // a driver's worth of work and not a flag.
+    //
+    // Dropping the request still stops the *client* waiting. It does not stop
+    // the job, and a capability that said otherwise would be the client
+    // claiming to have saved somebody money it did not save.
+    cancel: false,
     streaming: true,
     // `jobs.insert` with `dryRun` returns the byte estimate and runs nothing.
     cost_estimate: true,

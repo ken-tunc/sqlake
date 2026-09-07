@@ -74,6 +74,14 @@ async fn the_tree_shows_what_a_person_would_look_for() {
     use sqlake_core::driver::Driver as _;
     use sqlake_core::node::{NodeKind, NodeRef, RelationKind};
 
+    // The cancel path says what it did through `tracing` and nowhere else, so
+    // without this a request that was refused and one that was never sent look
+    // identical in a failure.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
     let Some(container) = start().await else {
         return;
     };
@@ -273,6 +281,105 @@ async fn until_gone(client: &tokio_postgres::Client) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("a connection was still open five seconds after it should have gone");
+}
+
+/// Recognisable in `pg_stat_activity`, and in nothing else that runs here.
+const MARKER: &str = "sqlake_cancel_probe";
+
+/// Abandoning a query stops it *at the server*, not just here.
+///
+/// The one case that cannot be written against a fixture: what it asserts is
+/// what a second connection can see about the first, and only a real backend
+/// has an opinion about that. `Capabilities::cancel` is a claim about this and
+/// nothing else.
+#[tokio::test]
+async fn abandoning_a_query_stops_it_at_the_server() {
+    use std::future::Future as _;
+
+    use sqlake_core::capability::Escaping;
+    use sqlake_core::driver::Driver as _;
+    use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
+
+    // The cancel path says what it did through `tracing` and nowhere else, so
+    // without this a request that was refused and one that was never sent look
+    // identical in a failure.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let Some(container) = start().await else {
+        return;
+    };
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("a mapped port");
+    seed(port).await;
+
+    let session = PgDriver::new()
+        .connect(&profile(port))
+        .await
+        .expect("should connect");
+
+    let sql = ValidatedSql::parse(
+        &RawSql::new(format!("select pg_sleep(120) /* {MARKER} */")),
+        Escaping::None,
+    )
+    .expect("one statement");
+    let query = ApprovedQuery::within(sql, None, Estimate::Unknown, None).expect("no budget");
+
+    let watcher = raw_client(port).await;
+    let running = || async {
+        watcher
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where query like $1 and state = 'active'",
+                &[&format!("%{MARKER}%")],
+            )
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+    };
+
+    // Started, then dropped in place — which is exactly what the session
+    // actor's `select` does when the caller goes away. Through a `spawn` and
+    // an `abort` it would be, too, but with the runtime's own cancellation
+    // machinery in the middle of what is being tested.
+    {
+        let mut running_query = std::pin::pin!(session.execute(&query));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut started = false;
+        for _ in 0..100 {
+            let _ = running_query.as_mut().poll(&mut cx);
+            // Kept polling for a few more turns after the server picks the
+            // query up: the messages are pipelined, so the backend can be
+            // executing while this side has not yet read that the bind
+            // succeeded — and stopping at the first sighting would leave the
+            // future somewhere it never is in the running client, where the
+            // actor polls it continuously.
+            if running().await > 0 {
+                for _ in 0..10 {
+                    let _ = running_query.as_mut().poll(&mut cx);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(started, "the probe query never started");
+    }
+
+    // The cancel goes out on a second connection from a spawned task, so it is
+    // not instantaneous — but it is not `pg_sleep(120)` either.
+    for _ in 0..100 {
+        if running().await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the server is still running the query five seconds after it was abandoned");
 }
 
 /// `None` when there is no Docker to talk to.
