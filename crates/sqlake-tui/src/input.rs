@@ -9,7 +9,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::{ConnStatus, Snapshot};
+use sqlake_app::snapshot::{ConnectionView, Snapshot};
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, ProfileId, TabId};
 use sqlake_core::node::TableRef;
@@ -293,6 +293,15 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::LoadMore,
     },
     KeyBinding {
+        // `n` for a new one. Global rather than in the grid: the gesture it
+        // matches is the `+` on the tab bar, which no pane owns, and a tab
+        // opened only while the grid has focus would be unreachable from the
+        // explorer where the connection is chosen.
+        keys: &[key('n')],
+        context: Context::Global,
+        kind: IntentKind::OpenSqlTab,
+    },
+    KeyBinding {
         keys: &[KeyCombo::ctrl(KeyCode::Tab), key(']'), key('[')],
         context: Context::Global,
         kind: IntentKind::SelectTab,
@@ -376,9 +385,10 @@ impl InputContext<'_> {
     fn connectable_profile(&self) -> Option<ProfileId> {
         let profiles = &self.snapshot.profiles;
         let live = |id: &ProfileId| {
-            self.snapshot.connections.iter().any(|c| {
-                &c.profile == id && matches!(c.status, ConnStatus::Connecting | ConnStatus::Ready)
-            })
+            self.snapshot
+                .connections
+                .iter()
+                .any(|c| &c.profile == id && c.is_live())
         };
         profiles
             .iter()
@@ -405,13 +415,36 @@ impl InputContext<'_> {
         self.active_tab
     }
 
+    /// A connection a SQL tab can be opened on: the selected row's, and
+    /// otherwise the first that is still live.
+    ///
+    /// Not [`Self::connection`] as it stands, which falls back to the first row
+    /// whatever its status. A closed connection keeps its row, so after
+    /// disconnecting the last one that fallback still answers — and the tab it
+    /// mints is taken away again by `close_disconnected_tabs` on the next
+    /// frame, which is a `+` that answers a click with nothing. The fallback to
+    /// the first *live* one is what keeps this and the bar's own `+` agreeing
+    /// on when there is somewhere to run a query.
+    fn sql_connection(&self) -> Option<ConnId> {
+        let live = |id: ConnId| {
+            self.snapshot
+                .connection(id)
+                .is_some_and(ConnectionView::is_live)
+        };
+        self.connection.filter(|c| live(*c)).or_else(|| {
+            self.snapshot
+                .connections
+                .iter()
+                .find(|c| c.is_live())
+                .map(|c| c.id)
+        })
+    }
+
     /// The relation the active tab points at, if any.
     fn active_preview(&self) -> Option<(ConnId, TableRef)> {
         let id = self.active_tab?;
-        self.tabs
-            .iter()
-            .find(|t| t.id == id)
-            .map(|t| (t.conn, t.table.clone()))
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        Some((tab.conn, tab.table()?.clone()))
     }
 
     /// The same relation, but only where its driver will order a preview.
@@ -678,6 +711,10 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
                 ]
             })
             .unwrap_or_default(),
+        (Target::Button(ButtonId::NewSqlTab), Gesture::Click) => ctx
+            .sql_connection()
+            .map(|conn| vec![ViewCmd::OpenSqlTab { conn }.into()])
+            .unwrap_or_default(),
         (Target::Button(ButtonId::DismissModal), Gesture::Click) => {
             vec![ViewCmd::DismissModal.into()]
         }
@@ -744,12 +781,17 @@ fn close_tab(id: TabId, ctx: &InputContext<'_>) -> Vec<Intent> {
     let Some(closing) = ctx.tabs.iter().find(|t| t.id == id) else {
         return Vec::new();
     };
-    let (conn, table) = (closing.conn, closing.table.clone());
     let mut intents = vec![ViewCmd::CloseTab(id).into()];
+    // A SQL tab has nothing in the store to forget: its buffer is this
+    // screen's, and the result it will grow in T4 is keyed by the run rather
+    // than by the tab.
+    let (conn, Some(table)) = (closing.conn, closing.table().cloned()) else {
+        return intents;
+    };
     let still_open = ctx
         .tabs
         .iter()
-        .any(|t| t.id != id && t.conn == conn && t.table == table);
+        .any(|t| t.id != id && t.conn == conn && t.table() == Some(&table));
     if !still_open {
         intents.push(Action::ForgetPreview { conn, table }.into());
     }
@@ -1008,6 +1050,12 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .active_preview()
             .map(|(conn, table)| vec![Action::LoadMore { conn, table }.into()])
             .unwrap_or_default(),
+        // With nothing live there is nowhere to run a query, and a tab that
+        // could never run one is a tab that lies.
+        IntentKind::OpenSqlTab => ctx
+            .sql_connection()
+            .map(|conn| vec![ViewCmd::OpenSqlTab { conn }.into()])
+            .unwrap_or_default(),
         IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
             .map(|tab| vec![ViewCmd::SelectTab(tab).into()])
             .unwrap_or_default(),
@@ -1117,7 +1165,7 @@ mod tests {
 
     use super::*;
     use crate::hit::ToastId;
-    use crate::ui::Severity;
+    use crate::ui::{Severity, TabContent};
 
     // ── fixtures ───────────────────────────────────────────────────────────
 
@@ -1216,12 +1264,12 @@ mod tests {
             OpenTab {
                 id: TabId::new(1),
                 conn,
-                table: TableRef::new(["public", "users"]),
+                content: TabContent::Preview(TableRef::new(["public", "users"])),
             },
             OpenTab {
                 id: TabId::new(2),
                 conn,
-                table: TableRef::new(["public", "empty"]),
+                content: TabContent::Preview(TableRef::new(["public", "empty"])),
             },
         ];
 
@@ -1246,7 +1294,7 @@ mod tests {
                     exhausted: false,
                     attempts: 0,
                     conn: t.conn,
-                    table: t.table.clone(),
+                    table: t.table().expect("a preview tab").clone(),
                     sort: None,
                     loaded_rows: 0,
                     data: LoadState::Idle,
@@ -1896,6 +1944,102 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_sql_tab_forgets_nothing() {
+        // A `ForgetPreview` here would drop the cache of whatever relation
+        // happened to be reachable, on a tab that never had one.
+        let mut f = fixture();
+        let sql = TabId::new(50);
+        f.tabs.push(OpenTab {
+            id: sql,
+            conn: f.conn,
+            content: TabContent::Sql {
+                number: 1,
+                text: String::new(),
+            },
+        });
+        assert_eq!(
+            on_mouse(Target::TabClose(sql), Gesture::Click, &f.ctx(PaneId::Grid)),
+            [Intent::View(ViewCmd::CloseTab(sql))]
+        );
+    }
+
+    #[test]
+    fn a_sql_tab_sorts_and_pages_nothing() {
+        // Both reach for the active tab's relation. Without the `?` they act
+        // on whichever relation another tab left in the context.
+        let mut f = fixture();
+        let sql = TabId::new(50);
+        f.tabs.push(OpenTab {
+            id: sql,
+            conn: f.conn,
+            content: TabContent::Sql {
+                number: 1,
+                text: String::new(),
+            },
+        });
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(sql);
+        assert!(on_key(press(KeyCode::Char('s')), &c).is_empty());
+        assert!(on_key(press(KeyCode::Char('m')), &c).is_empty());
+    }
+
+    #[test]
+    fn the_new_tab_button_and_its_key_do_the_same_thing() {
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
+        let expected: Vec<Intent> = vec![ViewCmd::OpenSqlTab { conn: f.conn }.into()];
+        assert_eq!(on_key(press(KeyCode::Char('n')), &c), expected);
+        assert_eq!(
+            on_mouse(Target::Button(ButtonId::NewSqlTab), Gesture::Click, &c),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_sql_tab_needs_somewhere_to_run() {
+        // With no connection there is nowhere to send a query, and a tab that
+        // could never run one is a tab that lies.
+        let mut f = fixture();
+        f.snapshot.connections.clear();
+        let mut c = f.ctx(PaneId::Grid);
+        c.connection = None;
+        assert!(on_key(press(KeyCode::Char('n')), &c).is_empty());
+        assert!(on_mouse(Target::Button(ButtonId::NewSqlTab), Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn a_closed_connection_is_not_somewhere_to_run_either() {
+        // A closed connection keeps its row so the user can see what happened
+        // to it. Opening a SQL tab on one mints a tab that
+        // `close_disconnected_tabs` takes away on the next frame, which is a
+        // `+` that answers a click with nothing.
+        let mut f = fixture();
+        f.snapshot.connections[0].status = ConnStatus::Closed;
+        let c = f.ctx(PaneId::Grid);
+        assert!(on_key(press(KeyCode::Char('n')), &c).is_empty());
+        assert!(on_mouse(Target::Button(ButtonId::NewSqlTab), Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn a_new_sql_tab_skips_a_dead_connection_for_a_live_one() {
+        // The selected row's connection is the one to use, but only while it
+        // is one: with a closed connection selected and a live one open, `n`
+        // opens on the live one rather than on nothing.
+        let mut f = fixture();
+        let live = ConnId::new();
+        f.snapshot.connections[0].status = ConnStatus::Closed;
+        let mut second = f.snapshot.connections[0].clone();
+        second.id = live;
+        second.status = ConnStatus::Ready;
+        f.snapshot.connections.push(second);
+        let c = f.ctx(PaneId::Grid);
+        assert_eq!(
+            on_key(press(KeyCode::Char('n')), &c),
+            [Intent::View(ViewCmd::OpenSqlTab { conn: live })]
+        );
+    }
+
+    #[test]
     fn closing_one_of_two_tabs_on_the_same_relation_keeps_the_data() {
         // `ViewCmd::OpenTab` never produces this today — it raises the
         // existing tab instead of minting a second one on the same
@@ -1906,7 +2050,7 @@ mod tests {
         f.tabs.push(OpenTab {
             id: twin,
             conn: f.conn,
-            table: TableRef::new(["public", "users"]),
+            content: TabContent::Preview(TableRef::new(["public", "users"])),
         });
 
         // `on_mouse` removes nothing itself, so the context is rebuilt
@@ -2174,6 +2318,7 @@ mod tests {
         Target::Button(_) => [
             Target::Button(ButtonId::Cancel(BusyId::new(1))),
             Target::Button(ButtonId::DismissModal),
+            Target::Button(ButtonId::NewSqlTab),
         ],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],

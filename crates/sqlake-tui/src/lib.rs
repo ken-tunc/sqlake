@@ -23,6 +23,7 @@ pub mod menu;
 pub mod mouse;
 pub mod overlay;
 pub mod run;
+pub mod sql;
 pub mod terminal;
 pub mod tree;
 pub mod ui;

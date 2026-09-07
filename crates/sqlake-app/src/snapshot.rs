@@ -89,6 +89,18 @@ impl ConnectionView {
         self.status == ConnStatus::Ready
     }
 
+    /// Whether this connection is one work can still be given to.
+    ///
+    /// Wider than [`Self::is_ready`]: a connection still opening will take the
+    /// work by the time it is sent. Narrower than "there is a row here": a
+    /// closed or failed connection keeps its row so the failure can be read,
+    /// and counting it is how an affordance ends up offering something that
+    /// cannot happen.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(self.status, ConnStatus::Connecting | ConnStatus::Ready)
+    }
+
     /// Whether a preview of this connection can be ordered by a column.
     ///
     /// False while the capabilities are unknown, so the answer is one a caller
@@ -306,6 +318,14 @@ mod tests {
         assert!(!conn(ConnStatus::Connecting).is_ready());
         assert!(!conn(ConnStatus::Failed("nope".into())).is_ready());
         assert!(!conn(ConnStatus::Closed).is_ready());
+    }
+
+    #[test]
+    fn a_connection_still_opening_is_live_and_a_finished_one_is_not() {
+        assert!(conn(ConnStatus::Ready).is_live());
+        assert!(conn(ConnStatus::Connecting).is_live());
+        assert!(!conn(ConnStatus::Failed("nope".into())).is_live());
+        assert!(!conn(ConnStatus::Closed).is_live());
     }
 
     #[test]

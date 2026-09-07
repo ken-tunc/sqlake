@@ -15,6 +15,7 @@
 //! data a preview is, and this screen decides what to call a tab of it and
 //! which failures are worth a passing note.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,16 +38,70 @@ use crate::grid::RenderedGrid;
 use crate::hit::{PaneId, SplitId, Target, ToastId};
 use crate::intent::ViewCmd;
 
-/// A tab this screen has open, pointing at one connection's relation.
+/// What a tab is showing.
 ///
-/// At most one per `(conn, table)`: opening a relation already open selects
-/// that tab rather than minting a second. `close_tab` in `input` depends on
-/// this to know when the store's copy can go.
+/// The connection is on [`OpenTab`] rather than in here: both kinds belong to
+/// one, and a SQL tab with no connection is a query with nowhere to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabContent {
+    Preview(TableRef),
+    /// A SQL buffer, numbered so that two of them can be told apart in a bar
+    /// where neither has a relation's name to wear.
+    ///
+    /// The text is this screen's, not the store's: what is being typed is one
+    /// person's half-finished sentence, and what crosses into `sqlake-app` is
+    /// the text of a query somebody asked to run. Empty until the `$EDITOR`
+    /// handoff fills it.
+    Sql {
+        number: u32,
+        text: String,
+    },
+}
+
+/// A tab this screen has open on one connection.
+///
+/// At most one per `(conn, table)` for a preview: opening a relation already
+/// open selects that tab rather than minting a second, and `close_tab` in
+/// `input` depends on it to know when the store's copy can go. SQL tabs have
+/// no such rule — two of them are two different questions, and nothing in the
+/// store is keyed by either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTab {
     pub id: TabId,
     pub conn: ConnId,
-    pub table: TableRef,
+    pub content: TabContent,
+}
+
+impl OpenTab {
+    /// The relation this tab is a preview of, or `None` for a SQL tab.
+    ///
+    /// Most of what reads a tab wants a relation and has nothing to do without
+    /// one — sorting, paging, the store's cache key — so an `Option` here is
+    /// what turns each of those into one `?` rather than a `match` repeated at
+    /// every call site.
+    #[must_use]
+    pub const fn table(&self) -> Option<&TableRef> {
+        match &self.content {
+            TabContent::Preview(table) => Some(table),
+            TabContent::Sql { .. } => None,
+        }
+    }
+
+    /// What the tab bar and the pane border call it.
+    #[must_use]
+    pub fn title(&self) -> Cow<'_, str> {
+        self.content.title()
+    }
+}
+
+impl TabContent {
+    #[must_use]
+    pub fn title(&self) -> Cow<'_, str> {
+        match self {
+            Self::Preview(table) => Cow::Borrowed(table.name()),
+            Self::Sql { number, .. } => Cow::Owned(format!("SQL#{number}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +331,10 @@ pub struct UiState {
     pub tabs: Vec<OpenTab>,
     pub active_tab: Option<TabId>,
     next_tab: u32,
+    /// What the next SQL tab is called. Separate from `next_tab`: the id is
+    /// bookkeeping and the number is read off the screen, so a session that
+    /// opened six previews must not name its first query tab `SQL#7`.
+    next_sql: u32,
     pub toasts: Vec<Toast>,
     next_toast: u64,
     /// The last error already raised for each preview, so that a redraw does
@@ -297,6 +356,12 @@ pub struct UiState {
     /// of, which is worse than not opening it.
     detail_offset: usize,
     detail_rows: usize,
+    /// Lines in the active SQL tab's buffer, as of the last frame.
+    ///
+    /// Recorded the way `detail_rows` is, and for the same reason: the scroll
+    /// clamp asks how much content there is, and the only thing that has
+    /// counted it is the pass that drew it.
+    sql_lines: usize,
     /// An OSC 52 sequence waiting for the render loop to write it.
     ///
     /// Not written from here: this type holds no terminal, and the sequence has
@@ -397,6 +462,20 @@ impl UiState {
         self.detail_offset = self.detail_offset.min(rows.saturating_sub(1));
     }
 
+    /// Called by the draw pass, which is the only thing that has counted the
+    /// lines.
+    pub fn set_sql_lines(&mut self, lines: usize) {
+        self.sql_lines = lines;
+        if let Some(grid) = self.active_grid_mut() {
+            grid.row_offset = grid.row_offset.min(lines.saturating_sub(1));
+        }
+    }
+
+    #[must_use]
+    pub fn sql_offset(&self) -> usize {
+        self.offset(PaneId::Grid)
+    }
+
     #[must_use]
     pub fn detail_offset(&self) -> usize {
         self.detail_offset
@@ -428,7 +507,7 @@ impl UiState {
         let keys: Vec<(ConnId, TableRef)> = self
             .tabs
             .iter()
-            .map(|t| (t.conn, t.table.clone()))
+            .filter_map(|t| Some((t.conn, t.table()?.clone())))
             .collect();
 
         for (conn, table) in keys {
@@ -471,6 +550,24 @@ impl UiState {
             // would happen only in tests.
             let fetch = self.apply(ViewCmd::CloseTab(id), snapshot);
             debug_assert!(fetch.is_none(), "closing a tab fetches nothing");
+        }
+    }
+
+    /// Mint a tab and focus it.
+    fn open(&mut self, conn: ConnId, content: TabContent) {
+        self.next_tab += 1;
+        let id = TabId::new(self.next_tab);
+        self.tabs.push(OpenTab { id, conn, content });
+        self.active_tab = Some(id);
+    }
+
+    /// The active tab's SQL, or `None` when it is a preview.
+    #[must_use]
+    pub fn active_sql(&self) -> Option<&str> {
+        let id = self.active_tab?;
+        match &self.tabs.iter().find(|t| t.id == id)?.content {
+            TabContent::Sql { text, .. } => Some(text),
+            TabContent::Preview(_) => None,
         }
     }
 
@@ -600,15 +697,25 @@ impl UiState {
                 if let Some(existing) = self
                     .tabs
                     .iter()
-                    .find(|t| t.conn == conn && t.table == table)
+                    .find(|t| t.conn == conn && t.table() == Some(&table))
                 {
                     self.active_tab = Some(existing.id);
                 } else {
-                    self.next_tab += 1;
-                    let id = TabId::new(self.next_tab);
-                    self.tabs.push(OpenTab { id, conn, table });
-                    self.active_tab = Some(id);
+                    self.open(conn, TabContent::Preview(table));
                 }
+            }
+            // Never raised onto an existing one, unlike a preview: two SQL
+            // tabs on one connection are two different questions, and there is
+            // nothing to match them on anyway.
+            ViewCmd::OpenSqlTab { conn } => {
+                self.next_sql += 1;
+                self.open(
+                    conn,
+                    TabContent::Sql {
+                        number: self.next_sql,
+                        text: String::new(),
+                    },
+                );
             }
             ViewCmd::SelectTab(id) => {
                 if self.tabs.iter().any(|t| t.id == id) {
@@ -649,7 +756,8 @@ impl UiState {
         let id = self.active_tab?;
         let at = self.tabs.iter().position(|t| t.id == id)?;
         let conn = self.tabs[at].conn;
-        let preview = snapshot.preview(conn, &self.tabs[at].table)?;
+        let table = self.tabs[at].table()?.clone();
+        let preview = snapshot.preview(conn, &table)?;
         // A first page still in flight is not something to hurry along, and its
         // `loaded_rows` of zero would otherwise read as "at the end".
         if !matches!(preview.data, LoadState::Ready(_)) {
@@ -673,10 +781,7 @@ impl UiState {
             return None;
         }
         grid.asked_after = Some(attempts);
-        Some(Action::LoadMore {
-            conn,
-            table: self.tabs[at].table.clone(),
-        })
+        Some(Action::LoadMore { conn, table })
     }
 
     fn cycle_focus(&mut self, delta: i32) {
@@ -708,6 +813,11 @@ impl UiState {
     fn content_rows(&self, pane: PaneId, snapshot: &Snapshot) -> usize {
         match pane {
             PaneId::Explorer => self.visible_len(snapshot),
+            // A SQL tab reuses the grid pane's offset rather than keeping one
+            // of its own, so `j`, `PageDown` and `G` all work in it with
+            // nothing added — only the count of what is being scrolled
+            // through differs.
+            PaneId::Grid if self.active_sql().is_some() => self.sql_lines,
             PaneId::Grid => self.row_count(snapshot),
             PaneId::Detail => self.detail_rows,
             PaneId::TabBar | PaneId::StatusBar => 0,
@@ -894,7 +1004,7 @@ impl UiState {
     pub fn active_sort(&self, snapshot: &Snapshot) -> Option<Sort> {
         let id = self.active_tab?;
         let tab = self.tabs.iter().find(|t| t.id == id)?;
-        snapshot.preview(tab.conn, &tab.table)?.sort
+        snapshot.preview(tab.conn, tab.table()?)?.sort
     }
 
     fn select_cell(&mut self, row: usize, col: usize, snapshot: &Snapshot) {
@@ -950,7 +1060,7 @@ impl UiState {
     fn rows_of<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
         let tab = self.active_tab?;
         let open = self.tabs.iter().find(|t| t.id == tab)?;
-        snapshot.preview(open.conn, &open.table)?.data.ready()
+        snapshot.preview(open.conn, open.table()?)?.data.ready()
     }
 
     fn row_count(&self, snapshot: &Snapshot) -> usize {
@@ -1617,6 +1727,142 @@ mod tests {
         snap.previews[0].last_error = Some("timed out".to_owned());
         ui.raise_preview_errors(&snap);
         assert_eq!(ui.toasts.len(), 2);
+    }
+
+    #[test]
+    fn sql_tabs_and_a_preview_tab_are_open_at_once() {
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+
+        let _ = ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+
+        assert_eq!(ui.tabs.len(), 3);
+        // Two SQL tabs, not one raised twice: they are two questions, and the
+        // rule that raises an already-open relation has nothing to match on.
+        let titles: Vec<String> = ui.tabs.iter().map(|t| t.title().into_owned()).collect();
+        assert_eq!(titles, ["users", "SQL#1", "SQL#2"]);
+    }
+
+    #[test]
+    fn the_sql_numbering_does_not_count_previews() {
+        // The id is bookkeeping and the number is read off the screen: a
+        // session that opened a relation first must not name its first query
+        // tab `SQL#2`.
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        assert_eq!(ui.tabs[1].title(), "SQL#1");
+    }
+
+    #[test]
+    fn closing_one_tab_leaves_the_others_where_they_were() {
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let first = ui.active_tab.expect("a tab");
+        let _ = ui.apply(
+            ViewCmd::OpenTab {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        let preview = ui.active_tab.expect("a tab");
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+
+        // Something view-local on the preview, to see whether closing a
+        // neighbour disturbs it.
+        let _ = ui.apply(ViewCmd::SelectTab(preview), &snap);
+        let _ = ui.apply(ViewCmd::SelectCell { row: 4, col: 2 }, &snap);
+
+        let _ = ui.apply(ViewCmd::CloseTab(first), &snap);
+
+        assert_eq!(ui.tabs.len(), 2);
+        assert_eq!(
+            ui.grid(preview).map(|g| (g.row, g.col)),
+            Some((4, 2)),
+            "closing a SQL tab moved the preview's cursor"
+        );
+    }
+
+    #[test]
+    fn a_sql_tab_scrolls_by_its_own_lines() {
+        // The grid pane's offset is reused, so `j` and `PageDown` need nothing
+        // added — but the clamp asks how much content there is, and for a SQL
+        // tab that is lines rather than rows.
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        ui.set_viewport(PaneId::Grid, Rect::new(0, 0, 40, 4));
+        ui.set_sql_lines(20);
+
+        let _ = ui.apply(
+            ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: 100,
+            },
+            &snap,
+        );
+        // Twenty lines in a pane four tall: sixteen is the last screenful.
+        assert_eq!(ui.sql_offset(), 16);
+    }
+
+    #[test]
+    fn a_shorter_buffer_does_not_leave_the_pane_scrolled_off_it() {
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        ui.set_viewport(PaneId::Grid, Rect::new(0, 0, 40, 4));
+        ui.set_sql_lines(20);
+        let _ = ui.apply(
+            ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: 100,
+            },
+            &snap,
+        );
+        ui.set_sql_lines(2);
+        assert!(ui.sql_offset() <= 1, "{}", ui.sql_offset());
+    }
+
+    #[test]
+    fn a_sql_tab_asks_for_no_pages() {
+        // `wants_a_page` reaches for the tab's relation, and a SQL tab has
+        // none. Without the `?` it would page whatever relation happened to
+        // be first in the snapshot.
+        let conn = ConnId::new();
+        let snap = snapshot(conn, 3, 10, 3);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        ui.set_viewport(PaneId::Grid, Rect::new(0, 0, 40, 10));
+        let fetch = ui.apply(
+            ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: 1000,
+            },
+            &snap,
+        );
+        assert!(fetch.is_none(), "{fetch:?}");
     }
 
     #[test]

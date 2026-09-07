@@ -131,6 +131,10 @@ pub enum ViewCmd {
         conn: ConnId,
         table: TableRef,
     },
+    /// Open an empty SQL tab on a connection, focused.
+    OpenSqlTab {
+        conn: ConnId,
+    },
     SelectTab(TabId),
     CloseTab(TabId),
 
@@ -184,6 +188,7 @@ intent_kinds! {
     PreviewTable       => "open a relation",
     SortPreview        => "sort by a column",
     LoadMore           => "fetch the next page",
+    OpenSqlTab         => "open a SQL tab",
     SelectTab          => "switch tabs",
     CloseTab           => "close the tab",
     Cancel             => "stop what is running",
@@ -225,6 +230,7 @@ impl IntentKind {
                 // Paired with `Action::PreviewTable`: one capability,
                 // "open a relation", not two.
                 ViewCmd::OpenTab { .. } => Self::PreviewTable,
+                ViewCmd::OpenSqlTab { .. } => Self::OpenSqlTab,
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
                 ViewCmd::DismissToast(_) => Self::DismissToast,
