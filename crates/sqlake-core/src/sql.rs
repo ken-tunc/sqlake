@@ -103,6 +103,55 @@ impl fmt::Display for ValidatedSql {
     }
 }
 
+/// Where in a statement something is, one-based in lines and columns.
+///
+/// Lines and columns rather than the offset a server happens to report,
+/// because converting is the one step that needs to know which server said it:
+/// PostgreSQL gives a character offset into the whole statement and BigQuery
+/// writes `[3:15]` into the message. Doing it in the driver is the rule
+/// [`Capabilities`](crate::capability::Capabilities) follows, applied to
+/// errors — it is what lets a front-end mark a line without asking who
+/// reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Position {
+    #[must_use]
+    pub const fn new(line: u32, column: u32) -> Self {
+        Self { line, column }
+    }
+
+    /// From a one-based character offset into `text`, which is how PostgreSQL
+    /// reports it.
+    ///
+    /// `None` for an offset past the end or of zero: the server says zero for
+    /// "no position", and pointing at a character that is not there would put
+    /// a marker on a line the user cannot see.
+    #[must_use]
+    pub fn of_offset(text: &str, offset: u32) -> Option<Self> {
+        let offset = usize::try_from(offset).ok()?;
+        if offset == 0 || offset > text.chars().count() {
+            return None;
+        }
+        let before: String = text.chars().take(offset - 1).collect();
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        Some(Self {
+            line: u32::try_from(line).unwrap_or(u32::MAX),
+            column: u32::try_from(column).unwrap_or(u32::MAX),
+        })
+    }
+}
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "line {}, column {}", self.line, self.column)
+    }
+}
+
 /// What a query is expected to cost, in whatever the server actually measures.
 ///
 /// An enum rather than a number because the two drivers do not measure the
@@ -596,6 +645,37 @@ mod tests {
         assert_eq!(
             one("select $$ a"),
             Err(InvalidSql::Unterminated("dollar-quoted string"))
+        );
+    }
+
+    #[test]
+    fn an_offset_becomes_a_line_and_a_column() {
+        let text = "select\n  bad\nfrom t";
+        // The `b` of `bad`: 10th character, counting the newlines.
+        assert_eq!(Position::of_offset(text, 10), Some(Position::new(2, 3)));
+        assert_eq!(Position::of_offset(text, 1), Some(Position::new(1, 1)));
+        assert_eq!(
+            Position::of_offset(text, u32::try_from(text.chars().count()).unwrap()),
+            Some(Position::new(3, 6))
+        );
+    }
+
+    #[test]
+    fn a_position_that_is_not_one_is_no_position() {
+        // Zero is what a server says for "no position", and past the end
+        // would put a marker on a line nobody can see.
+        assert_eq!(Position::of_offset("select 1", 0), None);
+        assert_eq!(Position::of_offset("select 1", 9), None);
+        assert_eq!(Position::of_offset("", 1), None);
+    }
+
+    #[test]
+    fn a_column_is_counted_in_characters_rather_than_bytes() {
+        // The server counts characters, so a name with an accent in it must
+        // not shift the marker.
+        assert_eq!(
+            Position::of_offset("select é, bad", 11),
+            Some(Position::new(1, 11))
         );
     }
 

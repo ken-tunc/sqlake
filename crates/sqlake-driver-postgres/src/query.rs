@@ -8,7 +8,7 @@
 use futures::{StreamExt as _, pin_mut};
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
-use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use sqlake_core::sql::{ApprovedQuery, Estimate, Position, ValidatedSql};
 use tokio::sync::OwnedMutexGuard;
 use tokio_postgres::{CancelToken, Client};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -140,6 +140,33 @@ impl StopsTheQuery {
     }
 }
 
+/// The server's own position, turned into a line and a column.
+///
+/// PostgreSQL reports a one-based *character* offset into the statement it was
+/// given — and only for the statement it was given, which is why this is done
+/// here and not against the buffer: `EXPLAIN` prefixes it, and nothing above
+/// this crate knows that.
+///
+/// `ErrorPosition::Internal` is a position inside a function's body rather
+/// than inside what the user typed. Ignored: marking line three of a query
+/// because line three *of a trigger somewhere else* is wrong would point at
+/// the wrong thing with total confidence.
+fn refused(err: &tokio_postgres::Error, sql: &str) -> DriverError {
+    let at = match err
+        .as_db_error()
+        .and_then(tokio_postgres::error::DbError::position)
+    {
+        Some(tokio_postgres::error::ErrorPosition::Original(offset)) => {
+            Position::of_offset(sql, *offset)
+        }
+        _ => None,
+    };
+    DriverError::Query {
+        message: crate::describe(err),
+        at,
+    }
+}
+
 pub async fn execute(
     client: &Client,
     tls: Option<tls::Verification>,
@@ -153,7 +180,7 @@ pub async fn execute(
     let statement = client
         .prepare(query.text())
         .await
-        .map_err(|err| DriverError::Query(crate::describe(&err)))?;
+        .map_err(|err| refused(&err, query.text()))?;
 
     let columns: Vec<Column> = statement
         .columns()
@@ -182,7 +209,7 @@ pub async fn execute(
     let stream = client
         .query_raw(&statement, std::iter::empty::<&str>())
         .await
-        .map_err(|err| DriverError::Query(crate::describe(&err)))?;
+        .map_err(|err| refused(&err, query.text()))?;
     pin_mut!(stream);
 
     let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
@@ -193,7 +220,7 @@ pub async fn execute(
     while rows.len() < cap
         && let Some(row) = stream.next().await
     {
-        let row = row.map_err(|err| DriverError::Query(crate::describe(&err)))?;
+        let row = row.map_err(|err| refused(&err, query.text()))?;
         rows.push(
             (0..row.len())
                 .map(|i| row.get::<_, RawValue>(i).decode())

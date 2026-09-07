@@ -174,8 +174,8 @@ The UI shows a confirmation dialog on `NeedsApproval` and calls the same use cas
 
 ## 5. Screen layout
 
-Where the layout is heading. Today's is most of it — a tree pane, a grid pane and the
-cell-detail pane under it — with the SQL and definition tabs arriving in M4 and M5.
+Where the layout is heading. Today's is most of it — a tree pane, a grid pane with preview and
+SQL tabs, and the cell-detail pane under it — with the definition tabs arriving in M5.
 
 ```
 ┌ sqlake ── [● prod-pg] [○ bq-analytics] [+] ─────────────────────── ⚙ ─┐
@@ -210,8 +210,8 @@ What that mechanism does not cover:
   entry needs a key binding, and the menu itself does too — for those terminals it does not
   exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
   cannot, because it only ever clicks the menu's first line.
-- Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M7, with the templates
-  it exists to insert).
+- Reserved keys: `Ctrl-p` for the command palette (M7, with the templates it exists to insert).
+  `e` opens `$EDITOR` and is bound; see `KEYMAP`.
 
 ---
 
@@ -439,7 +439,7 @@ asks about — the reasoning is in `tests/conformance.rs`.
 | **M1 — Connection management** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M2 — Table list** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M3 — Table preview** ✅ | — | Done. `crates/` and `git log` are the record |
-| **M4** | Running SQL (feature 4) | `$EDITOR` launch and terminal restore, estimate → approve → run, cancellation, multiple tabs, error line display. The first confirmation dialogs — `Modal` exists, and until now only a failed connection raises one |
+| **M4 — Running SQL** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
 | **M7** | SQL templates (feature 7) | Save, parameter entry, insert from the palette |
@@ -491,8 +491,10 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["socks"] }
 ```
 
-For `ValidatedSql` (M4), start by checking whether splitting on semicolons and classifying the
-statement is enough; reach for `sqlparser` only if it is not.
+`ValidatedSql` needed neither `sqlparser` nor anything else: finding where a statement ends is a
+scanner over the few things that can hide a `;`, and a parser would have brought a dialect list
+to keep correct and an AST within reach of code that has no business deciding what kind of
+statement this is.
 
 ---
 

@@ -11,7 +11,7 @@ use gcp_bigquery_client::model::query_response::QueryResponse;
 use gcp_bigquery_client::model::table_field_schema::TableFieldSchema;
 use sqlake_core::driver::{DriverError, DriverResult};
 use sqlake_core::result::{Column, ResultSet, Row};
-use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use sqlake_core::sql::{ApprovedQuery, Estimate, Position, ValidatedSql};
 
 use crate::error::{driver_error, listing_failed};
 use crate::value;
@@ -94,12 +94,36 @@ pub async fn execute(
     if let Some(errors) = &response.errors
         && let Some(first) = errors.first()
     {
-        return Err(DriverError::Query(first.message.clone().unwrap_or_else(
-            || "the query failed and said nothing about why".to_owned(),
-        )));
+        let message = first
+            .message
+            .clone()
+            .unwrap_or_else(|| "the query failed and said nothing about why".to_owned());
+        let at = position_in(&message);
+        return Err(DriverError::Query { message, at });
     }
 
     Ok(result_set(&response))
+}
+
+/// BigQuery writes the position into the message, as `[line:column]`.
+///
+/// Read out of the text because that is the only place it is: the REST error
+/// has no field for it. The last one in the message rather than the first — a
+/// message quoting the statement can contain something that looks like a
+/// position, and the one BigQuery appends is at the end.
+///
+/// Doing it here rather than in a front-end is the rule `Capabilities` follows
+/// applied to errors: this crate knows its own dialect, and the UI must not
+/// have to.
+fn position_in(message: &str) -> Option<Position> {
+    let (before, rest) = message.rsplit_once('[')?;
+    let _ = before;
+    let inside = rest.split_once(']')?.0;
+    let (line, column) = inside.split_once(':')?;
+    Some(Position::new(
+        line.trim().parse().ok()?,
+        column.trim().parse().ok()?,
+    ))
 }
 
 fn result_set(response: &QueryResponse) -> ResultSet {
@@ -180,6 +204,35 @@ mod tests {
                 serde_json::json!({ "totalBytesProcessed": "lots" })
             )),
             None
+        );
+    }
+
+    #[test]
+    fn a_position_is_read_out_of_the_message_because_that_is_where_it_is() {
+        assert_eq!(
+            position_in("Unrecognized name: nope at [3:15]"),
+            Some(Position::new(3, 15))
+        );
+        assert_eq!(
+            position_in("Syntax error: Unexpected end of script at [1:9]"),
+            Some(Position::new(1, 9))
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_position_in_it_has_none() {
+        assert_eq!(position_in("Access Denied: Table t"), None);
+        assert_eq!(position_in("something [not a position]"), None);
+        assert_eq!(position_in("half a position [3:]"), None);
+    }
+
+    #[test]
+    fn the_position_taken_is_the_one_bigquery_appended() {
+        // A message quoting the statement can contain something shaped like a
+        // position, and BigQuery's own is the last thing in the line.
+        assert_eq!(
+            position_in("Invalid array subscript a[1:2] at [4:9]"),
+            Some(Position::new(4, 9))
         );
     }
 

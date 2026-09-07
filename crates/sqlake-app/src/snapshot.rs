@@ -12,7 +12,7 @@ use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
 use sqlake_core::result::Sort;
-use sqlake_core::sql::{Estimate, OverBudget};
+use sqlake_core::sql::{Estimate, OverBudget, Position};
 
 use crate::action::BusyId;
 use crate::pages::PagedResult;
@@ -165,6 +165,12 @@ pub struct QueryView {
     /// answered would be waiting for itself.
     pub needs_approval: Option<Arc<OverBudget>>,
     pub data: LoadState<Arc<PagedResult>>,
+    /// Where the failure was, when the server said.
+    ///
+    /// Beside `data` rather than inside `LoadState::Failed`: every other thing
+    /// that fails has nowhere to point, and widening the shared type for one
+    /// of them would put an `Option` nobody reads on all of them.
+    pub failed_at: Option<Position>,
 }
 
 impl QueryView {

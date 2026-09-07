@@ -18,7 +18,7 @@ use sqlake_core::id::ProfileId;
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ProfileError, ProfileSummary, Profiles, ResolvedProfile};
 use sqlake_core::result::{Column, PageRequest, ResultSet, Row, Sort, SortDir};
-use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
+use sqlake_core::sql::{ApprovedQuery, Estimate, Position, ValidatedSql};
 use sqlake_core::value::Value;
 
 pub mod fixtures;
@@ -343,12 +343,15 @@ impl Drop for Unwound {
 /// than at the front-end is the rule `Capabilities` follows applied to errors:
 /// the driver knows its dialect, and the UI must not have to.
 fn syntax_error(sql: &str, marker: &str) -> DriverError {
-    let at = sql.find(marker).unwrap_or(0);
-    let line = sql[..at].matches('\n').count() + 1;
-    let column = sql[..at].rsplit('\n').next().map_or(0, str::len) + 1;
-    DriverError::Query(format!(
-        "mock: syntax error at or near \"{marker}\" (line {line}, column {column})"
-    ))
+    let before = sql.find(marker).map_or("", |at| &sql[..at]);
+    let at = Position::new(
+        u32::try_from(before.matches('\n').count() + 1).unwrap_or(1),
+        u32::try_from(before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1).unwrap_or(1),
+    );
+    DriverError::Query {
+        message: format!("mock: syntax error at or near \"{marker}\" ({at})"),
+        at: Some(at),
+    }
 }
 
 /// Drops the catalogue segment when the mock is configured with
@@ -521,7 +524,7 @@ impl Session for MockSession {
         };
 
         if self.behaviour.fails_for(&of.path, &self.attempts) {
-            return Err(DriverError::Query(format!("permission denied for {of}")));
+            return Err(DriverError::query(format!("permission denied for {of}")));
         }
         Ok(children)
     }
@@ -538,7 +541,7 @@ impl Session for MockSession {
             .ok_or_else(|| DriverError::NotFound(table.to_string()))?;
 
         if self.behaviour.fails_for(&table.path, &self.attempts) {
-            return Err(DriverError::Query(format!(
+            return Err(DriverError::query(format!(
                 "relation {table} is corrupt: unexpected page header"
             )));
         }
@@ -552,7 +555,7 @@ impl Session for MockSession {
             // A real engine answers "no such column" rather than returning the
             // rows in storage order and calling them sorted.
             if sort.column >= fixture.columns.len() {
-                return Err(DriverError::Query(format!(
+                return Err(DriverError::query(format!(
                     "sort column {} is out of range for {table}, which has {}",
                     sort.column,
                     fixture.columns.len()
@@ -907,7 +910,7 @@ mod tests {
         let s = driver.connect(&mock_profile("mock")).await.unwrap();
         let node = NodeRef::new(NodeKind::Namespace, ["restricted"]);
         let err = s.children(&node).await.unwrap_err();
-        assert!(matches!(err, DriverError::Query(_)), "{err:?}");
+        assert!(matches!(err, DriverError::Query { .. }), "{err:?}");
     }
 
     #[tokio::test]

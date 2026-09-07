@@ -17,13 +17,13 @@ pub fn connect_failed(err: BQError) -> DriverError {
 
 /// A failure while walking the tree or reading a table.
 pub fn listing_failed(err: BQError) -> DriverError {
-    DriverError::Query(describe(err))
+    DriverError::query(describe(err))
 }
 
 /// A failure with no better home. Not `Unsupported`: that means the caller
 /// asked for something the driver does not do.
 pub fn driver_error(what: impl Into<String>) -> DriverError {
-    DriverError::Query(what.into())
+    DriverError::query(what.into())
 }
 
 /// Whether this is the decode failure a project with no datasets in it comes

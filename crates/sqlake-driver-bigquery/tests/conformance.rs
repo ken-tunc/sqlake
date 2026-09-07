@@ -101,7 +101,7 @@ async fn the_bigquery_driver_conforms() {
         relation: TableRef::new([PROJECT, DATASET, TABLE]),
         missing: TableRef::new([PROJECT, DATASET, "no_such_relation"]),
         query: format!("select * from `{PROJECT}.{DATASET}.{TABLE}` order by id"),
-        broken_query: format!("select no_such_column from `{PROJECT}.{DATASET}.{TABLE}`"),
+        broken_query: format!("select\n  no_such_column\nfrom `{PROJECT}.{DATASET}.{TABLE}`"),
     })
     .await;
 }
@@ -166,16 +166,20 @@ impl Respond for Queries {
 
         // The suite's broken query, refused the way BigQuery refuses one: 400
         // with the position in the message.
-        if sql.contains("no_such_column") {
-            return ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": {
-                    "code": 400,
-                    "status": "INVALID_ARGUMENT",
-                    "message": format!(
-                        "Unrecognized name: no_such_column at [1:8]"
-                    ),
-                    "errors": [],
-                }
+        if let Some(at) = sql.find("no_such_column") {
+            // The position BigQuery would report, worked out from the
+            // statement rather than hardcoded: a fixture that always said
+            // `[1:8]` would let a driver reading the wrong number pass.
+            let before = &sql[..at];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, str::len) + 1;
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "bigquery#queryResponse",
+                "jobComplete": true,
+                "errors": [{
+                    "reason": "invalidQuery",
+                    "message": format!("Unrecognized name: no_such_column at [{line}:{column}]"),
+                }],
             }));
         }
 
