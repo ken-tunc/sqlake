@@ -98,21 +98,29 @@ impl Drop for StopsTheQuery {
         }
         tokio::spawn(async move {
             // Dropped at the end of this task, not before: holding it is what
-            // makes the next caller wait. The connect is bounded by the
-            // profile's `connect_timeout`, so the wait is too.
+            // makes the next caller wait — and therefore what would wedge the
+            // whole connection if this never finished. `connect_timeout`
+            // bounds the socket and nothing after it, which is the gap
+            // `config::DEADLINE` exists for on the connection this mirrors.
             let _running = running;
             // The connection this goes down has to be secured the same way the
             // first one was: a server requiring TLS refuses a plaintext cancel
             // request, and one that is not expecting TLS refuses the handshake.
-            let sent = match tls {
-                None => token.cancel_query(tokio_postgres::NoTls).await,
-                Some(verification) => match tls::client_config(verification) {
-                    Ok(config) => token.cancel_query(MakeRustlsConnect::new(config)).await,
-                    Err(why) => {
-                        tracing::warn!(%why, "cancel: no TLS configuration to send it with");
-                        return;
-                    }
-                },
+            let request = async {
+                match tls {
+                    None => token.cancel_query(tokio_postgres::NoTls).await,
+                    Some(verification) => match tls::client_config(verification) {
+                        Ok(config) => token.cancel_query(MakeRustlsConnect::new(config)).await,
+                        Err(why) => {
+                            tracing::warn!(%why, "cancel: no TLS configuration to send it with");
+                            Ok(())
+                        }
+                    },
+                }
+            };
+            let Ok(sent) = tokio::time::timeout(crate::config::DEADLINE, request).await else {
+                tracing::warn!("cancel request gave up; the connection is usable again");
+                return;
             };
             match sent {
                 // PostgreSQL answers nothing at all to a cancel request — it
