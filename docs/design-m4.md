@@ -18,7 +18,7 @@ needs no new use case of its own.
 | --- | --- |
 | 1 | `e` hands the terminal to `$EDITOR` and takes it back, and an editor that dies badly still leaves a usable screen |
 | 2 | A SQL tab runs its buffer and shows the result in the same grid a preview uses, paging and copy included |
-| 3 | Nothing reaches the database without an estimate: `Session::execute` accepts only an `ApprovedQuery`, and the only place that constructs one is the approval logic |
+| 3 | Nothing reaches the database without going through approval: `Session::execute` accepts only an `ApprovedQuery`, and the only place that constructs one is the approval logic |
 | 4 | A query over the configured threshold raises a dialog with a real choice in it, and answering it runs the same query rather than a rebuilt one |
 | 5 | Cancel stops the query **at the database**, not just the task waiting for it |
 | 6 | A syntax error points at the line it is on, without the UI knowing which database reported it |
@@ -42,18 +42,20 @@ right to keep unwritten.
 
 Not in scope because it is already built: the grid, paging, sorting, selection and copy all work
 on a `PagedResult` and do not care where the rows came from; `BusyItem` and `Action::Cancel`
-already exist and already abandon a reply; `TerminalGuard::restore` is already the single
-restore path, and already says in its own doc comment that M4 is its third caller.
+already exist and already abandon a reply; `sqlake_tui::terminal::restore` is already the single
+restore path, and that module's doc comment already names M4's `$EDITOR` handoff as its third
+caller.
 
 design.md §6 reserves `Ctrl-p` for the palette "(M4)", which contradicts §14 — the palette is
-M7's. Fixed in this document's own PR rather than left to be discovered.
+M7's. Fixed in this document's own PR rather than left to be discovered, as is §7.2's
+`Action::EditExternally`, which D1 rules out.
 
 ---
 
 ## 3. Decisions
 
-**D1 — the editor handoff is a third kind of intent, not an `Action`.** design.md §7.2 calls it
-`Action::EditExternally`, and that is wrong in a way worth being explicit about: an `Action` goes
+**D1 — the editor handoff is a third kind of intent, not an `Action`.** design.md §7.2 called it
+`Action::EditExternally`, and that was wrong in a way worth being explicit about: an `Action` goes
 to the store, the store runs on its own task, and handing the terminal over has to happen
 between two frames on the thread that owns the terminal. `Intent` gains a variant the render
 loop answers itself. `ViewCmd` is not it either — `UiState::apply` has a snapshot and no
@@ -84,25 +86,37 @@ threshold in `config.toml` applies to the bytes arm. A cost-unit estimate is sho
 gates — a number nobody can price is not a number to block on, and a fixed cutoff on it would be
 a superstition compiled into the client.
 
-**D6 — cancellation does not travel through the session actor.** The actor serialises access to
+**D6 — a driver that cannot estimate is approved, not refused.** `Capabilities::cost_estimate`
+already exists and is `false` in the mock's default set, so this is not hypothetical: if "no
+estimate" meant "no `ApprovedQuery`", nothing would run under CI at all. It means `Approval` is
+granted with nothing compared, which is what done-when 3 above is careful to say — the type gate
+holds either way, and the threshold is a defence only where a driver volunteers a number. The
+gate and the threshold are two mechanisms, and conflating them is how a type ends up trusted for
+something it never promised.
+
+So that the approval path is exercised where nothing but the mock runs, the mock grows a second
+capability set with `cost_estimate: true`, the way `NO_SORT` already exists for the preview it
+cannot sort.
+
+**D7 — cancellation does not travel through the session actor.** The actor serialises access to
 the `Box<dyn Session>`, so a cancel sent down the same channel queues behind the query it is
 meant to stop, and arrives after it finishes. `execute` therefore takes a cancellation handle
 the store keeps, and the driver's own out-of-band route — PostgreSQL's cancel request on a
 second socket, BigQuery's `jobs.cancel` — is what it triggers. `Capabilities::cancel` already
 exists to say when there is no such route.
 
-**D7 — the error's position is computed by the driver, in lines and columns.** PostgreSQL
+**D8 — the error's position is computed by the driver, in lines and columns.** PostgreSQL
 reports a one-based character offset into the statement; BigQuery writes `[3:15]` into the
 message text. Both are the driver's dialect of the same fact, and converting them where they are
 produced is the only way the TUI can mark a line without asking who reported it — the same rule
 as `Capabilities`, applied to errors.
 
-**D8 — one statement per run.** `ValidatedSql` already promises "single vs. multiple statements
+**D9 — one statement per run.** `ValidatedSql` already promises "single vs. multiple statements
 determined", and M4 spends that promise by refusing the multiple case. PostgreSQL's simple query
 protocol will happily run `DROP TABLE x; SELECT 1` as one round trip and report success, and a
 client whose result grid can show only the last of them is a client that hides what it did.
 
-**D9 — `Modal` gains choices rather than growing a second dialog type.** Today it is a title, a
+**D10 — `Modal` gains choices rather than growing a second dialog type.** Today it is a title, a
 body and a dismiss button. A confirmation is the same rectangle with more than one button, and
 each button is an `Intent` — which puts the dialog under the same coverage test as everything
 else, and means "approve" has a key binding because it could not have been built without one.
@@ -117,7 +131,7 @@ Each is one PR, reviewed before the next starts.
 | --- | --- | --- |
 | T1 | A tab is a preview *or* a SQL buffer | Two SQL tabs and a preview tab coexist; closing one leaves the others' state alone |
 | T2 | The `$EDITOR` handoff, scratch files, and the `editor` / `editor_args` settings | Editing in neovim returns to an intact screen; an editor that exits instantly says so; killing the editor rudely still restores the terminal |
-| T3 | `RawSql → ValidatedSql → PreparedSql`, `estimate` and `execute` on `Session`, in all three drivers | The conformance suite runs a query and an estimate against mock, PostgreSQL and the BigQuery fixture |
+| T3 | `RawSql → ValidatedSql → PreparedSql`, `estimate` and `execute` on `Session`, in all three drivers | The conformance suite runs a query against mock, PostgreSQL and the BigQuery fixture, and an estimate against every driver whose `Capabilities::cost_estimate` is true |
 | T4 | `ApprovedQuery`, the `RunQuery` use case, `QueryId`, and the query's place in the snapshot | A query runs and its rows reach the grid; `ApprovedQuery::new` is unreachable from outside the approval module, checked by the fact that nothing else compiles against it |
 | T5 | A `Modal` that asks, and the approval round trip through it | A query over the threshold stops, and approving runs the statement that was estimated — not the buffer as it stands |
 | T6 | Cancellation that reaches the server | Cancelling a ten-second query returns the connection immediately, and the server agrees it is gone |
