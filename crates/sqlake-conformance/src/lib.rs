@@ -25,7 +25,7 @@ use sqlake_core::driver::{Driver, DriverError, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef};
 use sqlake_core::profile::ResolvedProfile;
 use sqlake_core::result::{PageRequest, ResultSet, Sort, SortDir};
-use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
+use sqlake_core::sql::{Access, ApprovedQuery, Estimate, RawSql, ValidatedSql};
 use sqlake_core::value::Value;
 
 /// What a driver has to supply to be put through the suite.
@@ -110,8 +110,8 @@ async fn approved(
     // No budget: the suite is about the driver answering, not about the policy
     // over it, and a byte threshold would make the case pass or fail on how
     // big somebody's fixture table happens to be.
-    ApprovedQuery::within(sql, max_rows, estimate, None)
-        .unwrap_or_else(|_| unreachable!("no budget cannot be exceeded"))
+    ApprovedQuery::within(sql, max_rows, estimate, None, Access::ReadWrite)
+        .unwrap_or_else(|why| panic!("{kind}: {why}"))
 }
 
 /// `cost_estimate` is a promise, and this is where it is kept.
@@ -210,8 +210,8 @@ async fn a_statement_the_server_refuses_is_an_error(
     let Ok(estimate) = session.estimate(&sql).await else {
         return;
     };
-    let query = ApprovedQuery::within(sql, None, estimate, None)
-        .unwrap_or_else(|_| unreachable!("no budget cannot be exceeded"));
+    let query = ApprovedQuery::within(sql, None, estimate, None, Access::ReadWrite)
+        .unwrap_or_else(|why| panic!("{kind}: {why}"));
     let err = session.execute(&query).await.err().unwrap_or_else(|| {
         panic!("{kind}: the server was sent something it cannot run and said nothing")
     });

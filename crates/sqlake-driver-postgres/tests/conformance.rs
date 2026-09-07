@@ -298,7 +298,7 @@ async fn abandoning_a_query_stops_it_at_the_server() {
 
     use sqlake_core::capability::Escaping;
     use sqlake_core::driver::Driver as _;
-    use sqlake_core::sql::{ApprovedQuery, Estimate, RawSql, ValidatedSql};
+    use sqlake_core::sql::{Access, ApprovedQuery, Estimate, RawSql, ValidatedSql};
 
     // The cancel path says what it did through `tracing` and nowhere else, so
     // without this a request that was refused and one that was never sent look
@@ -327,7 +327,8 @@ async fn abandoning_a_query_stops_it_at_the_server() {
         Escaping::None,
     )
     .expect("one statement");
-    let query = ApprovedQuery::within(sql, None, Estimate::Unknown, None).expect("no budget");
+    let query = ApprovedQuery::within(sql, None, Estimate::Unknown, None, Access::ReadWrite)
+        .expect("no budget, and a read");
 
     let watcher = raw_client(port).await;
     let running = || async {
