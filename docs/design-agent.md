@@ -36,6 +36,8 @@ than reuse — which is what the peer relationship in architecture §2 is protec
 Modelled on herdr: a long-lived process holding session state, a socket API against it, and
 thin noun-verb subcommands over that API.
 
+Built, as of A1:
+
 ```
 sqlake                          launch the TUI (unchanged)
 sqlake --session work           launch the TUI and listen on a named socket
@@ -43,13 +45,20 @@ sqlake --session work           launch the TUI and listen on a named socket
 sqlake api snapshot             print the live Snapshot as JSON
 sqlake api schema               print the request/response schema
 
-sqlake connection list|open|close
+sqlake connection list
 sqlake schema list              namespaces in a connection
-sqlake table list|describe|preview
-sqlake query estimate|run|status|cancel|wait
-sqlake history search
+sqlake table list|preview
+```
 
-sqlake mcp                      speak MCP on stdio
+Planned, with the milestone that brings each:
+
+```
+sqlake connection open|close    A2
+sqlake table describe           M5
+sqlake query estimate|run|status|cancel|wait
+                                A2
+sqlake history search           M8
+sqlake mcp                      A3, speaks MCP on stdio
 ```
 
 Every subcommand prints JSON on stdout and diagnostics on stderr, so output is consumable

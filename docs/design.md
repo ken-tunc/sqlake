@@ -39,16 +39,20 @@ sqlake/
     ├── sqlake-app/               # use cases, state, actions. UI-agnostic and testable
     ├── sqlake-tui/               # rendering and input, on ratatui
     ├── sqlake-api/               # agent surface: protocol, schema, socket client and server
-    ├── sqlake-mcp/               # agent surface: MCP stdio server over sqlake-api
     ├── sqlake-config/            # profile and settings persistence, secret resolution
-    ├── sqlake-store/             # SQLite: history, templates, session restore
+    ├── sqlake-conformance/       # one suite every driver has to pass, run per driver
     ├── sqlake-driver-postgres/
     ├── sqlake-driver-bigquery/
     └── sqlake-driver-mock/       # for UI development and tests. Every screen works with no DB
+
+    # not yet, with the milestone that makes one:
+    #   sqlake-store/             # SQLite: history, templates, session restore (M7, M8)
+    #   sqlake-mcp/               # MCP stdio server over sqlake-api (A3)
 ```
 
 `crates/` is the list of what exists; the rest are created by the milestone that first needs
-one. An empty placeholder crate is dead weight and hides which parts are real.
+one. An empty placeholder crate is dead weight and hides which parts are real — so this list
+is checked against `ls crates/` rather than kept by hand.
 
 Dependencies flow one way:
 
@@ -94,11 +98,15 @@ partitioning and clustering and leaves the rest empty.
 
 ---
 
-## 4. Types still to be built (`sqlake-app`)
+## 4. Staged types (`sqlake-app`)
 
 Every operation in the app layer is a `UseCase` (`crates/sqlake-app/src/usecase/`) whose input
 and output are expressed as types, so a skipped step is a compile error rather than a runtime
 surprise.
+
+The SQL pipeline below is M4's and does not exist yet; the connection and template ones are
+noted where they stand. What is built is in the crates, and the invariants each stage carries
+are on the types themselves — this section is here for the ones that are not.
 
 ### 4.1 Stages as types
 

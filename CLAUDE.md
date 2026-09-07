@@ -10,12 +10,15 @@ milestone is done.
 
 These are load-bearing. Breaking one silently undoes a design decision.
 
-- **Dependencies flow one way**: `sqlake` → `sqlake-tui` → `sqlake-app` → `sqlake-core`,
-  with `sqlake-driver-*` depending only on `sqlake-core`.
+- **Dependencies flow one way**: `sqlake` → `sqlake-tui` / `sqlake-api` → `sqlake-app` →
+  `sqlake-core`, with `sqlake-driver-*` depending only on `sqlake-core`. The two front-ends
+  are peers and **neither may depend on the other** — something both want goes down to
+  `sqlake-app`, which is how `json::to_json` got there.
 - **No driver branching in the UI.** `if driver == Postgres` never appears in `sqlake-tui`.
   Express the difference as a field on `Capabilities` instead.
 - **Drawing code never sees `Value`.** It receives `RenderedGrid`, which formats cells on
-  demand. `sqlake-api` *does* see `Value`: an agent wants the document, not `{2 keys}`.
+  demand, or `RenderedDetail`, which lays one out in full. `sqlake-api` *does* see `Value`:
+  an agent wants the document, not `{2 keys}`.
 - **Nothing in `sqlake-app` assumes a character-cell display.** No widths, no glyphs, no
   elision. `sqlake-tui` and `sqlake-api` are peers over that layer and want opposite
   renderings of the same rows, so anything that picks one belongs in the front-end.
@@ -25,7 +28,9 @@ These are load-bearing. Breaking one silently undoes a design decision.
   widths and split positions are `ViewCmd`, applied synchronously to `UiState`.
 - **Terminal mode changes happen only in `TerminalGuard`.** The panic hook and the `$EDITOR`
   launch both go through it.
-- **Never write to stdout while the TUI is up.** `tracing` goes to a log file only.
+- **Never write to stdout while the TUI is up.** `tracing` goes to a log file only. The one
+  thing that does write is the OSC 52 copy, and it goes through the terminal's own writer
+  after a frame — the renderer's channel, not a second one.
 
 ## Testing
 
