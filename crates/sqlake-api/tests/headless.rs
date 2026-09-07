@@ -23,6 +23,7 @@ fn store() -> Store {
         Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
         Arc::new(MockProfiles::default()),
         PageRequest::DEFAULT_LIMIT,
+        None,
     )
 }
 

@@ -205,6 +205,8 @@ intent_kinds! {
     ToggleDetail       => "show a cell in full",
     Copy               => "copy cells to the clipboard",
     EditExternally     => "edit the query in $EDITOR",
+    RunQuery           => "run the query",
+    ApproveQuery       => "run it anyway, at the estimated cost",
     DismissModal       => "close the dialog",
     Filter             => "search the explorer",
 
@@ -276,6 +278,13 @@ impl IntentKind {
                 Action::LoadMore { .. } => Self::LoadMore,
                 // Paired with `ViewCmd::CloseTab`: one capability.
                 Action::ForgetPreview { .. } => Self::CloseTab,
+                // Paired with `ViewCmd::` nothing: running is an action and
+                // has no view half. `ForgetQuery` shares `CloseTab`'s kind for
+                // the same reason `ForgetPreview` does — closing the tab is
+                // what causes it.
+                Action::RunQuery { .. } => Self::RunQuery,
+                Action::ApproveQuery(_) => Self::ApproveQuery,
+                Action::ForgetQuery(_) => Self::CloseTab,
                 Action::Cancel(_) => Self::Cancel,
                 Action::Quit => Self::Quit,
             },

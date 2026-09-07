@@ -11,13 +11,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sqlake_app::action::Action;
 use sqlake_app::snapshot::{ConnectionView, Snapshot};
 use sqlake_app::tree::VisibleNode;
-use sqlake_core::id::{ConnId, ProfileId, TabId};
+use sqlake_core::id::{ConnId, ProfileId, QueryId, TabId};
 use sqlake_core::node::TableRef;
 
 use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
 use crate::intent::{Context, Handover, Intent, IntentKind, ViewCmd};
 use crate::mouse::Gesture;
-use crate::ui::{Filter, OpenTab, Toast};
+use crate::ui::{Filter, OpenTab, TabContent, Toast};
 
 /// Rows moved by one wheel notch. Three is the common terminal convention.
 const WHEEL_LINES: i32 = 3;
@@ -293,6 +293,24 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::LoadMore,
     },
     KeyBinding {
+        // `r` for run. `Ctrl-Enter` is bound too because it is what design.md
+        // named and what every other client uses — but only as a second combo:
+        // a terminal without the kitty keyboard protocol cannot send it at
+        // all, so binding it alone would be a gesture half the terminals in
+        // the world do not have.
+        keys: &[key('r'), KeyCombo::ctrl(KeyCode::Enter)],
+        context: Context::Global,
+        kind: IntentKind::RunQuery,
+    },
+    KeyBinding {
+        // Only reaches anything while a dialog is asking, which is the whole
+        // of when there is something to approve. `Enter` rather than a letter:
+        // a dialog's default answer is the one under the finger already.
+        keys: &[KeyCombo::new(KeyCode::Enter)],
+        context: Context::Modal,
+        kind: IntentKind::ApproveQuery,
+    },
+    KeyBinding {
         // Global rather than in the grid: the pane it acts on is the grid's,
         // but a query being written is what the whole client is doing at that
         // point, and needing focus in the pane first is a step with nothing
@@ -374,6 +392,9 @@ pub struct InputContext<'a> {
     /// a `SortPreview` for the right table.
     pub tabs: &'a [OpenTab],
     pub active_tab: Option<TabId>,
+    /// The open dialog, so a click on one of its buttons resolves to the
+    /// intent that button carries — the same way a menu line does.
+    pub modal: Option<&'a crate::overlay::Modal>,
     pub toasts: &'a [Toast],
     /// The explorer's search, or `None` when there is not one. It redirects
     /// the keyboard into itself only while it is being edited.
@@ -459,6 +480,26 @@ impl InputContext<'_> {
             .table()
             .is_none()
             .then_some(id)
+    }
+
+    /// The active tab's buffer and where to run it, when there is something
+    /// to run.
+    ///
+    /// An empty buffer is not: running nothing produces a statement the server
+    /// refuses, reported as an error, for a key press that should have done
+    /// nothing at all.
+    fn runnable(&self) -> Option<(ConnId, String)> {
+        let id = self.active_tab?;
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        let TabContent::Sql { text: sql, .. } = &tab.content else {
+            return None;
+        };
+        (!sql.trim().is_empty()
+            && self
+                .snapshot
+                .connection(tab.conn)
+                .is_some_and(ConnectionView::is_live))
+        .then(|| (tab.conn, sql.clone()))
     }
 
     /// The relation the active tab points at, if any.
@@ -742,9 +783,31 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
                 ]
             })
             .unwrap_or_default(),
+        (Target::Button(ButtonId::RunQuery), Gesture::Click) => {
+            ctx.runnable().map_or_else(Vec::new, |(conn, sql)| {
+                vec![
+                    Action::RunQuery {
+                        conn,
+                        query: QueryId::new(),
+                        sql,
+                        max_rows: None,
+                    }
+                    .into(),
+                ]
+            })
+        }
         (Target::Button(ButtonId::NewSqlTab), Gesture::Click) => ctx
             .sql_connection()
             .map(|conn| vec![ViewCmd::OpenSqlTab { conn }.into()])
+            .unwrap_or_default(),
+        (Target::Button(ButtonId::ModalChoice { index }), Gesture::Click) => ctx
+            .modal
+            .and_then(|m| m.choices.get(index))
+            // Just the answer. The dialog closes because the snapshot stops
+            // saying the question is open, the same way every other piece of
+            // this screen follows the store — and until it does, answering
+            // twice is refused there rather than prevented here.
+            .map(|choice| vec![choice.intent.clone()])
             .unwrap_or_default(),
         (Target::Button(ButtonId::DismissModal), Gesture::Click) => {
             vec![ViewCmd::DismissModal.into()]
@@ -813,10 +876,16 @@ fn close_tab(id: TabId, ctx: &InputContext<'_>) -> Vec<Intent> {
         return Vec::new();
     };
     let mut intents = vec![ViewCmd::CloseTab(id).into()];
-    // A SQL tab has nothing in the store to forget: its buffer is this
-    // screen's, and the result it will grow in T4 is keyed by the run rather
-    // than by the tab.
+    // A SQL tab's buffer is this screen's, so there is nothing there to
+    // forget — but the run it started is the store's, and nothing else is
+    // looking at it: a query is keyed by the run, so no other tab can be.
     let (conn, Some(table)) = (closing.conn, closing.table().cloned()) else {
+        if let TabContent::Sql {
+            query: Some(query), ..
+        } = &closing.content
+        {
+            intents.push(Action::ForgetQuery(*query).into());
+        }
         return intents;
     };
     let still_open = ctx
@@ -1093,6 +1162,24 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .editable_tab()
             .map(|tab| vec![Handover::Edit(tab).into()])
             .unwrap_or_default(),
+        IntentKind::RunQuery => ctx.runnable().map_or_else(Vec::new, |(conn, sql)| {
+            vec![
+                Action::RunQuery {
+                    conn,
+                    query: QueryId::new(),
+                    sql,
+                    max_rows: None,
+                }
+                .into(),
+            ]
+        }),
+        // The dialog's own first answer, so the key and the button cannot
+        // disagree about what "yes" means.
+        IntentKind::ApproveQuery => ctx
+            .modal
+            .and_then(|m| m.choices.first())
+            .map(|choice| vec![choice.intent.clone()])
+            .unwrap_or_default(),
         IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
             .map(|tab| vec![ViewCmd::SelectTab(tab).into()])
             .unwrap_or_default(),
@@ -1202,12 +1289,14 @@ mod tests {
 
     use super::*;
     use crate::hit::ToastId;
-    use crate::ui::{Severity, TabContent};
+    use crate::ui::Severity;
 
     // ── fixtures ───────────────────────────────────────────────────────────
 
     /// A snapshot, and the tabs and toasts a screen showing it might have.
     struct Fixture {
+        /// A dialog with an answer on it, for the sweep.
+        asking: crate::overlay::Modal,
         snapshot: Snapshot,
         conn: ConnId,
         tabs: Vec<OpenTab>,
@@ -1241,6 +1330,7 @@ mod tests {
                 snapshot: &self.snapshot,
                 focus,
                 modal_open: false,
+                modal: None,
                 connection: self.snapshot.connections.first().map(|c| c.id),
                 tree_selection: Some(0),
                 grid_column: Some(2),
@@ -1317,6 +1407,7 @@ mod tests {
                 content: TabContent::Sql {
                     number: 1,
                     text: "select 1".to_owned(),
+                    query: None,
                 },
             },
         ];
@@ -1352,6 +1443,7 @@ mod tests {
                     last_error: None,
                 })
                 .collect(),
+            queries: Vec::new(),
             busy: vec![BusyItem {
                 id: BusyId::new(1),
                 owner: BusyOwner::Preview {
@@ -1372,6 +1464,14 @@ mod tests {
         }];
 
         Fixture {
+            asking: crate::overlay::Modal::asking(
+                "This query costs more than the limit",
+                "It would read a lot.",
+                vec![crate::overlay::Choice {
+                    label: "Run it anyway".to_owned(),
+                    intent: Action::ApproveQuery(QueryId::new()).into(),
+                }],
+            ),
             snapshot,
             conn,
             tabs,
@@ -1995,6 +2095,108 @@ mod tests {
     }
 
     #[test]
+    fn r_runs_a_sql_tab_and_leaves_a_preview_alone() {
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        // A preview has no buffer, and running its rows is not a thing to do.
+        assert!(on_key(press(KeyCode::Char('r')), &c).is_empty());
+
+        c.active_tab = Some(TabId::new(3));
+        let intents = on_key(press(KeyCode::Char('r')), &c);
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [Intent::App(Action::RunQuery { conn, sql, .. })]
+                    if *conn == f.conn && sql == "select 1"
+            ),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_buffer_runs_nothing() {
+        // Running nothing produces a statement the server refuses, reported as
+        // an error, for a gesture that should have done nothing at all.
+        let mut f = fixture();
+        f.tabs.push(OpenTab {
+            id: TabId::new(60),
+            conn: f.conn,
+            content: TabContent::Sql {
+                number: 2,
+                text: "   \n ".to_owned(),
+                query: None,
+            },
+        });
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(TabId::new(60));
+        assert!(on_key(press(KeyCode::Char('r')), &c).is_empty());
+        assert!(on_mouse(Target::Button(ButtonId::RunQuery), Gesture::Click, &c).is_empty());
+    }
+
+    #[test]
+    fn the_run_button_and_its_key_do_the_same_thing() {
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(TabId::new(3));
+        let by_key = on_key(press(KeyCode::Char('r')), &c);
+        let by_click = on_mouse(Target::Button(ButtonId::RunQuery), Gesture::Click, &c);
+        // Not equal: each mints its own `QueryId`, which is the point of the
+        // id being the caller's. The statement and the connection are what
+        // have to agree.
+        let sql_of = |intents: &[Intent]| match intents {
+            [Intent::App(Action::RunQuery { conn, sql, .. })] => Some((*conn, sql.clone())),
+            _ => None,
+        };
+        assert_eq!(sql_of(&by_key), sql_of(&by_click));
+        assert!(sql_of(&by_key).is_some(), "{by_key:?}");
+    }
+
+    #[test]
+    fn a_dialog_is_answered_by_its_own_first_choice() {
+        // The key and the button cannot disagree about what "yes" means,
+        // because both read it off the dialog.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.modal_open = true;
+        c.modal = Some(&f.asking);
+
+        let expected = vec![f.asking.choices[0].intent.clone()];
+        assert_eq!(on_key(press(KeyCode::Enter), &c), expected);
+        assert_eq!(
+            on_mouse(
+                Target::Button(ButtonId::ModalChoice { index: 0 }),
+                Gesture::Click,
+                &c
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn closing_a_sql_tab_forgets_the_run_it_started() {
+        let mut f = fixture();
+        let query = QueryId::new();
+        f.tabs.push(OpenTab {
+            id: TabId::new(61),
+            conn: f.conn,
+            content: TabContent::Sql {
+                number: 2,
+                text: "select 1".to_owned(),
+                query: Some(query),
+            },
+        });
+        let intents = on_mouse(
+            Target::TabClose(TabId::new(61)),
+            Gesture::Click,
+            &f.ctx(PaneId::Grid),
+        );
+        assert!(
+            intents.contains(&Intent::App(Action::ForgetQuery(query))),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
     fn e_edits_a_sql_tab_and_leaves_a_preview_alone() {
         let f = fixture();
         let mut c = f.ctx(PaneId::Grid);
@@ -2036,6 +2238,7 @@ mod tests {
             content: TabContent::Sql {
                 number: 1,
                 text: String::new(),
+                query: None,
             },
         });
         assert_eq!(
@@ -2056,6 +2259,7 @@ mod tests {
             content: TabContent::Sql {
                 number: 1,
                 text: String::new(),
+                query: None,
             },
         });
         let mut c = f.ctx(PaneId::Grid);
@@ -2273,6 +2477,7 @@ mod tests {
             snapshot: &empty,
             focus: PaneId::Grid,
             modal_open: false,
+            modal: None,
             connection: None,
             tree_selection: None,
             grid_column: None,
@@ -2402,6 +2607,8 @@ mod tests {
             Target::Button(ButtonId::Cancel(BusyId::new(1))),
             Target::Button(ButtonId::DismissModal),
             Target::Button(ButtonId::NewSqlTab),
+            Target::Button(ButtonId::RunQuery),
+            Target::Button(ButtonId::ModalChoice { index: 0 }),
         ],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],
@@ -2626,10 +2833,18 @@ mod tests {
         for focus in [PaneId::Explorer, PaneId::Grid] {
             for selection in [Some(0), Some(1)] {
                 for open in [None, Some(&menu)] {
-                    let mut c = f.ctx(focus);
-                    c.tree_selection = selection;
-                    c.menu = open;
-                    contexts.push(c);
+                    // A dialog with an answer on it, for the same reason the
+                    // menu is opened: a `ModalChoice` resolves to nothing
+                    // without one, and the sweep would pass while proving
+                    // nothing about the dialog's buttons at all.
+                    for asking in [None, Some(&f.asking)] {
+                        let mut c = f.ctx(focus);
+                        c.tree_selection = selection;
+                        c.menu = open;
+                        c.modal = asking;
+                        c.modal_open = asking.is_some();
+                        contexts.push(c);
+                    }
                 }
             }
         }
@@ -2690,6 +2905,14 @@ mod tests {
                             c.filter = filter;
                             c.active_tab = Some(tab);
                             out.push(c);
+                            // And with a dialog that has something to answer.
+                            // A sweep that only ever opened one which tells
+                            // would report every binding on a question dead.
+                            if modal_open {
+                                let mut asking = c;
+                                asking.modal = Some(&f.asking);
+                                out.push(asking);
+                            }
                         }
                     }
                 }

@@ -18,7 +18,7 @@ pub mod value;
 
 pub use capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
 pub use driver::{Driver, DriverError, DriverResult, Session};
-pub use id::{ConnId, ProfileId, TabId};
+pub use id::{ConnId, ProfileId, QueryId, TabId};
 pub use ident::{Ident, QuotedIdent};
 pub use node::{NodeKind, NodeRef, RelationKind, TableRef, TreeNode};
 pub use profile::{

@@ -23,6 +23,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, EventStream, KeyEventKind};
 use ratatui::layout::Rect;
+use sqlake_app::action::Action;
 use sqlake_app::snapshot::{ConnStatus, ConnectionView, Snapshot};
 use sqlake_app::store::Store;
 use tokio::sync::watch;
@@ -111,6 +112,8 @@ pub async fn run(
                 snapshot = snapshots.borrow_and_update().clone();
                 raise_connection_failure(&snapshot, &mut ui);
                 ui.raise_preview_errors(&snapshot);
+                ui.raise_approvals(&snapshot);
+                ui.raise_query_errors(&snapshot);
                 ui.close_disconnected_tabs(&snapshot);
                 dirty = true;
             }
@@ -147,6 +150,23 @@ pub async fn run(
                     dirty = true;
                 }
                 Intent::App(action) => {
+                    // The tab remembers which run it started, because the id
+                    // is chosen here and the store answers under it. Recorded
+                    // before dispatching: the reply can arrive on the next
+                    // snapshot, and a tab that had not written the id down yet
+                    // would not recognise its own result.
+                    if let Action::RunQuery { query, .. } = &action
+                        && let Some(tab) = ui.active_tab
+                    {
+                        // The run this tab is about to stop showing. Nothing
+                        // else can be: a query is keyed by the run, so leaving
+                        // it behind would keep a whole result set in the store
+                        // that nothing could ever reach again.
+                        if let Some(previous) = ui.query_of(tab) {
+                            store.dispatch(Action::ForgetQuery(previous));
+                        }
+                        ui.set_query(tab, *query);
+                    }
                     store.dispatch(action);
                 }
                 // With the terminal handed over and the loop stopped. Nothing
@@ -263,6 +283,8 @@ fn initial_ui(snapshot: &Snapshot) -> UiState {
     let mut ui = UiState::new();
     raise_connection_failure(snapshot, &mut ui);
     ui.raise_preview_errors(snapshot);
+    ui.raise_approvals(snapshot);
+    ui.raise_query_errors(snapshot);
     ui.close_disconnected_tabs(snapshot);
     ui
 }
@@ -330,6 +352,7 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         snapshot,
         focus: ui.focus,
         modal_open: ui.modal.is_some(),
+        modal: ui.modal.as_ref(),
         // Overwritten from the pointer's own position on a mouse event; a key
         // press has no pointer and does not read it.
         pointer: (0, 0),
@@ -423,12 +446,41 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     // row short of the end.
     ui.set_viewport(PaneId::Grid, datagrid::body_area(grid));
     let mut detail = None;
-    if let Some((_, _, TabContent::Sql { text, .. })) = &active {
+    // A SQL tab shows its rows once it has some, and its buffer until then.
+    // Not both: the buffer is one key press away in `$EDITOR`, and splitting
+    // the pane costs the grid rows it needs more. T7 revisits it, because an
+    // error has to point at a line somebody can see.
+    let sql_rows = active
+        .as_ref()
+        .and_then(|(_, _, content)| match content {
+            TabContent::Sql { query, .. } => snapshot.query((*query)?),
+            TabContent::Preview(_) => None,
+        })
+        .is_some_and(|q| q.data.ready().is_some());
+    if let Some((_, _, TabContent::Sql { text, .. })) = &active
+        && !sql_rows
+    {
         // The whole pane, not `body_area`: there is no header row and no
         // scrollbar column to leave out, because there is no grid.
         ui.set_viewport(PaneId::Grid, grid);
         ui.set_sql_lines(crate::sql::line_count(text));
         crate::sql::render(frame, grid, text, ui.sql_offset());
+    }
+    if let Some((id, _, TabContent::Sql { .. })) = &active
+        && sql_rows
+        && let Some(rows) = snapshot
+            .query(ui.query_of(*id).expect("shown only when there is a query"))
+            .and_then(|q| q.data.ready())
+    {
+        let rows = Arc::clone(rows);
+        let id = *id;
+        // Sorting a result is not paging a relation: there is no column to
+        // re-fetch under a different order, so the header is not a control
+        // here and says so by not being one.
+        datagrid::render_rows(frame, hits, grid, &rows, ui.grid_mut(id), false, None);
+        if frames.detail.height > 0 {
+            detail = ui.grid_mut(id).detail();
+        }
     }
     if let Some((id, conn, TabContent::Preview(table))) = active
         && let Some(preview) = snapshot.preview(conn, &table)
@@ -478,7 +530,14 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         .active_tab
         .and_then(|id| ui.grid(id))
         .and_then(|g| g.selected_cells(ui.active_sort(snapshot)));
-    chrome::status_bar(frame, hits, frames.status_bar, snapshot, selected);
+    chrome::status_bar(
+        frame,
+        hits,
+        frames.status_bar,
+        snapshot,
+        selected,
+        ui.can_run(snapshot),
+    );
 
     // Toasts first so a dialog covers them: a message drawn over the thing
     // waiting for an answer hides the answer.
@@ -552,6 +611,7 @@ mod tests {
             Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
             PageRequest::DEFAULT_LIMIT,
+            None,
         )
     }
 
@@ -1575,6 +1635,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn screen_with_a_query_result_in_a_sql_tab() {
+        // What T4 is for: rows in the same grid a preview uses, under a tab
+        // that is a query rather than a relation.
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let _ = ui.apply(crate::intent::ViewCmd::OpenSqlTab { conn }, &snap);
+        let tab = ui.active_tab.expect("a tab");
+        ui.set_buffer(tab, "select * from public.users".to_owned());
+
+        let query = sqlake_core::id::QueryId::new();
+        ui.set_query(tab, query);
+        store.dispatch(Action::RunQuery {
+            conn,
+            query,
+            sql: "select * from public.users".to_owned(),
+            max_rows: None,
+        });
+        until(&mut rx, |s| {
+            s.query(query).is_some_and(|q| q.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 20));
+    }
+
+    #[tokio::test]
     async fn screen_with_a_sql_tab_beside_a_preview() {
         // Both kinds of tab on one bar, and the pane showing a buffer instead
         // of a grid — which is the whole of what T1 changes on screen.
@@ -1653,6 +1744,7 @@ mod tests {
             }))),
             Arc::new(MockProfiles::default()),
             PageRequest::DEFAULT_LIMIT,
+            None,
         );
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect {

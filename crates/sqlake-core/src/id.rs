@@ -33,6 +33,41 @@ impl fmt::Display for ConnId {
     }
 }
 
+/// Identifies one run of a query.
+///
+/// Chosen by the caller, like [`ConnId`] and for the same reason: a preview is
+/// its relation and can be found by name, but two runs of the same SQL are two
+/// different things with two different results. There is no natural key, so a
+/// caller that cannot see the screen — one waiting on a snapshot for the query
+/// it just started — would have nothing to wait on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QueryId(Uuid);
+
+impl QueryId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Short form for logs and tests. Not stable, not for display in the UI.
+    #[must_use]
+    pub fn short(&self) -> String {
+        self.0.simple().to_string()[..8].to_owned()
+    }
+}
+
+impl Default for QueryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for QueryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Identifies one workspace tab. Allocated by the application layer, which is
 /// why the inner counter is constructible here but never generated here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

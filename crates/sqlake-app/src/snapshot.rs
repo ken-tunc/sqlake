@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
-use sqlake_core::id::{ConnId, ProfileId};
+use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
 use sqlake_core::result::Sort;
+use sqlake_core::sql::{Estimate, OverBudget};
 
 use crate::action::BusyId;
 use crate::pages::PagedResult;
@@ -143,6 +144,38 @@ pub struct PreviewView {
     pub last_error: Option<String>,
 }
 
+/// One run of a statement, and whatever has come of it.
+///
+/// Keyed by a [`QueryId`] the caller chose rather than by its text: two runs of
+/// the same SQL are two different things with two different answers, so there
+/// is no name to look one up by.
+#[derive(Debug, Clone)]
+pub struct QueryView {
+    pub id: QueryId,
+    pub conn: ConnId,
+    /// What was sent, or what would be. Kept so a result can be read next to
+    /// the statement that produced it after the buffer has moved on.
+    pub sql: String,
+    /// What the server said it would cost, once it has been asked.
+    pub estimate: Option<Estimate>,
+    /// Waiting for somebody to say yes, and everything needed to ask.
+    ///
+    /// A field rather than a `LoadState` variant: the rows are genuinely not
+    /// loading, and a front-end drawing a spinner over a question nobody has
+    /// answered would be waiting for itself.
+    pub needs_approval: Option<Arc<OverBudget>>,
+    pub data: LoadState<Arc<PagedResult>>,
+}
+
+impl QueryView {
+    /// Whether this run is finished, however it finished — which is what a
+    /// caller with no screen waits on.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        !self.data.is_loading()
+    }
+}
+
 /// What a busy item is waiting for.
 ///
 /// Cancelling abandons a reply that will now never arrive, so something has to
@@ -154,6 +187,7 @@ pub enum BusyOwner {
     Connection(ConnId),
     Node { conn: ConnId, node: NodeRef },
     Preview { conn: ConnId, table: TableRef },
+    Query(QueryId),
 }
 
 /// A running, cancellable operation.
@@ -188,11 +222,18 @@ pub struct Snapshot {
     /// still a slice and an index — there is simply more than one root now.
     pub explorer: Arc<TreeView>,
     pub previews: Vec<PreviewView>,
+    /// Newest last, the order they were started in.
+    pub queries: Vec<QueryView>,
     pub busy: Vec<BusyItem>,
     pub should_quit: bool,
 }
 
 impl Snapshot {
+    #[must_use]
+    pub fn query(&self, id: QueryId) -> Option<&QueryView> {
+        self.queries.iter().find(|q| q.id == id)
+    }
+
     #[must_use]
     pub fn connection(&self, id: ConnId) -> Option<&ConnectionView> {
         self.connections.iter().find(|c| c.id == id)

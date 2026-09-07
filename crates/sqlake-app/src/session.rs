@@ -13,6 +13,7 @@ use sqlake_core::capability::Capabilities;
 use sqlake_core::driver::{DriverResult, Session};
 use sqlake_core::node::{NodeRef, TableRef, TreeNode};
 use sqlake_core::result::{PageRequest, ResultSet};
+use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AppError, AppResult};
@@ -30,6 +31,14 @@ enum SessionCmd {
     Preview {
         table: TableRef,
         req: PageRequest,
+        reply: oneshot::Sender<DriverResult<ResultSet>>,
+    },
+    Estimate {
+        sql: ValidatedSql,
+        reply: oneshot::Sender<DriverResult<Estimate>>,
+    },
+    Execute {
+        query: Box<ApprovedQuery>,
         reply: oneshot::Sender<DriverResult<ResultSet>>,
     },
     Close,
@@ -81,6 +90,33 @@ impl SessionHandle {
             .map_err(Into::into)
     }
 
+    pub async fn estimate(&self, sql: ValidatedSql) -> AppResult<Estimate> {
+        let (reply, answer) = oneshot::channel();
+        self.tx
+            .send(SessionCmd::Estimate { sql, reply })
+            .await
+            .map_err(|_| AppError::SessionClosed)?;
+        answer
+            .await
+            .map_err(|_| AppError::SessionClosed)?
+            .map_err(Into::into)
+    }
+
+    pub async fn execute(&self, query: ApprovedQuery) -> AppResult<ResultSet> {
+        let (reply, answer) = oneshot::channel();
+        self.tx
+            .send(SessionCmd::Execute {
+                query: Box::new(query),
+                reply,
+            })
+            .await
+            .map_err(|_| AppError::SessionClosed)?;
+        answer
+            .await
+            .map_err(|_| AppError::SessionClosed)?
+            .map_err(Into::into)
+    }
+
     /// Ask the actor to shut down. Returns immediately; the driver's own
     /// teardown happens on the actor task.
     pub fn close(&self) {
@@ -99,6 +135,12 @@ async fn run(session: Box<dyn Session>, mut rx: mpsc::Receiver<SessionCmd>) {
             }
             SessionCmd::Preview { table, req, reply } => {
                 let _ = reply.send(session.preview(&table, &req).await);
+            }
+            SessionCmd::Estimate { sql, reply } => {
+                let _ = reply.send(session.estimate(&sql).await);
+            }
+            SessionCmd::Execute { query, reply } => {
+                let _ = reply.send(session.execute(&query).await);
             }
             SessionCmd::Close => break,
         }

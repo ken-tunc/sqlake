@@ -11,6 +11,7 @@ use std::path::Path;
 use serde::Deserialize;
 use sqlake_core::result::PageRequest;
 
+use crate::bytes::ByteSize;
 use crate::error::{ConfigError, ConfigResult};
 
 /// The editor used when nothing says otherwise. POSIX requires it, so it is
@@ -36,6 +37,13 @@ pub struct Settings {
     /// those the client takes the terminal back before anything has been
     /// typed.
     pub editor_args: Vec<String>,
+    /// Bytes a query may cost before somebody is asked, or `None` for no
+    /// ceiling.
+    ///
+    /// Compared only against a byte estimate, which is BigQuery's. PostgreSQL
+    /// answers in planner cost units, and a fixed cutoff on a number nobody
+    /// can price would be a superstition compiled into the client.
+    pub max_bytes_billed: Option<u64>,
 }
 
 impl Settings {
@@ -71,6 +79,10 @@ impl Default for Settings {
             page_size: PageRequest::DEFAULT_LIMIT,
             editor: None,
             editor_args: Vec::new(),
+            // Nothing by default. A ceiling somebody did not choose is one
+            // they meet as a dialog in the middle of their work, about a
+            // number they never picked.
+            max_bytes_billed: None,
         }
     }
 }
@@ -81,6 +93,7 @@ pub(crate) struct SettingsFile {
     page_size: Option<u32>,
     editor: Option<String>,
     editor_args: Option<Vec<String>>,
+    max_bytes_billed: Option<ByteSize>,
 }
 
 impl SettingsFile {
@@ -94,6 +107,7 @@ impl SettingsFile {
             ));
         }
         let editor = self.editor;
+        let max_bytes_billed = self.max_bytes_billed.map(ByteSize::get);
         let editor_args = self
             .editor_args
             .unwrap_or_else(|| defaults.editor_args.clone());
@@ -114,6 +128,7 @@ impl SettingsFile {
                 page_size,
                 editor,
                 editor_args,
+                max_bytes_billed,
             }),
         }
     }
@@ -198,6 +213,19 @@ mod tests {
         // that works, and the reason the wrong editor opens impossible to see.
         let err = parse("editor = \"\"").unwrap_err().to_string();
         assert!(err.contains("editor"), "{err}");
+    }
+
+    #[test]
+    fn a_byte_budget_is_read_in_the_units_it_was_written_in() {
+        assert_eq!(
+            parse("max_bytes_billed = \"20GB\"")
+                .unwrap()
+                .max_bytes_billed,
+            Some(20_000_000_000)
+        );
+        // Nothing by default: a ceiling somebody did not choose is one they
+        // meet as a dialog about a number they never picked.
+        assert_eq!(parse("").unwrap().max_bytes_billed, None);
     }
 
     #[test]
