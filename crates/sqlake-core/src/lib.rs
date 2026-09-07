@@ -13,6 +13,7 @@ pub mod node;
 pub mod profile;
 pub mod result;
 pub mod secret;
+pub mod sql;
 pub mod value;
 
 pub use capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};

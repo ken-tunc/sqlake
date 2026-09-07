@@ -8,11 +8,24 @@ use std::sync::Arc;
 
 use sqlake_conformance::Subject;
 use sqlake_core::node::TableRef;
-use sqlake_driver_mock::{Behaviour, MockDriver, NO_SORT, mock_profile};
+use sqlake_driver_mock::{Behaviour, ESTIMATES, MockDriver, NO_SORT, mock_profile};
 
 #[tokio::test]
 async fn the_mock_driver_conforms() {
-    sqlake_conformance::run(&subject(MockDriver::new(Behaviour::instant()))).await;
+    sqlake_conformance::run(&subject(MockDriver::new(refusing()))).await;
+}
+
+/// And so does one that estimates.
+///
+/// The default set does not, so without this the branch every costing driver
+/// takes — a number, compared to a budget — is written and never executed
+/// anywhere CI can reach.
+#[tokio::test]
+async fn a_driver_that_estimates_conforms_too() {
+    sqlake_conformance::run(&subject(
+        MockDriver::new(refusing()).with_capabilities(ESTIMATES),
+    ))
+    .await;
 }
 
 /// And so does one that cannot sort a preview.
@@ -23,9 +36,23 @@ async fn the_mock_driver_conforms() {
 #[tokio::test]
 async fn a_driver_that_cannot_sort_conforms_too() {
     sqlake_conformance::run(&subject(
-        MockDriver::new(Behaviour::instant()).with_capabilities(NO_SORT),
+        MockDriver::new(refusing()).with_capabilities(NO_SORT),
     ))
     .await;
+}
+
+/// What the mock is told to refuse, so the suite has a statement the "server"
+/// says no to.
+const WRONG: &str = "sql_that_is_wrong";
+
+/// A mock that says no to [`WRONG`], which is what stands in for a server
+/// refusing a statement.
+fn refusing() -> Behaviour {
+    Behaviour {
+        failing_sql: vec![WRONG.to_owned()],
+        estimate_bytes: 4096,
+        ..Behaviour::instant()
+    }
 }
 
 fn subject(driver: MockDriver) -> Subject {
@@ -34,5 +61,7 @@ fn subject(driver: MockDriver) -> Subject {
         profile: mock_profile("mock"),
         relation: TableRef::new(["public", "users"]),
         missing: TableRef::new(["public", "no_such_relation"]),
+        query: "select * from public.users".to_owned(),
+        broken_query: format!("select {WRONG} from public.users"),
     }
 }

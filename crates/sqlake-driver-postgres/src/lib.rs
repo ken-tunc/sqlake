@@ -11,6 +11,7 @@
 pub mod catalog;
 pub mod config;
 pub mod preview;
+pub mod query;
 pub mod tls;
 pub mod value;
 
@@ -20,6 +21,7 @@ use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet};
+use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
 use tokio_postgres::{Client, Config};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -196,6 +198,14 @@ impl Session for PgSession {
 
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
         preview::preview(&self.client, &self.database, table, req).await
+    }
+
+    async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {
+        query::estimate(&self.client, sql).await
+    }
+
+    async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet> {
+        query::execute(&self.client, query).await
     }
 
     async fn close(self: Box<Self>) {

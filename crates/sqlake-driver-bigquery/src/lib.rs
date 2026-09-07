@@ -13,6 +13,7 @@
 pub mod catalog;
 pub mod error;
 pub mod preview;
+pub mod query;
 pub mod value;
 
 use std::future::Future;
@@ -27,6 +28,7 @@ use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{BigQueryAuth, BigQueryParams, Params, ResolvedProfile};
 use sqlake_core::result::{PageRequest, ResultSet};
+use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
 
 use crate::error::{connect_failed, driver_error, is_empty_dataset_list};
 
@@ -196,6 +198,7 @@ impl Driver for BqDriver {
         Ok(Box::new(BqSession {
             client,
             project: params.project.clone(),
+            location: params.location.clone(),
             deadline: self.deadline,
         }))
     }
@@ -230,6 +233,10 @@ async fn verify(client: &Client, project: &str) -> DriverResult<()> {
 pub struct BqSession {
     client: Client,
     project: String,
+    /// Where the job runs. Only a query needs it — reading a table by name
+    /// does not — and a job sent to the wrong region cannot see a dataset in
+    /// another one, which BigQuery reports as the table not existing.
+    location: Option<String>,
     deadline: Duration,
 }
 
@@ -284,6 +291,27 @@ impl Session for BqSession {
         self.within_deadline(
             &format!("reading `{table}`"),
             preview::preview(&self.client, table, req),
+        )
+        .await
+    }
+
+    async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {
+        self.within_deadline(
+            "estimating a query",
+            query::estimate(&self.client, &self.project, self.location.as_deref(), sql),
+        )
+        .await
+    }
+
+    async fn execute(&self, approved: &ApprovedQuery) -> DriverResult<ResultSet> {
+        self.within_deadline(
+            "running a query",
+            query::execute(
+                &self.client,
+                &self.project,
+                self.location.as_deref(),
+                approved,
+            ),
         )
         .await
     }

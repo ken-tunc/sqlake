@@ -1,8 +1,7 @@
 //! The seam between the application and a database.
 //!
-//! This is the M0 subset. `describe`, `estimate` and `execute` are added by the
-//! milestone that needs them (M5 and M4 respectively). Declaring them now would
-//! force stub types into existence months before anything constructs one.
+//! `describe` is still missing; M5 adds it. Declaring it now would force stub
+//! types into existence months before anything constructs one.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -11,6 +10,7 @@ use crate::capability::{Capabilities, DriverKind};
 use crate::node::{NodeRef, TableRef, TreeNode};
 use crate::profile::ResolvedProfile;
 use crate::result::{PageRequest, ResultSet};
+use crate::sql::{ApprovedQuery, Estimate, ValidatedSql};
 
 pub type DriverResult<T> = Result<T, DriverError>;
 
@@ -74,6 +74,28 @@ pub trait Session: Send + Sync + std::fmt::Debug {
     /// rows in its own order: a page that ignored the sort is indistinguishable
     /// from one that honoured it, and the caller would draw an arrow over it.
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet>;
+
+    /// What running `sql` is expected to cost, without running it.
+    ///
+    /// A driver whose [`Capabilities::cost_estimate`] is false answers
+    /// [`Estimate::Unknown`] rather than failing: "I cannot say" is the honest
+    /// answer to a question that was fair to ask, and the caller has already
+    /// been told to expect it.
+    ///
+    /// [`Capabilities::cost_estimate`]: crate::capability::Capabilities::cost_estimate
+    async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate>;
+
+    /// Run a query and return its rows.
+    ///
+    /// Takes an [`ApprovedQuery`] and nothing else, which is what makes "no
+    /// query runs without being estimated first" a fact about the type system
+    /// rather than a rule to remember. Building one requires an estimate, and
+    /// the only estimates come from [`Session::estimate`].
+    ///
+    /// [`ApprovedQuery::max_rows`] is a cap on the *fetch*, not on the
+    /// statement: a driver applies it to how many rows it pulls back, and
+    /// never by rewriting the text.
+    async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet>;
 
     async fn close(self: Box<Self>);
 }

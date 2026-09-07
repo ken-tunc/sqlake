@@ -16,7 +16,8 @@ use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::id::ProfileId;
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ProfileError, ProfileSummary, Profiles, ResolvedProfile};
-use sqlake_core::result::{PageRequest, ResultSet, Row, Sort, SortDir};
+use sqlake_core::result::{Column, PageRequest, ResultSet, Row, Sort, SortDir};
+use sqlake_core::sql::{ApprovedQuery, Estimate, ValidatedSql};
 use sqlake_core::value::Value;
 
 pub mod fixtures;
@@ -150,6 +151,16 @@ pub const NO_SORT: Capabilities = Capabilities {
     ..CAPABILITIES
 };
 
+/// A mock that costs a query before running it, which the default set does not.
+///
+/// Without this the approval path has nothing to exercise under CI, where the
+/// mock is the only driver — and "the budget refused it" would be a branch no
+/// test ever took.
+pub const ESTIMATES: Capabilities = Capabilities {
+    cost_estimate: true,
+    ..CAPABILITIES
+};
+
 /// How the mock should misbehave.
 ///
 /// Every field here exists because some surface would otherwise be written
@@ -190,6 +201,21 @@ pub struct Behaviour {
     /// test — which is exactly the assumption that strands a wide table on
     /// its first screenful.
     pub short_pages: Vec<Vec<String>>,
+    /// What [`Session::estimate`] answers, when the capability set says it
+    /// estimates at all.
+    ///
+    /// Explicit rather than derived from the text: an estimate computed from
+    /// the query would make every test that wants a number over the budget
+    /// have to write a query of a particular length, which says nothing about
+    /// what the test is for. Zero by default, so a budget only bites when a
+    /// test says what it is testing.
+    pub estimate_bytes: u64,
+    /// Substrings that make [`Session::execute`] fail.
+    ///
+    /// The message carries a line and column, because that is the shape a
+    /// server's own syntax error has and the front-end has to be built against
+    /// one that does.
+    pub failing_sql: Vec<String>,
 }
 
 /// How many times each flaky path has been asked for.
@@ -233,6 +259,14 @@ impl Behaviour {
             .chain(self.short_pages.iter())
     }
 
+    /// Whether `sql` is one of the queries configured to fail.
+    fn refuses(&self, sql: &str) -> Option<&str> {
+        self.failing_sql
+            .iter()
+            .find(|marker| sql.contains(marker.as_str()))
+            .map(String::as_str)
+    }
+
     fn matches(list: &[Vec<String>], path: &[String]) -> bool {
         list.iter().any(|p| p == path)
     }
@@ -269,6 +303,20 @@ impl Behaviour {
         flaky.is_some_and(|(_, times)| *seen <= *times)
             || late.is_some_and(|(_, times)| *seen > *times)
     }
+}
+
+/// A failure shaped like a server's own, with somewhere in the text to point.
+///
+/// The position is what T7's error marker needs, and inventing it here rather
+/// than at the front-end is the rule `Capabilities` follows applied to errors:
+/// the driver knows its dialect, and the UI must not have to.
+fn syntax_error(sql: &str, marker: &str) -> DriverError {
+    let at = sql.find(marker).unwrap_or(0);
+    let line = sql[..at].matches('\n').count() + 1;
+    let column = sql[..at].rsplit('\n').next().map_or(0, str::len) + 1;
+    DriverError::Query(format!(
+        "mock: syntax error at or near \"{marker}\" (line {line}, column {column})"
+    ))
 }
 
 /// Drops the catalogue segment when the mock is configured with
@@ -494,6 +542,60 @@ impl Session for MockSession {
             rows
         };
 
+        Ok(ResultSet::new(
+            fixture.columns.clone(),
+            rows,
+            fixture.total_rows(),
+        ))
+    }
+
+    async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {
+        self.behaviour.delay_for(&[]).await;
+        if let Some(marker) = self.behaviour.refuses(sql.text()) {
+            return Err(syntax_error(sql.text(), marker));
+        }
+        // Not a failure when the capability set says it cannot: "I cannot say"
+        // is the honest answer, and the caller was told to expect it.
+        if !self.capabilities.cost_estimate {
+            return Ok(Estimate::Unknown);
+        }
+        Ok(Estimate::Bytes(self.behaviour.estimate_bytes))
+    }
+
+    /// Answers with the rows of whatever relation the text names.
+    ///
+    /// Not a SQL engine and not pretending to be one: it looks for a
+    /// `schema.table` the catalogue knows and hands back that relation, so
+    /// `select * from public.users` in a test or a demo produces the rows
+    /// somebody reading it would expect. A query naming nothing comes back as
+    /// one row holding the text, because a mock whose answer to half the
+    /// queries is an error is a mock that cannot be typed into.
+    async fn execute(&self, query: &ApprovedQuery) -> DriverResult<ResultSet> {
+        self.behaviour.delay_for(&[]).await;
+        let text = query.text();
+        if let Some(marker) = self.behaviour.refuses(text) {
+            return Err(syntax_error(text, marker));
+        }
+
+        let cap = query.max_rows().map_or(usize::MAX, |n| n as usize);
+        let Some((schema, table)) = self.catalog.name_in(text) else {
+            return Ok(ResultSet::new(
+                vec![Column::new("query", "text", false)],
+                vec![Row(vec![Value::Text(text.to_owned())])]
+                    .into_iter()
+                    .take(cap)
+                    .collect(),
+                Some(1),
+            ));
+        };
+        let fixture = self
+            .catalog
+            .table(schema, table)
+            .ok_or_else(|| DriverError::NotFound(format!("{schema}.{table}")))?;
+        let rows = fixture.page(
+            0,
+            u32::try_from(cap.min(u32::MAX as usize)).unwrap_or(u32::MAX),
+        );
         Ok(ResultSet::new(
             fixture.columns.clone(),
             rows,
