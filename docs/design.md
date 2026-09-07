@@ -197,7 +197,8 @@ What that mechanism does not cover:
   entry needs a key binding, and the menu itself does too — for those terminals it does not
   exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
   cannot, because it only ever clicks the menu's first line.
-- Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M4).
+- Reserved keys: `e` opens `$EDITOR` (M4), `Ctrl-p` the command palette (M7, with the templates
+  it exists to insert).
 
 ---
 
