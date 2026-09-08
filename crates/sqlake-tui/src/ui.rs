@@ -711,7 +711,7 @@ impl UiState {
         let Some(id) = self.active_tab else { return };
         let last = self
             .definition(snapshot)
-            .map_or(0, |d| Laid::out(d).titles().len().saturating_sub(1));
+            .map_or(0, |d| crate::definition::section_count(d).saturating_sub(1));
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
             return;
         };
@@ -766,12 +766,11 @@ impl UiState {
         let Some(section) = self.active_tab.and_then(|id| self.section_of(id)) else {
             return false;
         };
-        // Laid out to be asked, rather than reaching for the cache: this is a
-        // question about the section list, and building one list is cheaper
-        // than a borrow that would make this take `&mut self`.
-        let laid = Laid::out(definition);
-        let at = section.min(laid.titles().len().saturating_sub(1));
-        laid.statement(at).is_some()
+        // Asked of the detail rather than of a `Laid`: this is on the input
+        // path, and laying one out would build every section's grid to answer
+        // a boolean about one of them.
+        let at = section.min(crate::definition::section_count(definition).saturating_sub(1));
+        crate::definition::is_statement(definition, at)
     }
 
     /// Which section the active definition tab is on.

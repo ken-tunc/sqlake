@@ -117,10 +117,28 @@ impl Laid {
     /// The statement, when `index` is the DDL section.
     #[must_use]
     pub fn statement(&self, index: usize) -> Option<&Ddl> {
-        (index == self.sections.len() + 1)
-            .then_some(self.ddl.as_ref())
-            .flatten()
+        let ddl = self.ddl.as_ref()?;
+        (index == self.sections.len() + 1).then_some(ddl)
     }
+}
+
+/// Whether the section at `index` is the DDL, without laying anything out.
+///
+/// The index is a fact about where [`Laid::titles`] puts things, so it is
+/// worked out here rather than in `sqlake-app` — and asked of the detail
+/// rather than of a `Laid`, because the questions on the input path (is this
+/// section scrolled by line or by row?) would otherwise build every section's
+/// grid to answer one boolean.
+#[must_use]
+pub fn is_statement(detail: &TableDetail, index: usize) -> bool {
+    detail.ddl.is_some() && index == detail.sections.len() + 1
+}
+
+/// How many sections the list has, which is the clamp every section index
+/// wants and the one thing [`Laid::titles`] is otherwise built for.
+#[must_use]
+pub fn section_count(detail: &TableDetail) -> usize {
+    1 + detail.sections.len() + usize::from(detail.ddl.is_some())
 }
 
 /// How wide the section list gets.
@@ -210,6 +228,49 @@ mod tests {
     use sqlake_core::node::{RelationKind, TableRef};
 
     use super::*;
+
+    fn detail_of(section_titles: &[&str], ddl: bool) -> TableDetail {
+        let mut detail = TableDetail::new(
+            TableRef::new(["public", "users"]),
+            RelationKind::Table,
+            Vec::new(),
+        );
+        for title in section_titles {
+            detail.sections.push(DetailSection {
+                title: (*title).to_owned(),
+                table: ResultSet::new(
+                    vec![ResultColumn::new("name", "text", false)],
+                    Vec::new(),
+                    None,
+                ),
+            });
+        }
+        if ddl {
+            detail.ddl = Some(Ddl::generated("CREATE TABLE users ()"));
+        }
+        detail
+    }
+
+    #[test]
+    fn the_cheap_answers_are_the_same_answers() {
+        // `is_statement` and `section_count` exist so the input path need not
+        // lay a definition out to ask about it. Two answers to one question is
+        // two answers that can disagree, so this is what says they do not.
+        for titles in [&[][..], &["Indexes"][..], &["Indexes", "Triggers"][..]] {
+            for ddl in [false, true] {
+                let detail = detail_of(titles, ddl);
+                let laid = Laid::out(&detail);
+                assert_eq!(laid.titles().len(), section_count(&detail), "{titles:?}");
+                for index in 0..=section_count(&detail) {
+                    assert_eq!(
+                        laid.statement(index).is_some(),
+                        is_statement(&detail, index),
+                        "section {index} of {titles:?} with ddl {ddl}"
+                    );
+                }
+            }
+        }
+    }
 
     fn definition(section_titles: &[&str]) -> Laid {
         let mut detail = TableDetail::new(
