@@ -40,6 +40,13 @@ const FIXTURE: &str = "
         PARTITION BY RANGE (at);
     CREATE TABLE events_2026 PARTITION OF events
         FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+    COMMENT ON TABLE users IS 'everyone who signed up';
+    COMMENT ON COLUMN users.id IS 'the key';
+    ALTER TABLE users ADD CONSTRAINT email_has_an_at CHECK (email LIKE '%@%');
+    CREATE UNIQUE INDEX users_email_key ON users (email);
+    CREATE FUNCTION noop() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql;
+    CREATE TRIGGER users_noop BEFORE INSERT ON users
+        FOR EACH ROW EXECUTE FUNCTION noop();
 ";
 
 #[tokio::test]
@@ -281,6 +288,113 @@ async fn until_gone(client: &tokio_postgres::Client) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("a connection was still open five seconds after it should have gone");
+}
+
+/// The definition, against a server — the half no fixture can answer.
+///
+/// Every section here exists because the fixture above put something in it: a
+/// check constraint, a second unique index, a trigger of somebody's own, and a
+/// partitioned table next door. A section that came back empty would mean the
+/// query found nothing where `psql \d` finds something.
+#[tokio::test]
+async fn a_definition_matches_what_the_server_was_told() {
+    use sqlake_core::driver::Driver as _;
+
+    let Some(container) = start().await else {
+        return;
+    };
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("a mapped port");
+    seed(port).await;
+
+    let session = PgDriver::new()
+        .connect(&profile(port))
+        .await
+        .expect("should connect");
+
+    let users = session
+        .describe(&TableRef::new([DATABASE, "public", "users"]))
+        .await
+        .expect("should describe");
+
+    assert_eq!(users.comment.as_deref(), Some("everyone who signed up"));
+    let id = &users.columns[0];
+    assert_eq!(id.name, "id");
+    assert_eq!(
+        id.type_name, "integer",
+        "`format_type` is what `\\d` prints"
+    );
+    assert!(!id.nullable, "a primary key is not nullable");
+    assert_eq!(id.comment.as_deref(), Some("the key"));
+
+    let index_names = column_of(&users, "Indexes", 0);
+    assert!(
+        index_names.contains(&"users_pkey".to_owned()),
+        "{index_names:?}"
+    );
+    assert!(
+        index_names.contains(&"users_email_key".to_owned()),
+        "{index_names:?}"
+    );
+    assert_eq!(
+        column_of(&users, "Indexes", 1).first().map(String::as_str),
+        Some("primary key"),
+        "the primary key sorts first and is named as one"
+    );
+
+    // The user's own trigger and not the three PostgreSQL makes per foreign
+    // key — this table has none, but the filter is what the assertion is for.
+    assert_eq!(column_of(&users, "Triggers", 0), ["users_noop"]);
+
+    let constraints = column_of(&users, "Constraints", 1);
+    assert!(constraints.contains(&"check".to_owned()), "{constraints:?}");
+    assert!(
+        constraints.contains(&"primary key".to_owned()),
+        "{constraints:?}"
+    );
+
+    // A table that is not partitioned has no partitioning section at all.
+    assert!(users.section("Partitioning").is_none());
+
+    let events = session
+        .describe(&TableRef::new([DATABASE, "public", "events"]))
+        .await
+        .expect("should describe");
+    let partitioning = events.section("Partitioning").expect("it is partitioned");
+    assert_eq!(
+        text(&partitioning.table.rows[0], 0).as_deref(),
+        Some("RANGE (at)")
+    );
+    assert_eq!(column_of(&events, "Partitioning", 1), ["events_2026"]);
+
+    session.close().await;
+}
+
+/// One column of one section, as strings.
+///
+/// Every cell a section carries is `Value::Text` — a definition is what the
+/// server prints, not a typed value — so anything else here is a driver that
+/// changed shape.
+fn column_of(detail: &sqlake_core::detail::TableDetail, title: &str, at: usize) -> Vec<String> {
+    detail
+        .section(title)
+        .map(|s| {
+            s.table
+                .rows
+                .iter()
+                .filter_map(|row| text(row, at))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn text(row: &sqlake_core::result::Row, at: usize) -> Option<String> {
+    match row.get(at) {
+        Some(sqlake_core::value::Value::Text(text)) => Some(text.clone()),
+        _ => None,
+    }
 }
 
 /// Recognisable in `pg_stat_activity`, and in nothing else that runs here.
