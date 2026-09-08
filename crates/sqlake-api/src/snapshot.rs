@@ -199,10 +199,9 @@ mod tests {
     use std::time::Duration;
 
     use sqlake_app::action::Action;
-    use sqlake_app::store::{Drivers, Store};
+    use sqlake_app::store::{Drivers, Store, Wiring};
     use sqlake_core::id::ProfileId;
     use sqlake_core::node::{NodeKind, NodeRef};
-    use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
     use super::*;
@@ -210,12 +209,10 @@ mod tests {
     const LIMIT: Duration = Duration::from_secs(5);
 
     async fn connected(behaviour: Behaviour) -> (Store, ConnId, Arc<Snapshot>) {
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let conn = ConnId::new();
         let snapshot = store
             .dispatch_and_settle(

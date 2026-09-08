@@ -9,13 +9,15 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use sqlake_app::action::Action;
-use sqlake_app::store::{Drivers, Store};
+use sqlake_app::store::{Drivers, Store, Wiring};
 use sqlake_config::{Config, Settings};
 use sqlake_core::id::{ConnId, ProfileId};
+use sqlake_core::library::Library;
 use sqlake_core::profile::Profiles;
 use sqlake_driver_bigquery::BqDriver;
 use sqlake_driver_mock::{MockDriver, MockProfiles};
 use sqlake_driver_postgres::PgDriver;
+use sqlake_library::Sqlite;
 use sqlake_tui::terminal::{TerminalGuard, install_panic_hook};
 use tracing_subscriber::EnvFilter;
 
@@ -163,10 +165,10 @@ fn main() -> Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     let store = runtime.block_on(async {
         let store = Store::spawn(
-            drivers(),
-            profiles,
-            settings.page_size,
-            settings.max_bytes_billed,
+            Wiring::new(drivers(), profiles)
+                .page_size(settings.page_size)
+                .budget(settings.max_bytes_billed)
+                .library(library()),
         );
         for profile in opening {
             store.dispatch(Action::Connect {
@@ -280,6 +282,34 @@ fn drivers() -> Drivers {
         .with(Arc::new(MockDriver::default()))
         .with(Arc::new(PgDriver::new()))
         .with(Arc::new(BqDriver::new()))
+}
+
+/// The file templates and history are kept in, or an unsaved stand-in.
+///
+/// A failure here is reported and stepped over rather than raised: sqlake is a
+/// database client, and refusing to open somebody's database because it cannot
+/// open its own scratch file would be the tail wagging the dog. What is lost
+/// is saving, and the session says so by keeping nothing.
+///
+/// `pub(crate)` because the agent modes build their own store and want the
+/// same file — an attached session and a one-shot command writing two
+/// different histories would be one history with holes in it.
+pub(crate) fn library() -> Arc<dyn Library> {
+    let opened = sqlake_config::paths::state_dir()
+        .map_err(|why| why.to_string())
+        .and_then(|dir| {
+            Sqlite::open(&sqlake_config::paths::library_file(&dir)).map_err(|why| why.to_string())
+        });
+    match opened {
+        Ok(library) => Arc::new(library),
+        Err(why) => {
+            tracing::warn!("nothing will be saved this session: {why}");
+            // In memory rather than nothing at all, so that saving a template
+            // works for as long as the process lives and the failure is one
+            // message rather than one per attempt.
+            Arc::new(Sqlite::in_memory().expect("an in-memory library opens"))
+        }
+    }
 }
 
 fn configuration(args: &Args) -> Result<(Arc<dyn Profiles>, Settings)> {

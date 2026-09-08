@@ -10,17 +10,18 @@ use rmcp::model::CallToolRequestParams;
 use serde_json::{Map, Value as Json, json};
 use sqlake_api::{Backend, Response, Service};
 use sqlake_app::action::Action;
-use sqlake_app::store::{Drivers, Store};
+use sqlake_app::store::{Drivers, Store, Wiring};
 use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 use sqlake_mcp::Server;
 
 async fn server() -> Server {
     let store = Store::spawn(
-        Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
-        Arc::new(MockProfiles::default()),
-        50,
-        None,
+        Wiring::new(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::default()),
+        )
+        .page_size(50),
     );
     let conn = ConnId::new();
     store

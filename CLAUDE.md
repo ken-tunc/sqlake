@@ -11,7 +11,7 @@ milestone is done.
 These are load-bearing. Breaking one silently undoes a design decision.
 
 - **Dependencies flow one way**: `sqlake` → `sqlake-tui` / `sqlake-api` → `sqlake-app` →
-  `sqlake-core`, with `sqlake-driver-*` depending only on `sqlake-core`. The two front-ends
+  `sqlake-core`, with `sqlake-driver-*` and `sqlake-library` depending only on `sqlake-core`. The two front-ends
   are peers and **neither may depend on the other** — something both want goes down to
   `sqlake-app`, which is how `json::to_json` got there.
 - **No driver branching in the UI.** `if driver == Postgres` never appears in `sqlake-tui`.

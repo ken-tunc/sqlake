@@ -741,10 +741,9 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::Value as Json;
-    use sqlake_app::store::Drivers;
+    use sqlake_app::store::{Drivers, Wiring};
     use sqlake_core::capability::Capabilities;
     use sqlake_core::id::ProfileId;
-    use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
     use super::*;
@@ -756,12 +755,10 @@ mod tests {
     }
 
     async fn service_of(driver: MockDriver) -> (Service, String) {
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(driver)),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let conn = ConnId::new();
         store
             .dispatch_and_settle(
@@ -990,15 +987,13 @@ mod tests {
     async fn an_estimate_that_outlives_the_wait_leaves_nothing_behind_either() {
         // The case the `?` above used to skip: a timed-out estimate is exactly
         // the one that would strand a `QueryView`, and its busy row with it.
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
                 latency: Duration::from_millis(300),
                 ..Behaviour::instant()
             }))),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let conn = ConnId::new();
         // Not through the service: connecting is slow here too, and the point
         // is a short wait on the estimate alone.
@@ -1075,12 +1070,10 @@ mod tests {
     #[tokio::test]
     async fn a_caller_can_lower_the_ceiling_and_never_raise_it() {
         let with_budget = |ours: Option<u64>| {
-            Service::new(Store::spawn(
+            Service::new(Store::spawn(Wiring::new(
                 Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
                 Arc::new(MockProfiles::default()),
-                PageRequest::DEFAULT_LIMIT,
-                None,
-            ))
+            )))
             .with_max_bytes(ours)
         };
 
@@ -1218,12 +1211,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_over_the_socket_is_refused_on_a_read_only_connection() {
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::read_only()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let conn = ConnId::new();
         store
             .dispatch_and_settle(

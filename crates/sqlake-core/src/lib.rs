@@ -10,6 +10,7 @@ pub mod detail;
 pub mod driver;
 pub mod id;
 pub mod ident;
+pub mod library;
 pub mod node;
 pub mod profile;
 pub mod result;
@@ -21,6 +22,10 @@ pub use capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
 pub use driver::{Driver, DriverError, DriverResult, Session};
 pub use id::{ConnId, ProfileId, QueryId, TabId};
 pub use ident::{Ident, QuotedIdent};
+pub use library::{
+    Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart, Template,
+    TemplateId,
+};
 pub use node::{NodeKind, NodeRef, RelationKind, TableRef, TreeNode};
 pub use profile::{
     Params, PostgresParams, ProfileColor, ProfileError, ProfileSummary, Profiles, ResolvedProfile,

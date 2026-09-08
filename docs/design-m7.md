@@ -62,11 +62,16 @@ application's state store and two of them in one sentence is one too many; not
 only file sqlake writes that a person cannot fix in an editor, and a v2 that cannot open a v1
 is a personal tool eating somebody's saved work.
 
-**D3 — SQLite is blocking, so it gets a thread.** `rusqlite` blocks, and blocking inside the
-tokio runtime stalls every other connection. `spawn_blocking` per call would work and hands the
-file to a different pool thread each time; a single owning thread behind a channel is the
-pattern the session actor already establishes here, gives the connection one owner, and makes
-"two writes at once" a question that cannot be asked.
+**D3 — SQLite blocks, and the caller is what knows that.** `rusqlite` blocks, and blocking
+inside the tokio runtime stalls every other connection, so every call goes through
+`spawn_blocking` — which is what the store already does with `Profiles::resolve`, and the
+reason that trait's doc comment says so out loud.
+
+An actor thread of its own was the first answer and is the wrong one. The session actor exists
+to serialise a *stateful* driver session — a cursor, a transaction, a cancel that has to reach
+the query it stops. SQLite's state is the file, and a `Mutex<Connection>` serialises that with
+no message type per method. What the actor would buy is an async signature, and an async
+signature over a blocking file is the lie moved rather than removed.
 
 **D4 — a placeholder is substituted, not bound.** Both servers take parameters, and using them
 would be the safer-looking answer. It is the wrong one here: `Session::execute` accepts only an
