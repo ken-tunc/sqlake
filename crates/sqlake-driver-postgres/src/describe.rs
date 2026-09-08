@@ -82,12 +82,18 @@ const TRIGGERS: &str = "\
 ///
 /// `contype` is a one-byte code; it is turned into a word here rather than
 /// shown raw, because `c` and `f` are not something to make a reader look up.
+///
+/// `contype <> 'n'` is what keeps this section about constraints. PostgreSQL
+/// 18 gives every `NOT NULL` column a `pg_constraint` row of its own, so a
+/// forty-column table would answer with forty rows saying what the column list
+/// above already says — and `psql \d`, which is what people compare this
+/// against, does not list them here either.
 const CONSTRAINTS: &str = "\
     SELECT con.conname, con.contype, pg_catalog.pg_get_constraintdef(con.oid) \
     FROM pg_catalog.pg_constraint con \
     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-    WHERE n.nspname = $1 AND c.relname = $2 \
+    WHERE n.nspname = $1 AND c.relname = $2 AND con.contype <> 'n' \
     ORDER BY con.contype, con.conname";
 
 /// How the table is partitioned, and what its partitions are.
@@ -147,7 +153,9 @@ pub async fn describe(
     detail.comment = relation.get(1);
 
     // Four more, together. Each is one index scan and none feeds another, so
-    // the cost of a definition is one round trip rather than five.
+    // the four of them cost one round trip rather than four. They wait for the
+    // relation because a name that is not there is a refusal, not four empty
+    // sections.
     let (indexes, triggers, constraints, partitions) = tokio::join!(
         client.query(INDEXES, &names),
         client.query(TRIGGERS, &names),
@@ -179,13 +187,24 @@ fn section(title: &str, columns: Vec<Column>, rows: Vec<Row>) -> Option<DetailSe
     })
 }
 
+/// One `pg_get_*def` column, which can come back null.
+///
+/// The catalogue scan and the lookup these functions do inside themselves are
+/// not one snapshot, so an index dropped by somebody else mid-query answers a
+/// row whose definition is null. Read as `String` that is a panic in the
+/// middle of a definition; a null cell is what it actually is.
+fn definition(row: &tokio_postgres::Row, at: usize) -> Value {
+    row.get::<_, Option<String>>(at)
+        .map_or(Value::Null, Value::Text)
+}
+
 fn indexes_of(rows: &[tokio_postgres::Row]) -> Option<DetailSection> {
     section(
         "Indexes",
         vec![
             Column::new("name", "text", false),
             Column::new("kind", "text", false),
-            Column::new("definition", "text", false),
+            Column::new("definition", "text", true),
         ],
         rows.iter()
             .map(|row| {
@@ -204,7 +223,7 @@ fn indexes_of(rows: &[tokio_postgres::Row]) -> Option<DetailSection> {
                         }
                         .to_owned(),
                     ),
-                    Value::Text(row.get(1)),
+                    definition(row, 1),
                 ])
             })
             .collect(),
@@ -216,10 +235,10 @@ fn triggers_of(rows: &[tokio_postgres::Row]) -> Option<DetailSection> {
         "Triggers",
         vec![
             Column::new("name", "text", false),
-            Column::new("definition", "text", false),
+            Column::new("definition", "text", true),
         ],
         rows.iter()
-            .map(|row| Row(vec![Value::Text(row.get(0)), Value::Text(row.get(1))]))
+            .map(|row| Row(vec![Value::Text(row.get(0)), definition(row, 1)]))
             .collect(),
     )
 }
@@ -230,14 +249,14 @@ fn constraints_of(rows: &[tokio_postgres::Row]) -> Option<DetailSection> {
         vec![
             Column::new("name", "text", false),
             Column::new("kind", "text", false),
-            Column::new("definition", "text", false),
+            Column::new("definition", "text", true),
         ],
         rows.iter()
             .map(|row| {
                 Row(vec![
                     Value::Text(row.get(0)),
-                    Value::Text(constraint_kind(row.get(1)).to_owned()),
-                    Value::Text(row.get(2)),
+                    Value::Text(constraint_kind(row.get(1))),
+                    definition(row, 2),
                 ])
             })
             .collect(),
@@ -254,18 +273,16 @@ fn partitioning_of(rows: &[tokio_postgres::Row]) -> Option<DetailSection> {
     section(
         "Partitioning",
         vec![
-            Column::new("key", "text", false),
+            Column::new("key", "text", true),
             Column::new("partition", "text", true),
             Column::new("bounds", "text", true),
         ],
         rows.iter()
             .map(|row| {
                 Row(vec![
-                    Value::Text(row.get(0)),
-                    row.get::<_, Option<String>>(1)
-                        .map_or(Value::Null, Value::Text),
-                    row.get::<_, Option<String>>(2)
-                        .map_or(Value::Null, Value::Text),
+                    definition(row, 0),
+                    definition(row, 1),
+                    definition(row, 2),
                 ])
             })
             .collect(),
@@ -285,6 +302,14 @@ fn constraint_kind(contype: i8) -> String {
         Ok('c') => "check".to_owned(),
         Ok('t') => "constraint trigger".to_owned(),
         Ok('x') => "exclusion".to_owned(),
+        // PostgreSQL 18 gives every `NOT NULL` a `pg_constraint` row. Shown as
+        // a word like the rest rather than filtered out: it is a constraint
+        // the server now names, and a bare `n` is the letter this function
+        // exists to avoid.
+        // Filtered out by `CONSTRAINTS`, and kept here anyway: a name is
+        // cheaper than a letter appearing if one ever reaches this by another
+        // route.
+        Ok('n') => "not null".to_owned(),
         Ok(other) => other.to_string(),
         Err(_) => "unknown".to_owned(),
     }
@@ -360,6 +385,9 @@ mod tests {
         assert_eq!(constraint_kind(b'p' as i8), "primary key");
         assert_eq!(constraint_kind(b'f' as i8), "foreign key");
         assert_eq!(constraint_kind(b'c' as i8), "check");
+        // PostgreSQL 18 catalogues `NOT NULL`, and a section full of `n` is
+        // what leaving it out of the match looks like.
+        assert_eq!(constraint_kind(b'n' as i8), "not null");
         // A kind a future PostgreSQL adds is better shown as its letter than
         // as something it is not.
         assert_eq!(constraint_kind(b'z' as i8), "z");
@@ -393,6 +421,15 @@ mod tests {
         // PostgreSQL creates three internal triggers per foreign key. Listing
         // them buries a user's own under bookkeeping they cannot edit.
         assert!(TRIGGERS.contains("NOT t.tgisinternal"));
+    }
+
+    #[test]
+    fn the_constraint_query_leaves_out_per_column_not_nulls() {
+        // PostgreSQL 18 catalogues every `NOT NULL` as a constraint of its
+        // own. Without this a forty-column table answers with forty rows
+        // repeating what the column list already says — and the conformance
+        // container pins an older server, so nothing else would notice.
+        assert!(CONSTRAINTS.contains("con.contype <> 'n'"));
     }
 
     #[test]
