@@ -440,7 +440,7 @@ asks about — the reasoning is in `tests/conformance.rs`.
 | **M2 — Table list** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M3 — Table preview** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M4 — Running SQL** ✅ | — | Done. `crates/` and `git log` are the record |
-| **M5** | Table definitions (feature 5) | Columns, indexes, triggers, constraints, partitioning, DDL |
+| **M5 — Table definitions** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
 | **M7** | SQL templates (feature 7) | Save, parameter entry, insert from the palette |
 | **M8** | Query history (feature 8) | FTS search, re-run, promote to template |

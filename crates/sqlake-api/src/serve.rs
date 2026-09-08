@@ -22,7 +22,7 @@ use sqlake_core::result::{Sort, SortDir};
 
 use crate::page::{Budget, Page};
 use crate::protocol::{Failure, Request, Response, schema};
-use crate::snapshot::{ConnectionInfo, NodeInfo, QueryInfo, SessionInfo};
+use crate::snapshot::{ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo};
 
 /// How long a request waits for the store before giving up.
 ///
@@ -141,6 +141,14 @@ impl Service {
                 .unwrap_or_else(Response::Failed),
             Request::QueryCancel { query } => self
                 .query_cancel(query)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::TableDescribe {
+                connection,
+                table,
+                refresh,
+            } => self
+                .describe(connection, table, *refresh, request.budget(self.budget))
                 .await
                 .unwrap_or_else(Response::Failed),
             Request::TablePreview {
@@ -536,6 +544,49 @@ impl Service {
         }
     }
 
+    async fn describe(
+        &self,
+        connection: &str,
+        path: &[String],
+        refresh: bool,
+        budget: Budget,
+    ) -> Result<Response, Failure> {
+        let conn = self.connection(connection).await?;
+        let table =
+            self.resolve(conn, path)
+                .await?
+                .as_table()
+                .ok_or_else(|| Failure::Unsupported {
+                    message: format!("{} is not a relation", path.join(".")),
+                })?;
+
+        let settled = self
+            .dispatch_and_settle(
+                Action::DescribeTable {
+                    conn,
+                    table: table.clone(),
+                    refresh,
+                },
+                |s| s.definition_settled(conn, &table),
+            )
+            .await?;
+
+        match settled.definition(conn, &table).map(|d| &d.data) {
+            Some(LoadState::Ready(detail)) => {
+                Ok(Response::Definition(DefinitionInfo::of(detail, budget)))
+            }
+            Some(LoadState::Failed(why)) => Err(Failure::Driver {
+                message: why.clone(),
+            }),
+            // Settled but neither: a person sharing the session closed the tab
+            // this was held for, which is the same answer as never having been
+            // described.
+            _ => Err(Failure::NotFound {
+                path: path.to_vec(),
+            }),
+        }
+    }
+
     /// Sorting is a second action against a preview that already exists.
     ///
     /// `SortPreview` restarts the relation at page one with the ordering
@@ -691,6 +742,7 @@ mod tests {
 
     use serde_json::Value as Json;
     use sqlake_app::store::Drivers;
+    use sqlake_core::capability::Capabilities;
     use sqlake_core::id::ProfileId;
     use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
@@ -1278,6 +1330,42 @@ mod tests {
                 .await,
         );
 
+        // A definition, under the narrow budget so that `omitted_columns` is
+        // written here too — and against a driver that has indexes, because a
+        // `sections` list is empty on the default mock and an empty one is
+        // skipped.
+        let (described, described_conn) = service_of(
+            MockDriver::new(Behaviour::instant()).with_capabilities(Capabilities {
+                indexes: true,
+                ..sqlake_driver_mock::CAPABILITIES
+            }),
+        )
+        .await;
+        responses.push(
+            Service::new(described.store().clone())
+                .with_budget(narrow)
+                .answer(&Request::TableDescribe {
+                    connection: described_conn,
+                    table: vec!["public".into(), "users".into()],
+                    refresh: false,
+                })
+                .await,
+        );
+        // And one built by hand for `generated_ddl`, which no driver the tests
+        // can reach fills in: the mock has no catalogue to build a statement
+        // from, and a definition whose DDL is never serialised is a field this
+        // check has not looked at.
+        let mut hand_built = sqlake_core::detail::TableDetail::new(
+            sqlake_core::node::TableRef::new(["public", "users"]),
+            sqlake_core::node::RelationKind::Table,
+            Vec::new(),
+        );
+        hand_built.ddl = Some(sqlake_core::detail::Ddl::generated("CREATE TABLE users ()"));
+        responses.push(Response::Definition(DefinitionInfo::of(
+            &hand_built,
+            Budget::DEFAULT,
+        )));
+
         // Opening, which is one of the two ways to reach `Connection`; closing
         // answers with the same shape.
         responses.push(
@@ -1376,6 +1464,14 @@ mod tests {
                 // `STRUCT` column would otherwise put its field names in here,
                 // which makes this assertion a statement about the fixture.
                 Response::Page(page) => page.rows.clear(),
+                // The same, one level down: a section's rows are catalogue
+                // values — an index's own definition, a partitioning
+                // expression — and none of them is protocol structure.
+                Response::Definition(definition) => {
+                    for section in &mut definition.sections {
+                        section.page.rows.clear();
+                    }
+                }
                 _ => {}
             }
             keys(
@@ -1388,10 +1484,12 @@ mod tests {
             "cancel",
             "capabilities",
             "columns",
+            "comment",
             "connection",
             "connections",
             "cost_estimate",
             "data",
+            "default",
             "driver",
             "error",
             // A query's own vocabulary. `sql` is the statement the caller
@@ -1400,6 +1498,11 @@ mod tests {
             // list is watching for.
             "estimate",
             "free_preview",
+            // A definition's own vocabulary. `generated_ddl` is a statement
+            // this client built from the catalogue, and `title` is the
+            // driver's name for a section — a server's words, not a
+            // credential's.
+            "generated_ddl",
             "hierarchy",
             "id",
             "loaded",
@@ -1418,13 +1521,18 @@ mod tests {
             "response",
             "returned",
             "rows",
+            "sections",
             "sortable_preview",
             "sql",
             "state",
+            "stats",
             "status",
+            "table",
+            "title",
             "total",
             "truncated",
             "type_name",
+            "value",
             "waited_ms",
         ]
         .iter()
@@ -1582,6 +1690,141 @@ mod tests {
             matches!(answer, Response::Failed(Failure::Unsupported { .. })),
             "{answer:?}"
         );
+    }
+
+    fn definition(response: &Response) -> &DefinitionInfo {
+        match response {
+            Response::Definition(definition) => definition,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_definition_answers_what_a_relation_is_rather_than_what_is_in_it() {
+        let (service, conn) = service_of(MockDriver::new(Behaviour::instant()).with_capabilities(
+            Capabilities {
+                indexes: true,
+                ..sqlake_driver_mock::CAPABILITIES
+            },
+        ))
+        .await;
+        let answer = service
+            .answer(&Request::TableDescribe {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                refresh: false,
+            })
+            .await;
+
+        let definition = definition(&answer);
+        assert_eq!(definition.table, ["public", "users"]);
+        assert_eq!(definition.relation_kind, "table");
+        // The point of the whole layer: an agent branching on nullability
+        // reads a boolean, where the TUI reads the words "not null".
+        let first = definition.columns.first().expect("a column");
+        assert!(!first.nullable);
+        assert!(first.default.is_some(), "{first:?}");
+        assert_eq!(
+            definition
+                .sections
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Indexes"]
+        );
+        assert!(!definition.stats.is_empty(), "{definition:?}");
+    }
+
+    #[tokio::test]
+    async fn a_definition_needs_no_listing_first() {
+        // The same promise `a_preview_needs_no_listing_first` makes: a caller
+        // names a path, it does not replay the clicks that would bring the
+        // path onto a screen.
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TableDescribe {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                refresh: false,
+            })
+            .await;
+        assert!(matches!(answer, Response::Definition(_)), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn describing_something_that_is_not_a_relation_says_so() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::TableDescribe {
+                connection: conn,
+                table: vec!["public".into()],
+                refresh: false,
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Unsupported { .. })),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_refresh_asks_the_driver_again() {
+        // Succeeds once and fails afterwards, so what the driver was asked is
+        // readable from the answers: a second call that comes back fine did
+        // not reach it, and one that fails did.
+        let table = vec!["public".to_owned(), "users".to_owned()];
+        let (service, conn) = service(Behaviour {
+            failing_after: vec![(table.clone(), 1)],
+            ..Behaviour::instant()
+        })
+        .await;
+        let describe = |refresh| Request::TableDescribe {
+            connection: conn.clone(),
+            table: table.clone(),
+            refresh,
+        };
+
+        assert!(
+            matches!(
+                service.answer(&describe(false)).await,
+                Response::Definition(_)
+            ),
+            "the first describe should have been answered"
+        );
+        assert!(
+            matches!(
+                service.answer(&describe(false)).await,
+                Response::Definition(_)
+            ),
+            "a second describe read what the session already held"
+        );
+        assert!(
+            matches!(
+                service.answer(&describe(true)).await,
+                Response::Failed(Failure::Driver { .. })
+            ),
+            "a refresh should have gone back to the driver"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_will_not_describe_says_why() {
+        let (service, conn) = service(Behaviour {
+            failing_nodes: vec![vec!["public".to_owned(), "users".to_owned()]],
+            ..Behaviour::instant()
+        })
+        .await;
+        let answer = service
+            .answer(&Request::TableDescribe {
+                connection: conn,
+                table: vec!["public".into(), "users".into()],
+                refresh: false,
+            })
+            .await;
+        let Response::Failed(Failure::Driver { message }) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert!(message.contains("permission denied"), "{message}");
     }
 
     #[tokio::test]

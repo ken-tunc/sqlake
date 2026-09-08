@@ -77,6 +77,7 @@ pub const fn takes_a_connection(kind: RequestKind) -> bool {
         RequestKind::NamespaceList
             | RequestKind::TableList
             | RequestKind::TablePreview
+            | RequestKind::TableDescribe
             | RequestKind::ConnectionClose
             | RequestKind::QueryEstimate
             | RequestKind::QueryRun
@@ -103,6 +104,11 @@ pub const fn describes(kind: RequestKind) -> &'static str {
         RequestKind::TablePreview => {
             "A page of one relation, read without running a query where the driver allows it."
         }
+        RequestKind::TableDescribe => {
+            "What a relation is rather than what is in it: columns, indexes, and a CREATE \
+             statement built from the catalogue. Cheaper than reading a page to find the \
+             column names."
+        }
         RequestKind::QueryEstimate => {
             "What a statement would cost, without running it. Show this to a person before running something expensive."
         }
@@ -127,7 +133,7 @@ pub fn input_schema(kind: RequestKind) -> JsonObject {
 
 /// The same, against a document generated once.
 ///
-/// [`all`] wants twelve of these, and `schema()` rebuilds the whole protocol
+/// [`all`] wants one per tool, and `schema()` rebuilds the whole protocol
 /// document each time it is called.
 pub(crate) fn from_document(document: &Json, kind: RequestKind) -> JsonObject {
     let defs = document.get("$defs").cloned().unwrap_or(Json::Null);
@@ -164,7 +170,7 @@ pub(crate) fn from_document(document: &Json, kind: RequestKind) -> JsonObject {
     // document's root rather than the one they were generated under — so the
     // definitions have to come along. Only the ones reached, though: the
     // document's `$defs` is mostly *response* types, and carrying all of it
-    // onto all twelve tools would put a hundred kilobytes of schema an agent
+    // onto every tool would put a hundred kilobytes of schema an agent
     // cannot call in front of it, which is the context this surface exists to
     // spend carefully.
     if let Some(defs) = defs.as_object() {
@@ -305,8 +311,8 @@ mod tests {
     #[test]
     fn a_schema_carries_no_definition_it_does_not_name() {
         // Every `$ref` a tool names resolves, and nothing else rides along: the
-        // protocol document's `$defs` is mostly response types, and twelve
-        // copies of it is a hundred kilobytes of schema an agent reads before
+        // protocol document's `$defs` is mostly response types, and a copy of
+        // it per tool is a hundred kilobytes of schema an agent reads before
         // it can call anything.
         let names = |schema: &JsonObject| -> Vec<String> {
             schema

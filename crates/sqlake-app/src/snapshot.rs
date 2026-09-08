@@ -335,6 +335,14 @@ impl Snapshot {
         )
     }
 
+    /// Whether the store has finished describing this relation.
+    #[must_use]
+    pub fn definition_settled(&self, conn: ConnId, table: &TableRef) -> bool {
+        !self.busy.iter().any(
+            |b| matches!(&b.owner, BusyOwner::Definition { conn: c, table: t } if *c == conn && t == table),
+        )
+    }
+
     #[must_use]
     pub fn preview(&self, conn: ConnId, table: &TableRef) -> Option<&PreviewView> {
         self.previews
