@@ -64,6 +64,10 @@ pub enum InvalidSql {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedSql {
     text: String,
+    /// Kept so [`kind`](ValidatedSql::kind) reads the text the same way
+    /// `parse` did. A statement scanned under one dialect and classified under
+    /// another is one whose string literals moved.
+    escaping: Escaping,
     /// Where in the text this was parsed out of the statement begins.
     ///
     /// Kept because [`parse`](ValidatedSql::parse) drops the whitespace before
@@ -99,6 +103,7 @@ impl ValidatedSql {
                 let before = &text[..start + (span.len() - kept.len())];
                 Ok(Self {
                     text: kept.trim_end().to_owned(),
+                    escaping,
                     start: Position::after_str(before),
                 })
             }
@@ -109,6 +114,47 @@ impl ValidatedSql {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Whether this statement only reads.
+    ///
+    /// A keyword check, not a parser, and it is the weaker of the two defences
+    /// on purpose. PostgreSQL's is the server's — a read-only connection sets
+    /// `default_transaction_read_only`, which catches what this cannot: a
+    /// `SELECT` calling a function that writes, or `nextval`. BigQuery has no
+    /// equivalent, so for it this is the only one there is.
+    ///
+    /// Which is why it errs towards [`StatementKind::Writes`]: what it misses
+    /// on PostgreSQL the server still refuses, and what it wrongly refuses is
+    /// a profile setting away from being allowed.
+    #[must_use]
+    pub fn kind(&self) -> StatementKind {
+        let mut words = Vec::new();
+        // The text is already one statement, so this cannot fail — it was
+        // scanned to get here.
+        let _ = scan(&self.text, self.escaping, |token| {
+            if let Token::Word { text } = token {
+                words.push(text.to_ascii_lowercase());
+            }
+        });
+
+        let Some(first) = words.first() else {
+            return StatementKind::Writes;
+        };
+        if !READ_OPENERS.contains(&first.as_str()) {
+            return StatementKind::Writes;
+        }
+        // The opener is already known to be a read, so only what follows it is
+        // worth reading again — which is also what makes `EXPLAIN ANALYZE` come
+        // out right without a rule of its own: `ANALYZE` runs the statement it
+        // is explaining, and it is one of the words below.
+        if words[1..]
+            .iter()
+            .any(|w| WRITING_WORDS.contains(&w.as_str()))
+        {
+            return StatementKind::Writes;
+        }
+        StatementKind::Reads
     }
 
     /// A position the server counted from this statement, as a position in the
@@ -139,6 +185,44 @@ impl fmt::Display for ValidatedSql {
         f.write_str(&self.text)
     }
 }
+
+/// Whether a statement only reads.
+///
+/// Conservative on purpose, and in one direction: calling a read a write costs
+/// somebody a refusal they can lift, and calling a write a read is how an agent
+/// deletes a table. So anything not recognisably read-only is [`Writes`].
+///
+/// [`Writes`]: StatementKind::Writes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StatementKind {
+    Reads,
+    Writes,
+}
+
+/// Statements that only read, by the word they open with.
+///
+/// `EXPLAIN` is here because it only plans. `EXPLAIN ANALYZE` runs what it is
+/// explaining, and comes out a write because `analyze` is one of the words
+/// below, which are looked for past the opener.
+const READ_OPENERS: [&str; 6] = ["select", "with", "table", "values", "show", "explain"];
+
+/// Words that mean a statement writes, wherever they appear past the opener.
+///
+/// Checked anywhere rather than only at the front, because `WITH x AS (INSERT
+/// … RETURNING *) SELECT * FROM x` opens with a read-only word and writes, and
+/// `SELECT … INTO t FROM u` creates a table on PostgreSQL. A classifier that
+/// read only the first word would pass both.
+///
+/// Several of these — `copy`, `vacuum`, `comment`, `truncate` among them — are
+/// unreserved in PostgreSQL and so can be a bare column name, which makes
+/// `SELECT copy FROM t` a false refusal. That is the direction this is meant to
+/// err in, and the refusal is a profile setting away from being lifted. A
+/// quoted `"copy"` never reaches here at all, since [`scan`] does not report
+/// what is inside quotes.
+const WRITING_WORDS: [&str; 18] = [
+    "insert", "update", "delete", "merge", "truncate", "drop", "create", "alter", "grant",
+    "revoke", "call", "replace", "rename", "comment", "vacuum", "analyze", "copy", "into",
+];
 
 /// Where in a statement something is, one-based in lines and columns.
 ///
@@ -275,6 +359,50 @@ pub enum Approval {
     ByHand,
 }
 
+/// What a connection is allowed to do.
+///
+/// A fact about the profile rather than the driver, which is why it is not on
+/// `Capabilities`: the same PostgreSQL server is read-only through one profile
+/// and not through another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Access {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Why a statement was not approved.
+///
+/// Two reasons with different answers: a cost is a question for a person, and
+/// a write on a read-only connection is a setting. Keeping them apart is what
+/// stops a client offering "run it anyway" for something no approval can allow.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotApproved {
+    OverBudget(OverBudget),
+    /// The connection only reads, and this statement does not.
+    ///
+    /// Carries the statement back for the message, not for a retry: there is
+    /// nothing to answer, and the way through is `readonly = false` on the
+    /// profile.
+    ReadOnly(ValidatedSql),
+}
+
+impl fmt::Display for NotApproved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OverBudget(over) => write!(
+                f,
+                "this query would read {} bytes and the limit is {}",
+                over.estimate.bytes().unwrap_or(0),
+                over.budget
+            ),
+            Self::ReadOnly(_) => f.write_str(
+                "this connection is read-only, and that statement is not a read \
+                 — `readonly = false` on the profile is what changes it",
+            ),
+        }
+    }
+}
+
 /// A query that costs more than the budget allows.
 ///
 /// Not an error: over the threshold is a normal branch, and the answer to it
@@ -314,21 +442,31 @@ impl ApprovedQuery {
     ///
     /// # Errors
     ///
-    /// [`OverBudget`], carrying everything needed to ask a person and then
-    /// call [`Self::by_hand`] with the same statement.
+    /// [`NotApproved`]: over the budget, carrying everything needed to ask a
+    /// person and then call [`Self::by_hand`] with the same statement — or a
+    /// write on a read-only connection, which no approval can allow.
     pub fn within(
         sql: ValidatedSql,
         max_rows: Option<u32>,
         estimate: Estimate,
         budget: Option<u64>,
-    ) -> Result<Self, OverBudget> {
+        access: Access,
+    ) -> Result<Self, NotApproved> {
+        // Before the budget, because a write on a read-only connection is not
+        // a question of cost: approving it would still be refused, and asking
+        // a person about the money first asks the wrong question.
+        if access == Access::ReadOnly && sql.kind() == StatementKind::Writes {
+            return Err(NotApproved::ReadOnly(sql));
+        }
         match (estimate.bytes(), budget) {
-            (Some(bytes), Some(budget)) if bytes > budget => Err(OverBudget {
-                sql,
-                max_rows,
-                estimate,
-                budget,
-            }),
+            (Some(bytes), Some(budget)) if bytes > budget => {
+                Err(NotApproved::OverBudget(OverBudget {
+                    sql,
+                    max_rows,
+                    estimate,
+                    budget,
+                }))
+            }
             (Some(_), Some(_)) => Ok(Self::new(sql, max_rows, estimate, Approval::WithinBudget)),
             // A number nobody compared to anything, which is what a cost
             // estimate, an absent one and an absent budget all amount to.
@@ -388,19 +526,60 @@ impl ApprovedQuery {
 /// reach of code that has no business branching on what kind of statement this
 /// is. That is the server's judgement, not ours.
 fn statement_spans(text: &str, escaping: Escaping) -> Result<Vec<(usize, usize)>, InvalidSql> {
-    let bytes = text.as_bytes();
-    let mut ends = Vec::new();
+    let mut spans = Vec::new();
     let mut start = 0;
-    let mut i = 0;
-    // Whether anything but whitespace and comments has been seen since the
-    // last boundary. A file of nothing but comments is not one statement, and
+    // Whether anything but whitespace and comments has been seen since the last
+    // boundary. A file of nothing but comments is not one statement, and
     // trimming cannot tell the two apart — `-- x` is not blank.
     let mut code = false;
+
+    scan(text, escaping, |token| match token {
+        Token::Semicolon(at) => {
+            if code {
+                // The offset *of* the semicolon, so the statement kept is the
+                // one the user wrote and an error position counted from its
+                // start still lands.
+                spans.push((start, at));
+            }
+            code = false;
+            start = at + 1;
+        }
+        Token::Code | Token::Word { .. } => code = true,
+    })?;
+
+    // A last statement with no semicolon after it.
+    if code {
+        spans.push((start, text.len()));
+    }
+    Ok(spans)
+}
+
+/// What the scanner reports. Everything a `;` or a keyword could hide in is
+/// skipped rather than reported, which is the whole job.
+#[derive(Debug, Clone, Copy)]
+enum Token<'a> {
+    /// A statement boundary, at this byte offset.
+    Semicolon(usize),
+    /// A bare word: an unquoted identifier or a keyword.
+    Word { text: &'a str },
+    /// Anything else that is not whitespace — punctuation, a number, a string.
+    Code,
+}
+
+/// Walks the text once, skipping strings, quoted names and comments.
+///
+/// One walk for both questions asked of it — where the statements end, and
+/// what the bare words are — because the skipping is the hard part and two
+/// copies of it would drift. A word inside a string is not a keyword and a `;`
+/// inside a comment is not a boundary, and both facts come from the same place.
+fn scan(text: &str, escaping: Escaping, mut on: impl FnMut(Token<'_>)) -> Result<(), InvalidSql> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
 
     while i < bytes.len() {
         match bytes[i] {
             b'\'' | b'"' | b'`' => {
-                code = true;
+                on(Token::Code);
                 let quote = bytes[i];
                 i += 1;
                 loop {
@@ -451,7 +630,7 @@ fn statement_spans(text: &str, escaping: Escaping) -> Result<Vec<(usize, usize)>
             }
             b'$' => match dollar_tag(bytes, i) {
                 Some(tag) => {
-                    code = true;
+                    on(Token::Code);
                     let Some(at) = find(bytes, tag, i + tag.len()) else {
                         return Err(InvalidSql::Unterminated("dollar-quoted string"));
                     };
@@ -459,33 +638,35 @@ fn statement_spans(text: &str, escaping: Escaping) -> Result<Vec<(usize, usize)>
                 }
                 // `$1` and a bare `$` are not quoting.
                 None => {
-                    code = true;
+                    on(Token::Code);
                     i += 1;
                 }
             },
             b';' => {
-                if code {
-                    // The offset *of* the semicolon, so the statement kept is
-                    // the one the user wrote and an error position counted
-                    // from its start still lands.
-                    ends.push((start, i));
-                }
-                code = false;
-                start = i + 1;
+                on(Token::Semicolon(i));
                 i += 1;
             }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while bytes
+                    .get(i)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                {
+                    i += 1;
+                }
+                on(Token::Word {
+                    text: &text[start..i],
+                });
+            }
             c => {
-                code |= !c.is_ascii_whitespace();
+                if !c.is_ascii_whitespace() {
+                    on(Token::Code);
+                }
                 i += 1;
             }
         }
     }
-
-    // A last statement with no semicolon after it.
-    if code {
-        ends.push((start, bytes.len()));
-    }
-    Ok(ends)
+    Ok(())
 }
 
 /// The `$tag$` opening at `at`, if that is what it is.
@@ -747,18 +928,121 @@ mod tests {
         assert_eq!(sql.in_source(Position::new(1, 8)), Position::new(1, 8));
     }
 
+    fn kind(text: &str) -> StatementKind {
+        one(text).expect("one statement").kind()
+    }
+
+    #[test]
+    fn a_select_reads() {
+        for read in [
+            "select 1",
+            "SELECT * FROM t",
+            "with x as (select 1) select * from x",
+            "table users",
+            "values (1), (2)",
+            "explain select * from t",
+            "show search_path",
+        ] {
+            assert_eq!(kind(read), StatementKind::Reads, "{read}");
+        }
+    }
+
+    #[test]
+    fn a_writing_word_anywhere_makes_it_a_write() {
+        // The case a first-word classifier passes: it opens with `with`, which
+        // is a read-only opener, and it writes.
+        assert_eq!(
+            kind("with x as (insert into t values (1) returning *) select * from x"),
+            StatementKind::Writes
+        );
+        // And `EXPLAIN ANALYZE` runs what it explains.
+        assert_eq!(kind("explain analyze delete from t"), StatementKind::Writes);
+        assert_eq!(kind("explain analyze select 1"), StatementKind::Writes);
+        // PostgreSQL's `SELECT … INTO` creates the table it names, and every
+        // word of it but `into` belongs to a read.
+        assert_eq!(kind("select * into copied from t"), StatementKind::Writes);
+    }
+
+    #[test]
+    fn anything_not_recognisably_a_read_is_a_write() {
+        // The direction that matters: calling a read a write costs somebody a
+        // refusal they can lift, and calling a write a read is how an agent
+        // deletes a table.
+        for write in [
+            "insert into t values (1)",
+            "delete from t",
+            "drop table t",
+            "create index on t (id)",
+            "grant select on t to nobody",
+            "vacuum",
+            "begin",
+            "set search_path = public",
+            "do $$ begin end $$",
+        ] {
+            assert_eq!(kind(write), StatementKind::Writes, "{write}");
+        }
+    }
+
+    #[test]
+    fn a_writing_word_inside_a_string_is_not_one() {
+        // The scanner does not report what is inside quotes, which is what
+        // stops a column value from reclassifying the statement.
+        assert_eq!(
+            kind("select * from t where a = 'delete'"),
+            StatementKind::Reads
+        );
+        assert_eq!(kind("select \"insert\" from t"), StatementKind::Reads);
+        assert_eq!(
+            kind("select 1 -- insert into t values (1)"),
+            StatementKind::Reads
+        );
+    }
+
+    #[test]
+    fn the_dialect_it_was_parsed_under_is_the_one_it_is_classified_under() {
+        // A statement scanned under one dialect and classified under another is
+        // one whose string literals moved — and a literal that moved is a
+        // keyword that was not one.
+        let text = "select '\\', delete_me from t";
+        assert_eq!(
+            ValidatedSql::parse(&RawSql::new(text), Escaping::None)
+                .unwrap()
+                .kind(),
+            StatementKind::Reads,
+            "`delete_me` is one word, not `delete` and `me`"
+        );
+    }
+
     #[test]
     fn a_budget_only_bites_on_a_number_that_is_money() {
         let sql = one("select 1").unwrap();
-        let over = ApprovedQuery::within(sql.clone(), None, Estimate::Bytes(2_000), Some(1_000));
+        let over = ApprovedQuery::within(
+            sql.clone(),
+            None,
+            Estimate::Bytes(2_000),
+            Some(1_000),
+            Access::ReadWrite,
+        );
         assert!(over.is_err());
 
         // Planner cost units are not money, and a fixed cutoff on them would
         // be a superstition compiled into the client.
-        let cost = ApprovedQuery::within(sql.clone(), None, Estimate::Cost(1e9), Some(1_000));
+        let cost = ApprovedQuery::within(
+            sql.clone(),
+            None,
+            Estimate::Cost(1e9),
+            Some(1_000),
+            Access::ReadWrite,
+        );
         assert_eq!(cost.unwrap().granted(), Approval::Ungated);
 
-        let under = ApprovedQuery::within(sql, None, Estimate::Bytes(10), Some(1_000));
+        let under = ApprovedQuery::within(
+            sql,
+            None,
+            Estimate::Bytes(10),
+            Some(1_000),
+            Access::ReadWrite,
+        );
         assert_eq!(under.unwrap().granted(), Approval::WithinBudget);
     }
 
@@ -768,15 +1052,53 @@ mod tests {
         // would mean nothing runs under CI at all. The budget defends only
         // where a driver volunteers a number; the type gate always holds.
         let sql = one("select 1").unwrap();
-        let q = ApprovedQuery::within(sql, None, Estimate::Unknown, Some(0)).unwrap();
+        let q = ApprovedQuery::within(sql, None, Estimate::Unknown, Some(0), Access::ReadWrite)
+            .unwrap();
         assert_eq!(q.granted(), Approval::Ungated);
     }
 
     #[test]
     fn no_budget_approves_whatever_it_costs() {
         let sql = one("select 1").unwrap();
-        let q = ApprovedQuery::within(sql, None, Estimate::Bytes(u64::MAX), None).unwrap();
+        let q = ApprovedQuery::within(
+            sql,
+            None,
+            Estimate::Bytes(u64::MAX),
+            None,
+            Access::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(q.granted(), Approval::Ungated);
+    }
+
+    #[test]
+    fn a_read_only_connection_refuses_a_write_before_it_is_costed() {
+        // Not a question of money: approving it would still be refused, and
+        // asking a person about the cost first asks the wrong question.
+        let sql = one("delete from t").unwrap();
+        let refused = ApprovedQuery::within(sql, None, Estimate::Bytes(1), None, Access::ReadOnly)
+            .unwrap_err();
+        assert!(matches!(refused, NotApproved::ReadOnly(_)), "{refused:?}");
+        assert!(refused.to_string().contains("readonly = false"));
+    }
+
+    #[test]
+    fn a_read_only_connection_still_reads() {
+        let sql = one("select * from t").unwrap();
+        assert!(
+            ApprovedQuery::within(sql, None, Estimate::Unknown, None, Access::ReadOnly).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_read_write_connection_writes() {
+        let sql = one("delete from t").unwrap();
+        assert_eq!(
+            ApprovedQuery::within(sql, None, Estimate::Unknown, None, Access::ReadWrite)
+                .unwrap()
+                .granted(),
+            Approval::Ungated
+        );
     }
 
     #[test]
@@ -784,8 +1106,16 @@ mod tests {
         // Not one rebuilt from the buffer, which after an `$EDITOR` round trip
         // need not be what the number was for.
         let sql = one("select huge from t").unwrap();
-        let refused =
-            ApprovedQuery::within(sql, Some(50), Estimate::Bytes(9), Some(1)).unwrap_err();
+        let NotApproved::OverBudget(refused) = ApprovedQuery::within(
+            sql,
+            Some(50),
+            Estimate::Bytes(9),
+            Some(1),
+            Access::ReadWrite,
+        )
+        .unwrap_err() else {
+            panic!("the budget is what refused it");
+        };
         assert_eq!(refused.budget, 1);
 
         let q = ApprovedQuery::by_hand(refused);
@@ -801,7 +1131,8 @@ mod tests {
         // and is wrong outright for a CTE ending in `INSERT … RETURNING`.
         let sql = one("with w as (insert into t values (1) returning *) select * from w").unwrap();
         let text = sql.text().to_owned();
-        let q = ApprovedQuery::within(sql, Some(10), Estimate::Unknown, None).unwrap();
+        let q = ApprovedQuery::within(sql, Some(10), Estimate::Unknown, None, Access::ReadWrite)
+            .unwrap();
         assert_eq!(q.text(), text);
     }
 }

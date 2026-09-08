@@ -67,6 +67,11 @@ pub fn mock_summary(id: &str) -> ProfileSummary {
 #[derive(Debug, Clone)]
 pub struct MockProfiles {
     profiles: Vec<ProfileSummary>,
+    /// What the profiles this hands out say they allow.
+    ///
+    /// Here rather than on [`mock_profile`] because the thing under test is
+    /// usually the store, and the store only ever sees a profile through this.
+    readonly: bool,
 }
 
 impl MockProfiles {
@@ -79,6 +84,16 @@ impl MockProfiles {
     pub fn new<'a>(ids: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
             profiles: ids.into_iter().map(mock_summary).collect(),
+            readonly: false,
+        }
+    }
+
+    /// [`Self::default`]'s single profile, marked read-only.
+    #[must_use]
+    pub fn read_only() -> Self {
+        Self {
+            readonly: true,
+            ..Self::default()
         }
     }
 }
@@ -97,7 +112,10 @@ impl Profiles for MockProfiles {
 
     fn resolve(&self, id: &ProfileId) -> Result<ResolvedProfile, ProfileError> {
         if self.profiles.iter().any(|p| &p.id == id) {
-            Ok(mock_profile(id.as_str()))
+            Ok(ResolvedProfile {
+                readonly: self.readonly,
+                ..mock_profile(id.as_str())
+            })
         } else {
             Err(ProfileError::new(format!("no profile called `{id}`")))
         }

@@ -8,6 +8,7 @@ use sqlake_core::driver::Driver;
 use sqlake_core::id::ProfileId;
 use sqlake_core::node::{NodeRef, TreeNode};
 use sqlake_core::profile::Profiles;
+use sqlake_core::sql::Access;
 
 use crate::error::{AppError, AppResult};
 use crate::session::SessionHandle;
@@ -33,6 +34,12 @@ pub struct ConnectOutput {
     pub name: String,
     pub session: SessionHandle,
     pub capabilities: Capabilities,
+    /// What this connection's profile allows.
+    ///
+    /// Carried out of here because the profile is resolved here and nowhere
+    /// else: it holds a secret, so it does not outlive this call, and
+    /// `readonly` is the one thing on it the rest of the client needs.
+    pub access: Access,
     /// The top level, fetched here so the tree is never briefly empty after a
     /// successful connection.
     pub roots: Vec<TreeNode>,
@@ -45,6 +52,11 @@ impl UseCase for Connect {
 
     async fn execute(&self, input: Self::Input) -> AppResult<Self::Output> {
         let profile = self.resolve(input.profile).await?;
+        let access = if profile.readonly {
+            Access::ReadOnly
+        } else {
+            Access::ReadWrite
+        };
         let session = SessionHandle::spawn(self.driver.connect(&profile).await?);
         let capabilities = session.capabilities();
         let roots = session.children(NodeRef::root()).await?;
@@ -52,6 +64,7 @@ impl UseCase for Connect {
             name: input.name,
             session,
             capabilities,
+            access,
             roots,
         })
     }

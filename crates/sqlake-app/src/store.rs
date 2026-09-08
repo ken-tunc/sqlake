@@ -19,7 +19,7 @@ use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
-use sqlake_core::sql::RawSql;
+use sqlake_core::sql::{Access, RawSql};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
@@ -220,6 +220,10 @@ struct Conn {
     kind: DriverKind,
     status: ConnStatus,
     capabilities: Option<Capabilities>,
+    /// What the profile allows. `ReadOnly` until the connection opens, which
+    /// is the safe answer to a question nobody can yet have asked: nothing
+    /// runs on a connection that is not open.
+    access: Access,
     session: Option<SessionHandle>,
     tree: TreeState,
     /// Cached flattening, refreshed only when the tree actually changes.
@@ -484,6 +488,7 @@ impl Runtime {
                     kind: summary.kind,
                     status: ConnStatus::Failed(err.user_message()),
                     capabilities: None,
+                    access: Access::ReadOnly,
                     session: None,
                     tree: TreeState::new(),
                     view: Arc::new(TreeView::default()),
@@ -503,6 +508,7 @@ impl Runtime {
             kind: summary.kind,
             status: ConnStatus::Connecting,
             capabilities: None,
+            access: Access::ReadOnly,
             session: None,
             tree: TreeState::new(),
             view: Arc::new(TreeView::default()),
@@ -773,9 +779,15 @@ impl Runtime {
     /// user's own ceiling, and a front-end that could name its own would be a
     /// front-end that could raise it.
     fn run_query(&mut self, conn_id: ConnId, id: QueryId, sql: String, max_rows: Option<u32>) {
-        let Some(session) = self.session(conn_id) else {
+        let Some(conn) = self.conns.iter().find(|c| c.id == conn_id) else {
             return;
         };
+        let Some(session) = conn.session.clone() else {
+            return;
+        };
+        // The connection's own, not the caller's: a front-end that could name
+        // its own would be one that could grant itself write access.
+        let access = conn.access;
         // An id already in use is a caller that lost track of one, and reusing
         // it would replace an answer somebody may still be reading.
         if self.queries.iter().any(|q| q.id == id) {
@@ -800,6 +812,7 @@ impl Runtime {
             let result = RunQuery { session }
                 .execute(RunQueryInput {
                     sql: RawSql::new(sql),
+                    access,
                     max_rows,
                     budget,
                 })
@@ -1069,6 +1082,7 @@ impl Runtime {
                     conn.name = out.name;
                     conn.status = ConnStatus::Ready;
                     conn.capabilities = Some(out.capabilities);
+                    conn.access = out.access;
                     conn.session = Some(out.session);
                     conn.tree.set_roots(out.roots);
                     conn.view = Arc::new(conn.tree.flatten(conn.id));
@@ -1495,6 +1509,63 @@ mod tests {
         )
         .await;
         assert!(snap.query(second).unwrap().data.ready().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_connection_refuses_a_write() {
+        // BigQuery has no `default_transaction_read_only`, so for it this is
+        // the only defence there is — which is why it lives here rather than
+        // being left to the server.
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::read_only()),
+            PageRequest::DEFAULT_LIMIT,
+            None,
+        );
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "delete from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+
+        let query = snap.query(id).unwrap();
+        let why = query.data.error().expect("a refusal");
+        assert!(why.contains("read-only"), "{why}");
+        // Not something to approve: no answer a person could give would make
+        // it run.
+        assert!(query.needs_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_connection_still_reads() {
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::read_only()),
+            PageRequest::DEFAULT_LIMIT,
+            None,
+        );
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+            },
+            move |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        assert!(snap.query(id).unwrap().data.ready().is_some());
     }
 
     #[tokio::test]

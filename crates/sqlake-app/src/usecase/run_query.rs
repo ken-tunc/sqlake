@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 use sqlake_core::driver::DriverError;
 use sqlake_core::result::ResultSet;
-use sqlake_core::sql::{ApprovedQuery, Estimate, InvalidSql, OverBudget, RawSql, ValidatedSql};
+use sqlake_core::sql::{
+    Access, ApprovedQuery, Estimate, InvalidSql, NotApproved, OverBudget, RawSql, ValidatedSql,
+};
 
 use crate::error::{AppError, AppResult};
 use crate::session::SessionHandle;
@@ -22,6 +24,8 @@ pub struct RunQuery {
 #[derive(Debug, Clone)]
 pub struct RunQueryInput {
     pub sql: RawSql,
+    /// What the connection's profile allows.
+    pub access: Access,
     /// Rows to fetch back, or all of them.
     pub max_rows: Option<u32>,
     /// Bytes a query may cost before somebody has to say yes, or `None` for no
@@ -65,7 +69,13 @@ impl UseCase for RunQuery {
             .await
             .map_err(|err| in_source(err, &sql))?;
 
-        match ApprovedQuery::within(sql.clone(), input.max_rows, estimate, input.budget) {
+        match ApprovedQuery::within(
+            sql.clone(),
+            input.max_rows,
+            estimate,
+            input.budget,
+            input.access,
+        ) {
             Ok(approved) => Ok(RunQueryOutput::Ran {
                 estimate,
                 result: self
@@ -74,7 +84,11 @@ impl UseCase for RunQuery {
                     .await
                     .map_err(|err| in_source(err, &sql))?,
             }),
-            Err(over) => Ok(RunQueryOutput::NeedsApproval(Box::new(over))),
+            Err(NotApproved::OverBudget(over)) => Ok(RunQueryOutput::NeedsApproval(Box::new(over))),
+            // Not a `NeedsApproval`: there is nothing to approve, and offering
+            // "run it anyway" for something no approval can allow would be a
+            // client promising what the profile forbids.
+            Err(refused @ NotApproved::ReadOnly(_)) => Err(AppError::Refused(refused.to_string())),
         }
     }
 }
@@ -155,6 +169,7 @@ mod tests {
     fn input(sql: &str, budget: Option<u64>) -> RunQueryInput {
         RunQueryInput {
             sql: RawSql::new(sql),
+            access: Access::ReadWrite,
             max_rows: None,
             budget,
         }
