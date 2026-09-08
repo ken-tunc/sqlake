@@ -46,6 +46,7 @@ sqlake api snapshot             print the live Snapshot as JSON
 sqlake api schema               print the request/response schema
 
 sqlake connection list
+sqlake connection open|close    against a session that outlives the command
 sqlake schema list              namespaces in a connection
 sqlake table list|preview
 ```
@@ -53,7 +54,6 @@ sqlake table list|preview
 Planned, with the milestone that brings each:
 
 ```
-sqlake connection open|close    A2
 sqlake table describe           M5
 sqlake query estimate|run|status|cancel|wait
                                 A2
@@ -124,11 +124,12 @@ this a clean protocol response instead of an error path with special handling.
 Agent sessions are **read-only by default**.
 
 - PostgreSQL: the connection sets `default_transaction_read_only = on`, so enforcement is the
-  server's, not ours.
-- BigQuery has no equivalent, so classification happens at `ValidatedSql`, which already
-  distinguishes single from multiple statements. Adding statement *kind* there gives a single
-  place to reject DML and DDL — and it protects the interactive client's read-only profiles
-  at the same time.
+  server's, not ours. It catches what a keyword check cannot — a `SELECT` calling a function
+  that writes.
+- BigQuery has no equivalent, so `ValidatedSql::kind` is the only defence there is. Built:
+  `ApprovedQuery::within` takes an `Access`, so a write on a read-only connection cannot reach
+  `Session::execute`. It errs towards refusing, which is a profile setting away from being
+  lifted; the other direction is how an agent deletes a table.
 
 Turning it off is per-profile and explicit: `agent = { write = true }`. There is no flag that
 grants write access for one command.

@@ -59,6 +59,17 @@ pub(crate) enum ApiCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConnectionCommand {
     List,
+    /// Open a connection to a configured profile, in a running session.
+    Open {
+        /// The profile's id, as written in `connections.toml`.
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// Close one of the session's connections.
+    ///
+    /// Which one is chosen the way every other command chooses: the session's
+    /// ready connection, narrowed by `--connect`.
+    Close,
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,6 +142,14 @@ impl Command {
             Self::Connection {
                 what: ConnectionCommand::List,
             } => Request::ConnectionList {},
+            Self::Connection {
+                what: ConnectionCommand::Open { profile },
+            } => Request::ConnectionOpen {
+                profile: profile.clone(),
+            },
+            Self::Connection {
+                what: ConnectionCommand::Close,
+            } => Request::ConnectionClose { connection },
             Self::Schema {
                 what: SchemaCommand::List,
             } => Request::NamespaceList { connection },
@@ -170,6 +189,14 @@ impl Command {
             | Self::Connection {
                 what: ConnectionCommand::List,
             } => Needs::Session,
+            // A store that dies with this process is not a session to open a
+            // connection in — see `Needs::LiveSession`.
+            Self::Connection {
+                what: ConnectionCommand::Open { .. },
+            } => Needs::LiveSession,
+            Self::Connection {
+                what: ConnectionCommand::Close,
+            } => Needs::Connection,
             Self::Schema { .. } | Self::Table { .. } => Needs::Connection,
         }
     }
@@ -182,6 +209,13 @@ pub(crate) enum Needs {
     Nothing,
     /// A session to ask. One-shot has to start one; attached already has one.
     Session,
+    /// A session that outlives the command.
+    ///
+    /// One-shot cannot answer these at all: its store dies with the process, so
+    /// a connection opened in it is one nothing can use afterwards. Refused
+    /// rather than answered, because "it worked" is the wrong thing to say
+    /// about a no-op.
+    LiveSession,
     /// A particular connection, named in the request.
     Connection,
 }
@@ -265,7 +299,9 @@ async fn attached(
     connect: Option<&ProfileId>,
 ) -> Result<Response> {
     let connection = match command.needs() {
-        Needs::Nothing | Needs::Session => String::new(),
+        // `LiveSession` among them: opening a connection names a profile, not
+        // a connection, so there is nothing to choose.
+        Needs::Nothing | Needs::Session | Needs::LiveSession => String::new(),
         Needs::Connection => {
             let open = match client.request(&Request::ConnectionList {}).await? {
                 Response::Connections(open) => open,
@@ -331,6 +367,15 @@ async fn one_shot(
 ) -> Result<Response> {
     // No budget: an agent runs nothing yet, and A2 is where the answer
     // to "who says yes for one" is decided rather than assumed here.
+    // Before the store is even started: what this refuses is not a failure of
+    // the store, and starting one to say so would open a connection first.
+    if command.needs() == Needs::LiveSession {
+        return Ok(Response::Failed(Failure::Unsupported {
+            message: "this needs a session that outlives the command — start one with \
+                      `sqlake --session <name>` and try again"
+                .to_owned(),
+        }));
+    }
     let service = Service::new(Store::spawn(drivers, profiles, page_size, None));
     let connection = if command.needs() == Needs::Nothing {
         String::new()
@@ -411,6 +456,9 @@ fn diagnostic(failure: &Failure) -> String {
         Failure::NoSuchConnection { connection } => {
             format!("no connection called `{connection}` is open")
         }
+        Failure::NoSuchProfile { profile } => {
+            format!("no profile called `{profile}` is configured in connections.toml")
+        }
         Failure::NotFound { path } => format!("`{}` is not in this connection", path.join(".")),
         Failure::Driver { message } => message.clone(),
         Failure::Timeout { waited_ms } => {
@@ -440,6 +488,60 @@ mod tests {
         Cli::try_parse_from(std::iter::once("sqlake").chain(args.iter().copied()))
             .expect("the arguments parse")
             .command
+    }
+
+    #[test]
+    fn opening_a_connection_names_a_profile_and_closing_names_a_connection() {
+        assert_eq!(
+            parse(&["connection", "open", "prod-pg"]).request(String::new()),
+            Request::ConnectionOpen {
+                profile: "prod-pg".into(),
+            }
+        );
+        // `close` takes no argument: which connection is chosen the way every
+        // other command chooses one, and `--connect` narrows it.
+        assert_eq!(
+            parse(&["connection", "close"]).request("c".into()),
+            Request::ConnectionClose {
+                connection: "c".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_refuses_to_open_a_connection_it_would_then_throw_away() {
+        // A store that dies with the process is not a session to open a
+        // connection in, and "it worked" is the wrong thing to say about a
+        // no-op.
+        let response = one_shot(
+            &parse(&["connection", "open", "mock"]),
+            Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+            Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            50,
+            None,
+        )
+        .await
+        .expect("it answers rather than erroring");
+
+        let Response::Failed(Failure::Unsupported { message }) = response else {
+            panic!("{response:?}");
+        };
+        assert!(message.contains("--session"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn one_shot_still_answers_everything_that_does_not_outlive_it() {
+        // The refusal above is about one thing, not about one-shot mode.
+        let response = one_shot(
+            &parse(&["connection", "list"]),
+            Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+            Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            50,
+            None,
+        )
+        .await
+        .expect("it answers");
+        assert!(matches!(response, Response::Connections(_)), "{response:?}");
     }
 
     #[test]

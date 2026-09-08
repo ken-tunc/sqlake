@@ -56,6 +56,24 @@ pub enum Request {
     /// Every connection currently open.
     ConnectionList {},
 
+    /// Open a connection to a configured profile.
+    ///
+    /// Only against a session that outlives the command. A one-shot run's store
+    /// dies with the process, so opening a connection in one would be a
+    /// connection nothing can use — refused rather than answered, because "it
+    /// worked" is the wrong thing to tell a caller about a no-op.
+    ConnectionOpen {
+        /// The profile's id, as written in `connections.toml`.
+        profile: String,
+    },
+
+    /// Close one of the session's connections.
+    ///
+    /// The connection's own cached tree and previews go with it. A human
+    /// sharing the session sees the tab close, which is the point of saying so
+    /// in the response rather than answering with nothing.
+    ConnectionClose { connection: String },
+
     /// The namespaces in a connection.
     ///
     /// Named for the structural level rather than the human one: a driver calls
@@ -117,6 +135,8 @@ request_kinds! {
     Snapshot       => "snapshot",
     Schema         => "schema",
     ConnectionList => "connection_list",
+    ConnectionOpen => "connection_open",
+    ConnectionClose => "connection_close",
     NamespaceList  => "namespace_list",
     TableList      => "table_list",
     TablePreview   => "table_preview",
@@ -135,6 +155,8 @@ impl Request {
             Self::Snapshot {} => RequestKind::Snapshot,
             Self::Schema {} => RequestKind::Schema,
             Self::ConnectionList {} => RequestKind::ConnectionList,
+            Self::ConnectionOpen { .. } => RequestKind::ConnectionOpen,
+            Self::ConnectionClose { .. } => RequestKind::ConnectionClose,
             Self::NamespaceList { .. } => RequestKind::NamespaceList,
             Self::TableList { .. } => RequestKind::TableList,
             Self::TablePreview { .. } => RequestKind::TablePreview,
@@ -167,6 +189,10 @@ impl Request {
 pub enum Failure {
     /// No connection with this id is open.
     NoSuchConnection { connection: String },
+    /// No profile with this id is configured. Distinct from
+    /// [`Failure::NoSuchConnection`] because the two are fixed in different
+    /// files: one is a typo in the request, the other in `connections.toml`.
+    NoSuchProfile { profile: String },
     /// The node or relation is not in the tree the connection loaded.
     NotFound { path: Vec<String> },
     /// The driver refused, or failed.
@@ -196,6 +222,11 @@ pub enum Response {
     Snapshot(SessionInfo),
     Schema(Json),
     Connections(Vec<ConnectionInfo>),
+    /// One connection, after something was done to it. Closing answers with the
+    /// closed connection rather than with nothing: a caller that asked twice
+    /// gets the same answer, and one that asked about something already gone
+    /// can tell that from a failure.
+    Connection(ConnectionInfo),
     /// The answer to both `namespace_list` and `table_list`: one level of the
     /// tree, whichever level it is. A driver's hierarchy is data, so a request
     /// per level would be a promise about depth that `Capabilities::hierarchy`
@@ -221,13 +252,14 @@ macro_rules! kinds {
     };
 }
 
-kinds!(ResponseKind: Snapshot, Schema, Connections, Nodes, Page, Failed);
+kinds!(ResponseKind: Snapshot, Schema, Connections, Connection, Nodes, Page, Failed);
 
 // One level below `ResponseKind`, because a `Failed` response is not one
 // shape: each variant carries its own fields, so a check that samples one
 // failure has looked at a sixth of what `Failed` can put on the wire.
 kinds!(
     FailureKind: NoSuchConnection,
+    NoSuchProfile,
     NotFound,
     Driver,
     Timeout,
@@ -244,6 +276,7 @@ impl Response {
             Self::Snapshot(_) => ResponseKind::Snapshot,
             Self::Schema(_) => ResponseKind::Schema,
             Self::Connections(_) => ResponseKind::Connections,
+            Self::Connection(_) => ResponseKind::Connection,
             Self::Nodes(_) => ResponseKind::Nodes,
             Self::Page(_) => ResponseKind::Page,
             Self::Failed(_) => ResponseKind::Failed,
@@ -259,6 +292,7 @@ impl Failure {
     pub const fn kind(&self) -> FailureKind {
         match self {
             Self::NoSuchConnection { .. } => FailureKind::NoSuchConnection,
+            Self::NoSuchProfile { .. } => FailureKind::NoSuchProfile,
             Self::NotFound { .. } => FailureKind::NotFound,
             Self::Driver { .. } => FailureKind::Driver,
             Self::Timeout { .. } => FailureKind::Timeout,
@@ -349,6 +383,12 @@ mod tests {
                 table: vec!["public".into(), "users".into()],
                 sort: None,
                 limit: None,
+            },
+            Request::ConnectionOpen {
+                profile: "mock".into(),
+            },
+            Request::ConnectionClose {
+                connection: "c".into(),
             },
         ];
         for request in &requests {

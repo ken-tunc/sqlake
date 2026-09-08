@@ -85,6 +85,13 @@ impl Service {
                     .map(ConnectionInfo::from)
                     .collect(),
             ),
+            Request::ConnectionOpen { profile } => {
+                self.open(profile).await.unwrap_or_else(Response::Failed)
+            }
+            Request::ConnectionClose { connection } => self
+                .close(connection)
+                .await
+                .unwrap_or_else(Response::Failed),
             Request::NamespaceList { connection } => self
                 .namespaces(connection)
                 .await
@@ -143,6 +150,76 @@ impl Service {
             }),
             _ => Ok(conn),
         }
+    }
+
+    /// Open a connection, and wait for it to finish opening.
+    ///
+    /// Waited on rather than answered straight away: `dispatch` only queues, so
+    /// returning the id immediately would hand the caller something no snapshot
+    /// has yet — and the next request would be told there is no such
+    /// connection, about the one it was just given.
+    ///
+    /// A connection that failed to open is still answered as a connection
+    /// rather than as an error. It exists, its row says why, and closing it is
+    /// something the caller may want to do.
+    async fn open(&self, profile: &str) -> Result<Response, Failure> {
+        let snapshot = self.store.snapshot();
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|p| p.id.as_str() == profile)
+            .map(|p| p.id.clone())
+            .ok_or_else(|| Failure::NoSuchProfile {
+                profile: profile.to_owned(),
+            })?;
+
+        // The id is chosen here for the same reason `Action::Connect` takes
+        // one: two connections may name the same profile, so "the one that was
+        // not there before" is not something to read out of a snapshot a person
+        // is also changing.
+        let conn = ConnId::new();
+        let settled = self
+            .dispatch_and_settle(Action::Connect { profile, conn }, move |s| {
+                s.connection_settled(conn)
+            })
+            .await?;
+        settled
+            .connection(conn)
+            .map(|c| Response::Connection(ConnectionInfo::from(c)))
+            .ok_or_else(|| Failure::NoSuchConnection {
+                connection: conn.to_string(),
+            })
+    }
+
+    /// Close a connection, and answer with what it became.
+    ///
+    /// Not [`Self::connection`], which refuses an already-closed one: closing
+    /// something twice is a caller repeating itself, and the honest answer is
+    /// the connection, closed.
+    async fn close(&self, connection: &str) -> Result<Response, Failure> {
+        let conn = self
+            .store
+            .snapshot()
+            .connections
+            .iter()
+            .find(|c| c.id.to_string() == connection)
+            .map(|c| c.id)
+            .ok_or_else(|| Failure::NoSuchConnection {
+                connection: connection.to_owned(),
+            })?;
+
+        let settled = self
+            .dispatch_and_settle(Action::Disconnect(conn), move |s| {
+                s.connection(conn)
+                    .is_none_or(|c| c.status == sqlake_app::snapshot::ConnStatus::Closed)
+            })
+            .await?;
+        settled
+            .connection(conn)
+            .map(|c| Response::Connection(ConnectionInfo::from(c)))
+            .ok_or_else(|| Failure::NoSuchConnection {
+                connection: connection.to_owned(),
+            })
     }
 
     async fn namespaces(&self, connection: &str) -> Result<Response, Failure> {
@@ -397,6 +474,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{FailureKind, ResponseKind, SortBy};
+    use crate::snapshot::Status;
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
         service_of(MockDriver::new(behaviour)).await
@@ -453,6 +531,123 @@ mod tests {
     /// [`Service::answer`] at all, so provoking failures is not a way to
     /// enumerate them: the last of each kind is constructed, which serialises
     /// identically to one that was earned.
+    #[tokio::test]
+    async fn opening_a_connection_answers_with_one_that_is_ready() {
+        let (service, first) = service(Behaviour::instant()).await;
+        let Response::Connection(opened) = service
+            .answer(&Request::ConnectionOpen {
+                profile: "mock".into(),
+            })
+            .await
+        else {
+            panic!("should have opened one");
+        };
+        // Ready, not connecting: `dispatch` only queues, so an id answered
+        // before the store had applied it would be one the next request is
+        // told does not exist.
+        assert_eq!(opened.status, Status::Ready);
+        assert_ne!(opened.id, first, "a second connection, not the first again");
+
+        let Response::Connections(open) = service.answer(&Request::ConnectionList {}).await else {
+            panic!("should have listed them");
+        };
+        assert_eq!(open.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_profile_nobody_configured_is_named_as_a_profile() {
+        // Not `NoSuchConnection`: the two are fixed in different files.
+        let (service, _) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::ConnectionOpen {
+                profile: "nope".into(),
+            })
+            .await;
+        assert!(
+            matches!(
+                answer,
+                Response::Failed(Failure::NoSuchProfile { ref profile }) if profile == "nope"
+            ),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_will_not_open_is_still_a_connection() {
+        // It exists, its row says why, and closing it is something a caller
+        // may want to do — so the answer is the connection rather than an
+        // error about it.
+        let (service, _) = service(Behaviour {
+            connect_fails: true,
+            ..Behaviour::instant()
+        })
+        .await;
+        let Response::Connection(opened) = service
+            .answer(&Request::ConnectionOpen {
+                profile: "mock".into(),
+            })
+            .await
+        else {
+            panic!("should have answered with the connection");
+        };
+        assert!(matches!(opened.status, Status::Failed { .. }), "{opened:?}");
+    }
+
+    #[tokio::test]
+    async fn closing_says_what_the_connection_became() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let close = Request::ConnectionClose {
+            connection: conn.clone(),
+        };
+
+        let Response::Connection(gone) = service.answer(&close).await else {
+            panic!("should have closed it");
+        };
+        assert_eq!(gone.status, Status::Closed);
+
+        // Twice is a caller repeating itself, and the honest answer is the
+        // connection, closed — not a failure about something that is there.
+        let Response::Connection(again) = service.answer(&close).await else {
+            panic!("closing twice should answer the same way");
+        };
+        assert_eq!(again.status, Status::Closed);
+    }
+
+    #[tokio::test]
+    async fn closing_something_that_was_never_open_is_a_failure() {
+        let (service, _) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::ConnectionClose {
+                connection: "not-an-id".into(),
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::NoSuchConnection { .. })),
+            "{answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_takes_its_tree_with_it() {
+        // What a caller has to be able to see: reading through a connection
+        // after closing it is a failure rather than an empty database.
+        let (service, conn) = service(Behaviour::instant()).await;
+        let _ = service
+            .answer(&Request::ConnectionClose {
+                connection: conn.clone(),
+            })
+            .await;
+        let answer = service
+            .answer(&Request::NamespaceList {
+                connection: conn.clone(),
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Driver { .. })),
+            "{answer:?}"
+        );
+    }
+
     #[tokio::test]
     async fn no_response_carries_a_credential() {
         fn keys(value: &Json, into: &mut BTreeSet<String>) {
@@ -519,6 +714,15 @@ mod tests {
                 .await,
         );
 
+        // Opening and closing, which are the only way to reach `Connection`.
+        responses.push(
+            session
+                .answer(&Request::ConnectionOpen {
+                    profile: "mock".into(),
+                })
+                .await,
+        );
+
         // A connection that failed to open, for `Status::Failed`'s reason.
         let (broken, _) = service(Behaviour {
             connect_fails: true,
@@ -531,6 +735,9 @@ mod tests {
         for failure in [
             Failure::NoSuchConnection {
                 connection: "id".into(),
+            },
+            Failure::NoSuchProfile {
+                profile: "prod".into(),
             },
             Failure::NotFound {
                 path: vec!["public".into()],
