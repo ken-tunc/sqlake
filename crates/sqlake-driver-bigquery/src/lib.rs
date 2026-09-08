@@ -51,6 +51,7 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     // The one physical-layout feature BigQuery has, and the one that decides
     // what a query costs.
     partitioning: true,
+    clustering: true,
     transactions: false,
     // False, and this is the honest answer rather than an oversight. Cancelling
     // a BigQuery job means `jobs.cancel` with its id, and the synchronous

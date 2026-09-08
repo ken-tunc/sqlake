@@ -77,6 +77,14 @@ pub struct Capabilities {
     pub triggers: bool,
     pub constraints: bool,
     pub partitioning: bool,
+    /// The driver keeps a clustering or sort order, and a definition can show
+    /// it.
+    ///
+    /// Separate from [`Capabilities::partitioning`] because BigQuery has both
+    /// and they are different questions: partitioning decides which files a
+    /// query reads, clustering decides the order inside one. PostgreSQL has
+    /// neither under this name.
+    pub clustering: bool,
     pub transactions: bool,
     /// Cancelling reaches the server.
     ///
@@ -134,6 +142,7 @@ mod tests {
         triggers: true,
         constraints: true,
         partitioning: true,
+        clustering: false,
         transactions: true,
         cancel: true,
         streaming: true,
@@ -154,6 +163,7 @@ mod tests {
         triggers: false,
         constraints: false,
         partitioning: true,
+        clustering: true,
         transactions: false,
         cancel: false,
         streaming: true,

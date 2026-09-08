@@ -39,35 +39,39 @@ pub struct DetailSection {
     pub table: ResultSet,
 }
 
-/// The statement that would create this relation.
+/// The statement that would create this relation, as this client built it.
 ///
-/// The two kinds are kept apart in the type rather than in a sentence next to
-/// it, because the difference is the whole of what a reader needs and a string
-/// loses it: one is what the server says, and the other is this client's
-/// reading of a catalogue.
+/// Always built here, which is why there is no variant saying otherwise.
+/// Neither server hands one over for free: PostgreSQL has no `SHOW CREATE
+/// TABLE`, and BigQuery's is in `INFORMATION_SCHEMA.TABLES.ddl`, which is a
+/// billed query — issued from a call that takes no `ApprovedQuery`, it would
+/// be the one place SQL runs without the gate. Even a view's body, which both
+/// servers do hand over, arrives as a `SELECT` with the `CREATE VIEW` around
+/// it added here.
+///
+/// So a front-end showing this has to say it was generated. Correct as far as
+/// it goes and never further: somebody who copies it and runs it gets what it
+/// covers rather than what is there, and the covered set is the driver's to
+/// state.
+///
+/// A newtype rather than a `String` so that "this is generated" travels with
+/// the text instead of being remembered at each place it is drawn. A driver
+/// whose server hands over a whole statement would be the reason to bring back
+/// a second variant — there is no such driver, and adding one for it now would
+/// be a distinction nothing makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ddl {
-    /// What the server itself reports — BigQuery's `INFORMATION_SCHEMA`.
-    Reported(String),
-    /// Built from the catalogue by this client, because the server offers
-    /// nothing. Correct as far as it goes and never further: a front-end
-    /// showing this has to say so, since somebody who copies it and runs it
-    /// gets what it covers rather than what is there.
-    Generated(String),
-}
+pub struct Ddl(String);
 
 impl Ddl {
+    /// Built from the catalogue by this client.
     #[must_use]
-    pub fn text(&self) -> &str {
-        match self {
-            Self::Reported(text) | Self::Generated(text) => text,
-        }
+    pub fn generated(text: impl Into<String>) -> Self {
+        Self(text.into())
     }
 
-    /// Whether this came from the server rather than from here.
     #[must_use]
-    pub const fn is_reported(&self) -> bool {
-        matches!(self, Self::Reported(_))
+    pub fn text(&self) -> &str {
+        &self.0
     }
 }
 
@@ -151,13 +155,11 @@ mod tests {
     }
 
     #[test]
-    fn where_the_ddl_came_from_survives_being_read() {
-        // A string would lose it, and losing it is how a reconstruction gets
-        // copied and run as though it were the real thing.
-        let reported = Ddl::Reported("CREATE TABLE t (…)".to_owned());
-        let generated = Ddl::Generated("CREATE TABLE t (…)".to_owned());
-        assert_eq!(reported.text(), generated.text());
-        assert!(reported.is_reported());
-        assert!(!generated.is_reported());
+    fn ddl_is_a_type_rather_than_a_string() {
+        // So that "this was generated" travels with the text rather than being
+        // remembered at each place it is drawn — which is how a reconstruction
+        // gets copied and run as though it were the real thing.
+        let ddl = Ddl::generated("CREATE TABLE t (…)");
+        assert_eq!(ddl.text(), "CREATE TABLE t (…)");
     }
 }

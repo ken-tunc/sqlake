@@ -74,10 +74,17 @@ Where a driver's page already knows, `describe` must agree with it: the BigQuery
 asserts that `REQUIRED` is reported as `NOT NULL`, and a `describe` that came back with
 anything else would be a contradiction inside one driver.
 
-**D4 — DDL is generated, and labelled as generated.** BigQuery has real DDL in
-`INFORMATION_SCHEMA.TABLES.ddl` and PostgreSQL has nothing: `pg_dump` is a subprocess this
-client will not spawn, and there is no `SHOW CREATE TABLE`. So PostgreSQL's is reconstructed
-from the catalogue.
+**D4 — DDL is generated, and labelled as generated.** For *both* drivers, which is a correction
+to what this said before T3 went looking. PostgreSQL has nothing: `pg_dump` is a subprocess this
+client will not spawn, and there is no `SHOW CREATE TABLE`. BigQuery has real DDL in
+`INFORMATION_SCHEMA.TABLES.ddl` — and reading it is a *query*, billed with a ten-megabyte
+minimum, issued from a call that takes no `ApprovedQuery`. That would make `describe` the one
+place in this client where SQL runs without the gate design.md §4.1 is about, to fetch
+something nobody asked for.
+
+So `Ddl` is a newtype rather than the enum it briefly was: nothing reports, and a variant for
+a case no driver produces is a distinction nothing makes. Even a view's body, which both
+servers hand over for free, arrives as a `SELECT` with the `CREATE VIEW` around it added here.
 
 Reconstruction that is quietly wrong is worse than none — somebody copies it, runs it, and gets
 a different table. So it is never presented as what was typed: the pane says it was built from
