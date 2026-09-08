@@ -494,20 +494,27 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         match snapshot.definition(*conn, table).map(|d| &d.data) {
             Some(sqlake_app::snapshot::LoadState::Ready(ready)) => {
                 let held = Arc::clone(ready);
-                let definition = ui.laid(id, &held).clone();
-                let definition = &definition;
-                // The list first, because what is left of the pane is what the
-                // grid gets — and working that out twice is how the two come
-                // to disagree.
-                // Clamped here as well as where it is picked: a refresh can
-                // come back with fewer sections than the tab was on, and an
-                // index past the end draws an empty pane with nothing in it
-                // saying why.
-                let section = section.min(definition.titles().len().saturating_sub(1));
-                let body = crate::definition::sections(frame, hits, grid, definition, section);
-                let summary = crate::definition::summary(definition);
-                let rows = definition.rows(section).map(Arc::clone);
-                let statement = definition.statement(section).map(|d| d.text().to_owned());
+                ui.lay_out(id, &held);
+                // Everything the layout is asked for happens here, while the
+                // borrow of it is shared; the calls below need `&mut ui` and
+                // would otherwise cost a clone of the whole thing each frame.
+                let (body, summary, rows, statement) = {
+                    let definition = ui.laid(id).expect("just laid out");
+                    // The list first, because what is left of the pane is what
+                    // the grid gets — and working that out twice is how the
+                    // two come to disagree.
+                    // Clamped here as well as where it is picked: a refresh can
+                    // come back with fewer sections than the tab was on, and an
+                    // index past the end draws an empty pane with nothing in it
+                    // saying why.
+                    let section = section.min(definition.titles().len().saturating_sub(1));
+                    (
+                        crate::definition::sections(frame, hits, grid, definition, section),
+                        crate::definition::summary(definition),
+                        definition.rows(section).map(Arc::clone),
+                        definition.statement(section).map(|d| d.text().to_owned()),
+                    )
+                };
                 let body = chrome::caption(frame, body, &summary);
                 // One or the other: `rows` is `None` for the DDL section and
                 // `statement` is `None` for every other, which is what stops

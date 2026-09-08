@@ -173,14 +173,9 @@ pub enum Request {
         /// Here and not on `table_preview`, where a page is re-fetched by
         /// paging anyway: a definition is fetched once, so a relation altered
         /// since would otherwise stay wrong for as long as the session lives.
-        #[serde(default, skip_serializing_if = "is_false")]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         refresh: bool,
     },
-}
-
-/// `skip_serializing_if` hands a reference, and `Not::not` takes a value.
-fn is_false(flag: &bool) -> bool {
-    !*flag
 }
 
 /// Generates the kind enum and its complete list together, so the two cannot

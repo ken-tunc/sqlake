@@ -742,7 +742,7 @@ impl UiState {
     /// have nothing to do with this tab — a spinner tick will do it — and
     /// laying out every column again on each one is work with nothing to show
     /// for it.
-    pub fn laid(&mut self, tab: TabId, detail: &Arc<TableDetail>) -> &Laid {
+    pub fn lay_out(&mut self, tab: TabId, detail: &Arc<TableDetail>) {
         let stale = self
             .laid
             .get(&tab)
@@ -751,7 +751,17 @@ impl UiState {
             self.laid
                 .insert(tab, (Arc::clone(detail), Laid::out(detail)));
         }
-        &self.laid.get(&tab).expect("just built when it was stale").1
+    }
+
+    /// What [`UiState::lay_out`] built for this tab, if it has been asked for.
+    ///
+    /// Separate from building it so the draw pass can read the layout through
+    /// a shared borrow — one `&mut self` that stayed alive across the whole
+    /// pane would have to be paid for with a clone of everything in it, the
+    /// generated statement included.
+    #[must_use]
+    pub fn laid(&self, tab: TabId) -> Option<&Laid> {
+        self.laid.get(&tab).map(|(_, laid)| laid)
     }
 
     /// Whether the active definition tab is on its generated statement, which
@@ -1277,12 +1287,12 @@ impl UiState {
         // Counted from the rectangle that is there rather than the one asked
         // for: a selection outlives a result that shrank under it, and the
         // count is what the message claims was sent.
-        let Some(area) = crate::copy::clamped(rows, asked) else {
+        let Some(area) = crate::copy::clamped(&rows, asked) else {
             self.push_toast(Severity::Info, "nothing to copy");
             return;
         };
 
-        let text = crate::copy::render(rows, format, area);
+        let text = crate::copy::render(&rows, format, area);
         let cells = (area.2 - area.0 + 1) * (area.3 - area.1 + 1);
         match crate::copy::sequence(&text) {
             Ok(sequence) => {
@@ -1385,26 +1395,30 @@ impl UiState {
     ///
     /// `None` covers a real frame: a tab opened this tick has nothing in the
     /// snapshot until the store answers.
-    fn rows_of<'a>(&'a self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
+    fn rows_of(&self, snapshot: &Snapshot) -> Option<Arc<PagedResult>> {
         let tab = self.active_tab?;
         let open = self.tabs.iter().find(|t| t.id == tab)?;
         match &open.content {
-            TabContent::Preview(table) => snapshot.preview(open.conn, table)?.data.ready(),
+            TabContent::Preview(table) => snapshot.preview(open.conn, table)?.data.ready().cloned(),
             // A run this screen started. `None` while it is still running, or
             // before there has been one, which is what makes the pane show the
             // buffer instead.
-            TabContent::Sql { query, .. } => snapshot.query((*query)?)?.data.ready(),
+            TabContent::Sql { query, .. } => snapshot.query((*query)?)?.data.ready().cloned(),
             // The section this tab is looking at, which is a different grid
             // per tab even for the same relation.
-            // Read out of the layout the last draw built rather than laying
-            // the detail out again: this is on the path of every scroll and
-            // click, and `&self` could not cache what it built anyway. A
-            // definition whose detail arrived after that draw has no rows here
-            // for one frame, which is a frame nobody can have scrolled in yet.
             TabContent::Definition { table, section } => {
                 let detail = snapshot.definition(open.conn, table)?.data.ready()?;
-                let (held, laid) = self.laid.get(&tab)?;
-                Arc::ptr_eq(held, detail).then(|| laid.rows(*section))?
+                match self.laid.get(&tab) {
+                    // What the last draw built, when it was built from this
+                    // same detail.
+                    Some((held, laid)) if Arc::ptr_eq(held, detail) => laid.rows(*section).cloned(),
+                    // And otherwise laid out here, thrown away, and built
+                    // again by the next draw — which is the whole cost, and is
+                    // paid once per refresh rather than per event. Returning
+                    // nothing instead would drop a scroll or a copy already
+                    // queued behind a `--refresh`, silently.
+                    _ => Laid::out(detail).rows(*section).cloned(),
+                }
             }
         }
     }
@@ -1427,7 +1441,6 @@ impl UiState {
         let Some(rows) = self.rows_of(snapshot) else {
             return 0;
         };
-        let rows = Arc::clone(rows);
         let Some(tab) = self.active_tab else {
             return 0;
         };
@@ -1890,7 +1903,7 @@ mod tests {
     fn a_resized_column_keeps_its_width() {
         let (snap, mut ui) = setup(0, 10, 3);
         let natural = {
-            let rows = ui.rows_of(&snap).unwrap().clone();
+            let rows = ui.rows_of(&snap).unwrap();
             ui.grid_mut(TabId::new(1)).grid(&rows).columns()[1].natural_width
         };
         let _ = ui.apply(ViewCmd::ResizeColumn { col: 1, delta: 5 }, &snap);
@@ -1915,7 +1928,7 @@ mod tests {
     #[test]
     fn the_rendered_grid_is_built_once_per_page() {
         let (snap, mut ui) = setup(0, 10, 2);
-        let rows = ui.rows_of(&snap).unwrap().clone();
+        let rows = ui.rows_of(&snap).unwrap();
         let first = ui.grid_mut(TabId::new(1)).grid(&rows) as *const RenderedGrid;
         let again = ui.grid_mut(TabId::new(1)).grid(&rows) as *const RenderedGrid;
         assert_eq!(first, again, "an unchanged snapshot must not rebuild it");
@@ -2195,6 +2208,49 @@ mod tests {
         );
         // Twenty lines in a pane four tall: sixteen is the last screenful.
         assert_eq!(ui.sql_offset(), 16);
+    }
+
+    #[test]
+    fn a_definition_answers_for_a_scroll_no_draw_has_seen_yet() {
+        // The layout is built during the draw, and events queued behind a
+        // `--refresh` are handled before the next one. Reading only what the
+        // last draw built would answer "no rows" here, which clamps the grid
+        // to the top and makes a copy do nothing at all — silently, since
+        // neither says why it found nothing.
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let detail = |name: &str| {
+            Arc::new(sqlake_core::detail::TableDetail::new(
+                table(),
+                sqlake_core::node::RelationKind::Table,
+                vec![sqlake_core::detail::ColumnDef {
+                    name: name.to_owned(),
+                    type_name: "integer".to_owned(),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                }],
+            ))
+        };
+        snap.definitions.push(sqlake_app::snapshot::DefinitionView {
+            conn,
+            table: table(),
+            data: LoadState::Ready(detail("id")),
+        });
+
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::OpenDefinition {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        assert_eq!(ui.row_count(&snap), 1, "before the first draw");
+
+        // What a refresh does: the same table, a different `Arc`.
+        snap.definitions[0].data = LoadState::Ready(detail("renamed"));
+        assert_eq!(ui.row_count(&snap), 1, "after the detail was replaced");
     }
 
     #[test]
