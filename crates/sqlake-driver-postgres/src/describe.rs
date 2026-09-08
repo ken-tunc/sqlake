@@ -33,6 +33,13 @@ const RELATION: &str = "\
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
     WHERE n.nspname = $1 AND c.relname = $2";
 
+/// A generated or identity column has no default, whatever `pg_attrdef` holds
+/// for it. `pg_get_expr` on a `GENERATED ALWAYS AS (…) STORED` column returns
+/// the generation expression, and writing that out as `DEFAULT <expr>` is a
+/// statement that runs and produces a column which is neither generated nor an
+/// identity — a lie rather than a gap. Omitted here so the definition and the
+/// DDL are both merely incomplete about it, which is what §D4's list says.
+///
 /// `attnum > 0` skips the system columns — `ctid`, `xmin` and the rest — which
 /// exist on every table and are nobody's schema. `NOT attisdropped` skips
 /// columns a `DROP COLUMN` left behind: PostgreSQL keeps the slot, and showing
@@ -41,7 +48,8 @@ const COLUMNS: &str = "\
     SELECT a.attname, \
            pg_catalog.format_type(a.atttypid, a.atttypmod), \
            NOT a.attnotnull, \
-           pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
+           CASE WHEN a.attgenerated = '' AND a.attidentity = '' \
+                THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid) END, \
            col_description(a.attrelid, a.attnum) \
     FROM pg_catalog.pg_attribute a \
     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
@@ -139,9 +147,10 @@ pub async fn describe(
         .ok_or_else(|| DriverError::NotFound(table.to_string()))?;
     let columns = columns.map_err(query)?;
 
+    let relkind: i8 = relation.get(0);
     let mut detail = TableDetail::new(
         table.clone(),
-        crate::catalog::relation_kind(relation.get(0)),
+        crate::catalog::relation_kind(relkind),
         columns
             .iter()
             .map(|row| ColumnDef {
@@ -183,8 +192,23 @@ pub async fn describe(
     {
         detail.sections.push(section);
     }
-    detail.ddl = ddl(&schema, &name, &detail, view_body.as_deref());
+    if has_ddl(relkind) {
+        detail.ddl = ddl(&schema, &name, &detail, view_body.as_deref());
+    }
     Ok(detail)
+}
+
+/// Whether a statement can be built for this `relkind` at all.
+///
+/// On the letter rather than on [`RelationKind`]: `relation_kind` calls
+/// everything it does not recognise a table, so an index, a sequence or a
+/// composite type would otherwise come back as a `CREATE TABLE` built out of
+/// the columns `pg_attribute` keeps for it.
+fn has_ddl(relkind: i8) -> bool {
+    matches!(
+        u8::try_from(relkind).map(char::from),
+        Ok('r' | 'p' | 'v' | 'm')
+    )
 }
 
 /// The statement that would recreate this relation, built from the catalogue.
@@ -200,7 +224,9 @@ pub async fn describe(
 ///
 /// **What it does not**: storage parameters, tablespaces, collations, partition
 /// bounds and the `PARTITION BY` clause itself, inheritance, row-level
-/// security, rules, and anything an extension added. A table using any of them
+/// security, rules, generated and identity columns — which come out as plain
+/// ones rather than as wrong ones, see `COLUMNS` — and anything an extension
+/// added. A table using any of them
 /// comes back as a statement that runs and produces something subtly
 /// different — which is why the type is [`Ddl`] rather than a string, and why
 /// a front-end showing it has to say it was generated.
@@ -219,9 +245,10 @@ fn ddl(schema: &str, name: &str, detail: &TableDetail, view_body: Option<&str>) 
             body.trim_end()
         )));
     }
-    // Only a table has columns to write out. A foreign table's options and an
-    // index's own relation are not something this can reconstruct, and a
-    // half-statement is worse than none.
+    // Only a table has columns to write out. A foreign table's options are not
+    // something this can reconstruct, and a half-statement is worse than none.
+    // The relations `relation_kind` cannot name — an index, a sequence — are
+    // stopped by the caller, which still has the `relkind` letter.
     if detail.kind != RelationKind::Table || detail.columns.is_empty() {
         return None;
     }
@@ -506,6 +533,16 @@ mod tests {
     }
 
     #[test]
+    fn a_generated_column_has_no_default_to_write_out() {
+        // `pg_get_expr` on a generated column returns the *generation*
+        // expression, and `DEFAULT <that>` is a statement that runs and builds
+        // a column which is neither generated nor an identity. Omitting is a
+        // gap; emitting it is a lie.
+        assert!(COLUMNS.contains("a.attgenerated = ''"));
+        assert!(COLUMNS.contains("a.attidentity = ''"));
+    }
+
+    #[test]
     fn an_identifier_is_always_quoted() {
         // Deciding per name is how a table called `order` ends up in a
         // statement that will not parse, and a name that did not need it is
@@ -514,6 +551,19 @@ mod tests {
         assert_eq!(quoted("order"), "\"order\"");
         // A quote inside a name is doubled, which is the standard escape.
         assert_eq!(quoted("od\"d"), "\"od\"\"d\"");
+    }
+
+    #[test]
+    fn a_relation_that_is_not_one_of_the_four_gets_no_statement() {
+        // `relation_kind` calls an index and a sequence tables, so without the
+        // letter a `CREATE TABLE` would be built out of `pg_attribute`'s idea
+        // of their columns.
+        for letter in *b"iSct" {
+            assert!(!has_ddl(letter as i8), "{}", letter as char);
+        }
+        for letter in *b"rpvm" {
+            assert!(has_ddl(letter as i8), "{}", letter as char);
+        }
     }
 
     #[test]

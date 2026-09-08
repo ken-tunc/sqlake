@@ -304,7 +304,9 @@ impl Definition {
     /// the SQL tab.
     #[must_use]
     pub fn statement(&self, index: usize) -> Option<&Ddl> {
-        (index == self.titles().len() - 1)
+        // The index [`Definition::titles`] puts it at, worked out rather than
+        // built: the list is allocated, and this is asked once a frame.
+        (index == self.sections.len() + 1)
             .then_some(self.ddl.as_ref())
             .flatten()
     }
