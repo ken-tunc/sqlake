@@ -72,9 +72,15 @@ fn detail(table: &TableRef, described: &Table) -> TableDetail {
 
 /// The numbers worth showing, and only the ones that are there.
 ///
-/// A row missing is how "this table does not report it" is said: a view has no
-/// byte count, and `0 B` would be a claim about storage rather than an absence
-/// of one.
+/// A field that is absent or empty is left out rather than shown as zero,
+/// because "this table does not report it" and "this table has none" are
+/// different answers.
+///
+/// A field reported *as* `"0"` is shown, and that is deliberate rather than
+/// settled: an empty table's `Rows 0` is real, and whether a view's
+/// `tables.get` omits these or answers zero is not something this driver has
+/// been able to check against the API. Filtering zero to tidy up a view would
+/// hide the empty table's count on a guess.
 fn stats(described: &Table) -> Vec<(String, String)> {
     let mut stats = Vec::new();
     if let Some(rows) = described.num_rows.as_ref().filter(|n| !n.is_empty()) {
@@ -159,8 +165,8 @@ mod tests {
 
     #[test]
     fn a_number_this_table_does_not_report_is_left_out() {
-        // `0 B` would be a claim about storage rather than an absence of one,
-        // and a view genuinely has neither.
+        // Absent and empty are both "it did not say", which is not the same
+        // answer as zero.
         let view = detail(
             &users(),
             &described(serde_json::json!({

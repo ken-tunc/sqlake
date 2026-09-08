@@ -17,9 +17,9 @@ use tokio_postgres::Client;
 
 /// The relation itself: what kind it is, and its comment.
 ///
-/// `to_regclass` rather than a join on name: it resolves exactly the way the
-/// server would resolve the name in a query, and answers `NULL` for something
-/// that is not there instead of no rows for something ambiguous.
+/// Matched on `nspname` and `relname` rather than resolved through the search
+/// path: the caller already names the schema, so `to_regclass` would only add
+/// a way for a name to resolve to a relation somewhere else.
 const RELATION: &str = "\
     SELECT c.relkind, obj_description(c.oid, 'pg_class') \
     FROM pg_catalog.pg_class c \
@@ -44,8 +44,12 @@ const COLUMNS: &str = "\
       AND a.attnum > 0 AND NOT a.attisdropped \
     ORDER BY a.attnum";
 
-pub async fn describe(client: &Client, table: &TableRef) -> DriverResult<TableDetail> {
-    let (schema, name) = split(table)?;
+pub async fn describe(
+    client: &Client,
+    database: &str,
+    table: &TableRef,
+) -> DriverResult<TableDetail> {
+    let (schema, name) = split(database, table)?;
 
     // Together: neither answer feeds the other, and a definition is two round
     // trips either way.
@@ -81,12 +85,20 @@ pub async fn describe(client: &Client, table: &TableRef) -> DriverResult<TableDe
 
 /// The schema and relation names out of a path.
 ///
-/// The database segment is dropped rather than checked: PostgreSQL has no
-/// cross-database queries, so a path naming another one could not be answered
-/// over this connection anyway — and the tree only ever offers this one.
-fn split(table: &TableRef) -> DriverResult<(String, String)> {
+/// A path naming another database is refused rather than answered about this
+/// one: PostgreSQL has no cross-database queries, so it needs another
+/// connection, and dropping the segment instead would describe a same-named
+/// relation here as though it were the one that was asked for. [`crate::preview`]
+/// refuses it for the same reason.
+fn split(database: &str, table: &TableRef) -> DriverResult<(String, String)> {
     match table.path.as_slice() {
-        [_, schema, name] | [schema, name] => Ok((schema.clone(), name.clone())),
+        [db, schema, name] if db == database => Ok((schema.clone(), name.clone())),
+        [db, _, _] => Err(DriverError::NotFound(format!(
+            "{table} is in database `{db}`, and this connection is to `{database}`"
+        ))),
+        // Two segments are already about this connection, so there is nothing
+        // to disagree with.
+        [schema, name] => Ok((schema.clone(), name.clone())),
         _ => Err(DriverError::NotFound(format!(
             "`{table}` does not name a relation"
         ))),
@@ -107,17 +119,32 @@ mod tests {
         // mean the relation on this connection.
         let with = TableRef::new(["app", "public", "users"]);
         let without = TableRef::new(["public", "users"]);
-        assert_eq!(split(&with).unwrap(), split(&without).unwrap());
         assert_eq!(
-            split(&with).unwrap(),
+            split("app", &with).unwrap(),
+            split("app", &without).unwrap()
+        );
+        assert_eq!(
+            split("app", &with).unwrap(),
             ("public".to_owned(), "users".to_owned())
         );
     }
 
     #[test]
+    fn a_path_naming_another_database_is_refused() {
+        // Dropping the segment would answer about `app.public.users` under the
+        // name `other.public.users`: the wrong relation, reported as the right
+        // one. `preview` refuses the same path rather than paging it.
+        let err = split("app", &TableRef::new(["other", "public", "users"])).unwrap_err();
+        assert!(matches!(err, DriverError::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
     fn a_path_that_names_no_relation_is_refused_before_a_query() {
         for path in [vec!["public"], vec![], vec!["a", "b", "c", "d"]] {
-            assert!(split(&TableRef::new(path.clone())).is_err(), "{path:?}");
+            assert!(
+                split("app", &TableRef::new(path.clone())).is_err(),
+                "{path:?}"
+            );
         }
     }
 

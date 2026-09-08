@@ -231,7 +231,7 @@ impl Session for PgSession {
 
     async fn describe(&self, table: &TableRef) -> DriverResult<TableDetail> {
         let _running = self.cancels.lock().await;
-        describe::describe(&self.client, table).await
+        describe::describe(&self.client, &self.database, table).await
     }
 
     async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {
