@@ -132,14 +132,14 @@ macro_rules! request_kinds {
 }
 
 request_kinds! {
-    Snapshot       => "snapshot",
-    Schema         => "schema",
-    ConnectionList => "connection_list",
-    ConnectionOpen => "connection_open",
+    Snapshot        => "snapshot",
+    Schema          => "schema",
+    ConnectionList  => "connection_list",
+    ConnectionOpen  => "connection_open",
     ConnectionClose => "connection_close",
-    NamespaceList  => "namespace_list",
-    TableList      => "table_list",
-    TablePreview   => "table_preview",
+    NamespaceList   => "namespace_list",
+    TableList       => "table_list",
+    TablePreview    => "table_preview",
 }
 
 impl Request {

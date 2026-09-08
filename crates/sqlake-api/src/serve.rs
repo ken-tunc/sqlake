@@ -120,15 +120,14 @@ impl Service {
         }
     }
 
-    /// The connection this request names, once it has finished opening.
+    /// The connection this request names, whatever state it is in.
     ///
     /// Resolved by comparing the id it prints rather than by parsing one: an id
     /// that is well formed but not open and an id that is not an id at all are
     /// the same answer to the caller, and only one of the two would survive a
     /// parse.
-    async fn connection(&self, id: &str) -> Result<ConnId, Failure> {
-        let conn = self
-            .store
+    fn conn_id(&self, id: &str) -> Result<ConnId, Failure> {
+        self.store
             .snapshot()
             .connections
             .iter()
@@ -136,7 +135,13 @@ impl Service {
             .map(|c| c.id)
             .ok_or_else(|| Failure::NoSuchConnection {
                 connection: id.to_owned(),
-            })?;
+            })
+    }
+
+    /// The connection this request names, once it has finished opening, and
+    /// only if it is in a state that can answer.
+    async fn connection(&self, id: &str) -> Result<ConnId, Failure> {
+        let conn = self.conn_id(id)?;
         let settled = self.settle(|s| s.connection_settled(conn)).await?;
         match settled.connection(conn).map(|c| &c.status) {
             Some(sqlake_app::snapshot::ConnStatus::Failed(why)) => Err(Failure::Driver {
@@ -197,17 +202,7 @@ impl Service {
     /// something twice is a caller repeating itself, and the honest answer is
     /// the connection, closed.
     async fn close(&self, connection: &str) -> Result<Response, Failure> {
-        let conn = self
-            .store
-            .snapshot()
-            .connections
-            .iter()
-            .find(|c| c.id.to_string() == connection)
-            .map(|c| c.id)
-            .ok_or_else(|| Failure::NoSuchConnection {
-                connection: connection.to_owned(),
-            })?;
-
+        let conn = self.conn_id(connection)?;
         let settled = self
             .dispatch_and_settle(Action::Disconnect(conn), move |s| {
                 s.connection(conn)
@@ -714,7 +709,8 @@ mod tests {
                 .await,
         );
 
-        // Opening and closing, which are the only way to reach `Connection`.
+        // Opening, which is one of the two ways to reach `Connection`; closing
+        // answers with the same shape.
         responses.push(
             session
                 .answer(&Request::ConnectionOpen {
