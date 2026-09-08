@@ -10,9 +10,11 @@
 //! knows, and a `NOT NULL` nobody is shown is a constraint they do not know
 //! they have.
 
-use sqlake_core::detail::{ColumnDef, DetailSection, TableDetail};
+use sqlake_core::capability::QuoteStyle;
+use sqlake_core::detail::{ColumnDef, Ddl, DetailSection, TableDetail};
 use sqlake_core::driver::{DriverError, DriverResult};
-use sqlake_core::node::TableRef;
+use sqlake_core::ident::Ident;
+use sqlake_core::node::{RelationKind, TableRef};
 use sqlake_core::result::{Column, ResultSet, Row};
 use sqlake_core::value::Value;
 use tokio_postgres::Client;
@@ -23,7 +25,10 @@ use tokio_postgres::Client;
 /// path: the caller already names the schema, so `to_regclass` would only add
 /// a way for a name to resolve to a relation somewhere else.
 const RELATION: &str = "\
-    SELECT c.relkind, obj_description(c.oid, 'pg_class') \
+    SELECT c.relkind, \
+           obj_description(c.oid, 'pg_class'), \
+           CASE WHEN c.relkind IN ('v', 'm') \
+                THEN pg_catalog.pg_get_viewdef(c.oid, true) END \
     FROM pg_catalog.pg_class c \
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
     WHERE n.nspname = $1 AND c.relname = $2";
@@ -151,6 +156,7 @@ pub async fn describe(
             .collect(),
     );
     detail.comment = relation.get(1);
+    let view_body: Option<String> = relation.get(2);
 
     // Four more, together. Each is one index scan and none feeds another, so
     // the four of them cost one round trip rather than four. They wait for the
@@ -177,7 +183,126 @@ pub async fn describe(
     {
         detail.sections.push(section);
     }
+    detail.ddl = ddl(&schema, &name, &detail, view_body.as_deref());
     Ok(detail)
+}
+
+/// The statement that would recreate this relation, built from the catalogue.
+///
+/// PostgreSQL offers none: there is no `SHOW CREATE TABLE`, and `pg_dump` is a
+/// subprocess this client will not spawn. So this is assembled from what the
+/// sections above already fetched, which is also why it costs no extra round
+/// trip.
+///
+/// **What it covers**: columns with their types, nullability and defaults;
+/// every constraint, through `pg_get_constraintdef`; and the indexes that are
+/// not already implied by one, through `pg_get_indexdef`.
+///
+/// **What it does not**: storage parameters, tablespaces, collations, partition
+/// bounds and the `PARTITION BY` clause itself, inheritance, row-level
+/// security, rules, and anything an extension added. A table using any of them
+/// comes back as a statement that runs and produces something subtly
+/// different — which is why the type is [`Ddl`] rather than a string, and why
+/// a front-end showing it has to say it was generated.
+fn ddl(schema: &str, name: &str, detail: &TableDetail, view_body: Option<&str>) -> Option<Ddl> {
+    let qualified = format!("{}.{}", quoted(schema), quoted(name));
+
+    // A view's body is the server's own text, and `CREATE VIEW` around it is
+    // this client's — which is why the whole is still generated.
+    if let Some(body) = view_body {
+        let keyword = match detail.kind {
+            RelationKind::MaterializedView => "MATERIALIZED VIEW",
+            _ => "VIEW",
+        };
+        return Some(Ddl::generated(format!(
+            "CREATE {keyword} {qualified} AS\n{}",
+            body.trim_end()
+        )));
+    }
+    // Only a table has columns to write out. A foreign table's options and an
+    // index's own relation are not something this can reconstruct, and a
+    // half-statement is worse than none.
+    if detail.kind != RelationKind::Table || detail.columns.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<String> = detail
+        .columns
+        .iter()
+        .map(|column| {
+            let mut line = format!("    {} {}", quoted(&column.name), column.type_name);
+            if let Some(default) = &column.default {
+                line.push_str(&format!(" DEFAULT {default}"));
+            }
+            if !column.nullable {
+                line.push_str(" NOT NULL");
+            }
+            line
+        })
+        .collect();
+    // Constraints inline, in the server's own words. Named, because a
+    // constraint whose name is dropped comes back with one PostgreSQL invents
+    // — and the difference shows up the next time somebody drops it by name.
+    lines.extend(
+        rows_of(detail, "Constraints")
+            .map(|row| format!("    CONSTRAINT {} {}", quoted(&row.0), row.2)),
+    );
+
+    let mut statement = format!("CREATE TABLE {qualified} (\n{}\n);", lines.join(",\n"));
+
+    // Indexes that no constraint already implies. A primary key and a unique
+    // constraint each own an index of the same name, and writing both means a
+    // statement that fails on the second.
+    let owned: Vec<String> = rows_of(detail, "Constraints").map(|row| row.0).collect();
+    for (index, _, definition) in rows_of(detail, "Indexes") {
+        if !owned.contains(&index) {
+            statement.push_str(&format!("\n\n{definition};"));
+        }
+    }
+    Some(Ddl::generated(statement))
+}
+
+/// The `(name, kind, definition)` of each row of a section this driver built.
+///
+/// Reading them back out rather than keeping a second copy while building:
+/// the sections are the answer, and a parallel structure to generate from
+/// would be one more thing to keep in step with them.
+fn rows_of<'a>(
+    detail: &'a TableDetail,
+    title: &str,
+) -> impl Iterator<Item = (String, String, String)> + 'a {
+    detail
+        .section(title)
+        .into_iter()
+        .flat_map(|section| section.table.rows.iter())
+        .filter_map(|row| {
+            Some((
+                text(row.get(0))?,
+                text(row.get(1))?,
+                // A definition can be null — see `definition` above — and a
+                // statement built around a missing one would be nonsense.
+                text(row.get(2))?,
+            ))
+        })
+}
+
+fn text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Text(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// An identifier, quoted the way PostgreSQL wants it.
+///
+/// Always, rather than only where it is needed: a name that does not need
+/// quoting is unchanged by it except for the quotes, and deciding per name is
+/// how a table called `order` ends up in a statement that will not parse.
+fn quoted(name: &str) -> String {
+    Ident::new(name)
+        .quote(QuoteStyle::DoubleQuote)
+        .as_str()
+        .to_owned()
 }
 
 fn section(title: &str, columns: Vec<Column>, rows: Vec<Row>) -> Option<DetailSection> {
@@ -378,6 +503,140 @@ mod tests {
                 "{path:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_identifier_is_always_quoted() {
+        // Deciding per name is how a table called `order` ends up in a
+        // statement that will not parse, and a name that did not need it is
+        // unchanged except for the quotes.
+        assert_eq!(quoted("users"), "\"users\"");
+        assert_eq!(quoted("order"), "\"order\"");
+        // A quote inside a name is doubled, which is the standard escape.
+        assert_eq!(quoted("od\"d"), "\"od\"\"d\"");
+    }
+
+    #[test]
+    fn only_a_table_gets_a_generated_create_table() {
+        // A foreign table's options and an index's own relation are not
+        // something this can reconstruct, and half a statement is worse than
+        // none.
+        let column = ColumnDef {
+            name: "id".to_owned(),
+            type_name: "integer".to_owned(),
+            nullable: false,
+            default: None,
+            comment: None,
+        };
+        for kind in [RelationKind::External, RelationKind::Routine] {
+            let detail =
+                TableDetail::new(TableRef::new(["public", "t"]), kind, vec![column.clone()]);
+            assert!(ddl("public", "t", &detail, None).is_none(), "{kind:?}");
+        }
+
+        let table = TableDetail::new(
+            TableRef::new(["public", "t"]),
+            RelationKind::Table,
+            vec![column],
+        );
+        let statement = ddl("public", "t", &table, None).expect("a table has one");
+        assert_eq!(
+            statement.text(),
+            "CREATE TABLE \"public\".\"t\" (\n    \"id\" integer NOT NULL\n);"
+        );
+    }
+
+    #[test]
+    fn a_view_keeps_the_body_the_server_gave() {
+        let detail = TableDetail::new(
+            TableRef::new(["public", "v"]),
+            RelationKind::View,
+            Vec::new(),
+        );
+        let statement = ddl("public", "v", &detail, Some("SELECT 1;\n")).expect("a view has one");
+        assert_eq!(
+            statement.text(),
+            "CREATE VIEW \"public\".\"v\" AS\nSELECT 1;"
+        );
+
+        let mut materialized = detail;
+        materialized.kind = RelationKind::MaterializedView;
+        assert!(
+            ddl("public", "v", &materialized, Some("SELECT 1"))
+                .expect("one")
+                .text()
+                .starts_with("CREATE MATERIALIZED VIEW"),
+        );
+    }
+
+    #[test]
+    fn an_index_a_constraint_already_owns_is_not_written_twice() {
+        // A primary key owns an index of the same name. Writing both means a
+        // statement that fails on the second.
+        let mut detail = TableDetail::new(
+            TableRef::new(["public", "t"]),
+            RelationKind::Table,
+            vec![ColumnDef {
+                name: "id".to_owned(),
+                type_name: "integer".to_owned(),
+                nullable: false,
+                default: None,
+                comment: None,
+            }],
+        );
+        detail.sections.push(DetailSection {
+            title: "Constraints".to_owned(),
+            table: ResultSet::new(
+                vec![
+                    Column::new("name", "text", false),
+                    Column::new("kind", "text", false),
+                    Column::new("definition", "text", false),
+                ],
+                vec![Row(vec![
+                    Value::Text("t_pkey".to_owned()),
+                    Value::Text("primary key".to_owned()),
+                    Value::Text("PRIMARY KEY (id)".to_owned()),
+                ])],
+                None,
+            ),
+        });
+        detail.sections.push(DetailSection {
+            title: "Indexes".to_owned(),
+            table: ResultSet::new(
+                vec![
+                    Column::new("name", "text", false),
+                    Column::new("kind", "text", false),
+                    Column::new("definition", "text", false),
+                ],
+                vec![
+                    Row(vec![
+                        Value::Text("t_pkey".to_owned()),
+                        Value::Text("primary key".to_owned()),
+                        Value::Text("CREATE UNIQUE INDEX t_pkey ON t (id)".to_owned()),
+                    ]),
+                    Row(vec![
+                        Value::Text("t_name".to_owned()),
+                        Value::Text("index".to_owned()),
+                        Value::Text("CREATE INDEX t_name ON t (name)".to_owned()),
+                    ]),
+                ],
+                None,
+            ),
+        });
+
+        let statement = ddl("public", "t", &detail, None)
+            .expect("one")
+            .text()
+            .to_owned();
+        assert!(
+            statement.contains("CONSTRAINT \"t_pkey\" PRIMARY KEY (id)"),
+            "{statement}"
+        );
+        assert!(statement.contains("CREATE INDEX t_name"), "{statement}");
+        assert!(
+            !statement.contains("CREATE UNIQUE INDEX t_pkey"),
+            "{statement}"
+        );
     }
 
     #[test]
