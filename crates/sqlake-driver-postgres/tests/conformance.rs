@@ -17,8 +17,17 @@ use sqlake_core::id::ProfileId;
 use sqlake_core::node::TableRef;
 use sqlake_core::profile::{Params, PostgresParams, ResolvedProfile, SslMode};
 use sqlake_driver_postgres::PgDriver;
+use testcontainers::ImageExt as _;
 use testcontainers::runners::AsyncRunner as _;
 use testcontainers_modules::postgres::Postgres;
+
+/// A supported PostgreSQL, rather than the module's default of 11.
+///
+/// `describe` needs `pg_attribute.attgenerated`, which arrives in 12 — see the
+/// driver's `COLUMNS` — so 11 cannot answer a definition at all. Pinned rather
+/// than floating so a new major does not change what a green run means without
+/// anybody choosing it.
+const PG_IMAGE_TAG: &str = "16-alpine";
 
 /// The image's own defaults, which `testcontainers-modules` sets up.
 const USER: &str = "postgres";
@@ -545,7 +554,12 @@ async fn abandoning_a_query_stops_it_at_the_server() {
 /// failure: a CI run that quietly skips this suite is a CI run that proves
 /// nothing about the driver.
 async fn start() -> Option<testcontainers::ContainerAsync<Postgres>> {
-    match Postgres::default().start().await {
+    // Not `testcontainers-modules`' own default, which is `11-alpine`:
+    // PostgreSQL 11 went out of support in November 2023, and testing against
+    // it hid two things at once — `attgenerated` does not exist there, and 18's
+    // per-column `NOT NULL` constraints could not be reached either. A current
+    // release is what people run this against.
+    match Postgres::default().with_tag(PG_IMAGE_TAG).start().await {
         Ok(container) => Some(container),
         Err(err) => {
             assert!(
