@@ -33,6 +33,13 @@ const RELATION: &str = "\
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
     WHERE n.nspname = $1 AND c.relname = $2";
 
+/// **PostgreSQL 12 and up.** `attgenerated` arrives in 12, so this query does
+/// not parse on 11 — which went out of support in November 2023, and which the
+/// conformance container used to pin. A server older than that answers every
+/// definition with "column a.attgenerated does not exist" rather than silently
+/// getting one wrong, which is the right way round for a floor nobody meant to
+/// have.
+///
 /// A generated or identity column has no default, whatever `pg_attrdef` holds
 /// for it. `pg_get_expr` on a `GENERATED ALWAYS AS (…) STORED` column returns
 /// the generation expression, and writing that out as `DEFAULT <expr>` is a
