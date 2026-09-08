@@ -72,18 +72,27 @@ async fn the_bigquery_driver_conforms() {
             })),
         )
         .await;
+    // Partitioned and clustered, so the definition the suite asks for has
+    // sections in it rather than only columns.
     google
-        .describes_table(
+        .describes_table_with(
             DATASET,
             TABLE,
-            serde_json::json!({
-                "fields": [
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "kind": "bigquery#table",
+                "id": format!("{PROJECT}:{DATASET}.{TABLE}"),
+                "tableReference": {
+                    "projectId": PROJECT, "datasetId": DATASET, "tableId": TABLE,
+                },
+                "numRows": ROWS.to_string(),
+                "timePartitioning": { "type": "DAY", "field": "signed_up" },
+                "clustering": { "fields": ["email"] },
+                "schema": { "fields": [
                     { "name": "id", "type": "INTEGER", "mode": "REQUIRED" },
                     { "name": "email", "type": "STRING" },
                     { "name": "signed_up", "type": "DATE" },
-                ],
-            }),
-            Some(&ROWS.to_string()),
+                ]},
+            })),
         )
         .await;
     google.answers_rows(DATASET, TABLE, Window).await;

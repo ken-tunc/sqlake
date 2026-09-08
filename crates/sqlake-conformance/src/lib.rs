@@ -315,6 +315,7 @@ async fn a_relation_describes_itself(
             "Triggers" => capabilities.triggers,
             "Constraints" => capabilities.constraints,
             "Partitioning" => capabilities.partitioning,
+            "Clustering" => capabilities.clustering,
             // A driver is free to answer something this suite has no flag
             // for; what it may not do is answer one it said it had not got.
             _ => true,

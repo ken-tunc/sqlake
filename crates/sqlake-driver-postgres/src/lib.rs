@@ -46,6 +46,7 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     triggers: true,
     constraints: true,
     partitioning: true,
+    clustering: false,
     transactions: true,
     cancel: true,
     streaming: true,
