@@ -6,6 +6,7 @@
 //! the others.
 
 pub mod capability;
+pub mod detail;
 pub mod driver;
 pub mod id;
 pub mod ident;

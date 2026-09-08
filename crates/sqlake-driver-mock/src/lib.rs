@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
+use sqlake_core::detail::{ColumnDef, DetailSection, TableDetail};
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::id::ProfileId;
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
@@ -612,6 +613,82 @@ impl Session for MockSession {
             rows,
             fixture.total_rows(),
         ))
+    }
+
+    /// Enough of a definition to draw one, and shaped by the capabilities this
+    /// mock claims.
+    ///
+    /// Filling in every section regardless would make the mock the one driver
+    /// where `Capabilities` and the answer disagree — and the pane that reads
+    /// both would be written against a shape no real driver produces.
+    async fn describe(&self, table: &TableRef) -> DriverResult<TableDetail> {
+        self.behaviour.delay_for(&table.path).await;
+
+        let [schema, name] = without_catalog(&table.path) else {
+            return Err(DriverError::NotFound(format!("{table} is not a relation")));
+        };
+        let fixture = self
+            .catalog
+            .table(schema, name)
+            .ok_or_else(|| DriverError::NotFound(table.to_string()))?;
+
+        if self.behaviour.fails_for(&table.path, &self.attempts) {
+            return Err(DriverError::query(format!("permission denied for {table}")));
+        }
+
+        let columns = fixture
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(at, column)| ColumnDef {
+                name: column.name.clone(),
+                type_name: column.type_name.clone(),
+                nullable: column.nullable,
+                // The first column stands in for one with a default, so
+                // anything drawing them has a filled cell and an empty one.
+                default: (at == 0).then(|| "nextval('mock_seq')".to_owned()),
+                comment: (at == 0).then(|| "the primary key".to_owned()),
+            })
+            .collect();
+
+        let mut detail = TableDetail::new(table.clone(), fixture.kind, columns);
+        detail.comment = Some(format!("the mock's {name}"));
+        detail.stats = vec![(
+            "Rows".to_owned(),
+            fixture
+                .total_rows()
+                .map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+        )];
+        if self.capabilities.indexes {
+            detail.sections.push(DetailSection {
+                title: "Indexes".to_owned(),
+                table: ResultSet::new(
+                    vec![
+                        Column::new("name", "text", false),
+                        Column::new("definition", "text", false),
+                    ],
+                    vec![Row(vec![
+                        Value::Text(format!("{name}_pkey")),
+                        Value::Text(format!(
+                            "CREATE UNIQUE INDEX {name}_pkey ON {schema}.{name} ({})",
+                            fixture.columns.first().map_or("id", |c| c.name.as_str())
+                        )),
+                    ])],
+                    Some(1),
+                ),
+            });
+        }
+        if self.capabilities.partitioning {
+            detail.sections.push(DetailSection {
+                title: "Partitioning".to_owned(),
+                table: ResultSet::new(
+                    vec![Column::new("by", "text", false)],
+                    vec![Row(vec![Value::Text("none".to_owned())])],
+                    Some(1),
+                ),
+            });
+        }
+        Ok(detail)
     }
 
     async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {

@@ -11,6 +11,7 @@
 //! rows, and the only way to order them is the thing that costs.
 
 pub mod catalog;
+pub mod describe;
 pub mod error;
 pub mod preview;
 pub mod query;
@@ -24,6 +25,7 @@ use gcp_bigquery_client::Client;
 use gcp_bigquery_client::client_builder::ClientBuilder;
 use gcp_bigquery_client::dataset::ListOptions;
 use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
+use sqlake_core::detail::TableDetail;
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{BigQueryAuth, BigQueryParams, Params, ResolvedProfile};
@@ -305,6 +307,14 @@ impl Session for BqSession {
         self.within_deadline(
             &format!("reading `{table}`"),
             preview::preview(&self.client, table, req),
+        )
+        .await
+    }
+
+    async fn describe(&self, table: &TableRef) -> DriverResult<TableDetail> {
+        self.within_deadline(
+            &format!("describing `{table}`"),
+            describe::describe(&self.client, table),
         )
         .await
     }
