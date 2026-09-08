@@ -78,6 +78,24 @@ pub enum Action {
         table: TableRef,
     },
 
+    /// Fetch what a relation is, reusing what is cached for it.
+    ///
+    /// `refresh` asks again for something already answered. A definition is
+    /// fetched once and never re-fetched by scrolling the way a preview is, so
+    /// without this the only way out of a stale one is to close the
+    /// connection.
+    DescribeTable {
+        conn: ConnId,
+        table: TableRef,
+        refresh: bool,
+    },
+
+    /// A front-end is no longer showing this definition anywhere.
+    ForgetDefinition {
+        conn: ConnId,
+        table: TableRef,
+    },
+
     /// Sort a preview by a column.
     ///
     /// The direction is not carried: the store holds the current sort and
@@ -163,6 +181,14 @@ impl fmt::Display for Action {
             Self::ToggleNode { node, .. } => write!(f, "toggle({node})"),
             Self::ExpandNode { node, .. } => write!(f, "expand({node})"),
             Self::PreviewTable { table, .. } => write!(f, "preview({table})"),
+            Self::DescribeTable { table, refresh, .. } => {
+                write!(
+                    f,
+                    "describe({table}{})",
+                    if *refresh { ", again" } else { "" }
+                )
+            }
+            Self::ForgetDefinition { table, .. } => write!(f, "forget_definition({table})"),
             Self::SortPreview { table, column, .. } => write!(f, "sort({table}, col {column})"),
             Self::LoadMore { table, .. } => write!(f, "load_more({table})"),
             Self::ForgetPreview { table, .. } => write!(f, "forget_preview({table})"),

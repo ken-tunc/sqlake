@@ -321,6 +321,24 @@ pub const KEYMAP: &[KeyBinding] = &[
         kind: IntentKind::EditExternally,
     },
     KeyBinding {
+        // `d` shows what the selected relation is. In the explorer, where the
+        // relation is chosen — `D` is disconnect and global, and the pane
+        // binding beating it is the hazard `KEYMAP` warns about, so the case
+        // matters here.
+        keys: &[key('d')],
+        context: Context::Explorer,
+        kind: IntentKind::DescribeTable,
+    },
+    KeyBinding {
+        // Through the definition's sections. `Tab` moves focus and `[`/`]`
+        // move tabs, so neither is free; `{`/`}` are the shifted forms of the
+        // brackets already used for the thing one level up, which is the
+        // relationship they have.
+        keys: &[key('{'), key('}')],
+        context: Context::Grid,
+        kind: IntentKind::SelectSection,
+    },
+    KeyBinding {
         // `n` for a new one. Global rather than in the grid: the gesture it
         // matches is the `+` on the tab bar, which no pane owns, and a tab
         // opened only while the grid has focus would be unreachable from the
@@ -783,6 +801,9 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
                 ]
             })
             .unwrap_or_default(),
+        (Target::Section { index }, Gesture::Click) => {
+            vec![ViewCmd::SelectSection(crate::intent::SectionPick::At(index)).into()]
+        }
         (Target::Button(ButtonId::RunQuery), Gesture::Click) => {
             ctx.runnable().map_or_else(Vec::new, |(conn, sql)| {
                 vec![
@@ -868,6 +889,37 @@ fn open_or_focus_tab(conn: ConnId, table: TableRef) -> Vec<Intent> {
     ]
 }
 
+/// Opening a definition: both halves, unconditionally.
+///
+/// `DescribeTable` is what makes a tab raised from a failure retry, and the
+/// store treats it as a no-op when the definition is already cached — so
+/// there is nothing to decide between here, the same as `open_or_focus_tab`.
+fn describe_node(index: usize, ctx: &InputContext<'_>) -> Vec<Intent> {
+    let Some(node) = ctx.node(index) else {
+        return Vec::new();
+    };
+    let conn = node.conn;
+    let Some(table) = node.node_ref.as_table() else {
+        // A namespace has no definition. Silent rather than a message: the
+        // gesture is one key, and a row that is not a relation is most of the
+        // tree.
+        return Vec::new();
+    };
+    vec![
+        ViewCmd::OpenDefinition {
+            conn,
+            table: table.clone(),
+        }
+        .into(),
+        Action::DescribeTable {
+            conn,
+            table,
+            refresh: false,
+        }
+        .into(),
+    ]
+}
+
 /// Closing a tab. If it was the last one open on this relation, the store's
 /// own cache of it — and any page still in flight for it — goes too.
 ///
@@ -880,6 +932,18 @@ fn close_tab(id: TabId, ctx: &InputContext<'_>) -> Vec<Intent> {
         return Vec::new();
     };
     let mut intents = vec![ViewCmd::CloseTab(id).into()];
+    // A definition is cached until something says otherwise, so the tab going
+    // is the only thing that ever will.
+    if let Some(table) = closing.defines() {
+        intents.push(
+            Action::ForgetDefinition {
+                conn: closing.conn,
+                table: table.clone(),
+            }
+            .into(),
+        );
+        return intents;
+    }
     // A SQL tab's buffer is this screen's, so there is nothing there to
     // forget — but the run it started is the store's, and nothing else is
     // looking at it: a query is keyed by the run, so no other tab can be.
@@ -993,7 +1057,7 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         KeyCode::Up | KeyCode::PageUp | KeyCode::Left | KeyCode::Home | KeyCode::BackTab
     ) || matches!(
         event.code,
-        KeyCode::Char('h' | 'H' | 'k' | 'K' | '<' | 'g' | '[')
+        KeyCode::Char('h' | 'H' | 'k' | 'K' | '<' | 'g' | '[' | '{')
     );
 
     match kind {
@@ -1188,6 +1252,20 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .and_then(|m| m.choices.first())
             .map(|choice| vec![choice.intent.clone()])
             .unwrap_or_default(),
+        // The relation under the cursor in the explorer, which is where a
+        // definition is opened from — the same row `Enter` previews.
+        IntentKind::DescribeTable => ctx
+            .tree_selection
+            .map(|i| describe_node(i, ctx))
+            .unwrap_or_default(),
+        IntentKind::SelectSection => vec![
+            ViewCmd::SelectSection(crate::intent::SectionPick::By(if backwards {
+                -1
+            } else {
+                1
+            }))
+            .into(),
+        ],
         IntentKind::SelectTab => neighbouring_tab(ctx, backwards)
             .map(|tab| vec![ViewCmd::SelectTab(tab).into()])
             .unwrap_or_default(),
@@ -1435,6 +1513,7 @@ mod tests {
                 tree: std::sync::Arc::default(),
             }],
             explorer,
+            definitions: Vec::new(),
             previews: tabs
                 .iter()
                 // A SQL tab has no relation, so the store holds nothing for
@@ -2103,6 +2182,97 @@ mod tests {
     }
 
     #[test]
+    fn d_opens_a_definition_of_the_selected_relation() {
+        // Both halves, the way `Enter` opens a preview: the tab and the fetch.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        // Row one: the fixture's tree is `public` and `users` under it.
+        c.tree_selection = Some(1);
+        let intents = on_key(press(KeyCode::Char('d')), &c);
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::View(ViewCmd::OpenDefinition { .. }))),
+            "{intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .any(|i| matches!(i, Intent::App(Action::DescribeTable { refresh: false, .. }))),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_has_no_definition_to_open() {
+        // Most of the tree is not a relation, and a message about that on
+        // every stray keypress would be noise.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Explorer);
+        c.tree_selection = Some(0);
+        assert!(on_key(press(KeyCode::Char('d')), &c).is_empty());
+    }
+
+    #[test]
+    fn closing_a_definition_forgets_it() {
+        // Nothing else ever will: a definition is cached until something says
+        // otherwise, unlike a preview, which every page request refreshes.
+        let mut f = fixture();
+        let table = TableRef::new(["public", "users"]);
+        f.tabs.push(OpenTab {
+            id: TabId::new(70),
+            conn: f.conn,
+            content: TabContent::Definition {
+                table: table.clone(),
+                section: 0,
+            },
+        });
+        let intents = on_mouse(
+            Target::TabClose(TabId::new(70)),
+            Gesture::Click,
+            &f.ctx(PaneId::Grid),
+        );
+        assert!(
+            intents.contains(&Intent::App(Action::ForgetDefinition {
+                conn: f.conn,
+                table,
+            })),
+            "{intents:?}"
+        );
+        // And not a `ForgetPreview`: a definition tab never had one.
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, Intent::App(Action::ForgetPreview { .. }))),
+            "{intents:?}"
+        );
+    }
+
+    #[test]
+    fn a_section_is_pickable_by_click_and_by_key() {
+        let f = fixture();
+        let c = f.ctx(PaneId::Grid);
+        assert_eq!(
+            on_mouse(Target::Section { index: 2 }, Gesture::Click, &c),
+            [Intent::View(ViewCmd::SelectSection(
+                crate::intent::SectionPick::At(2)
+            ))]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('}')), &c),
+            [Intent::View(ViewCmd::SelectSection(
+                crate::intent::SectionPick::By(1)
+            ))]
+        );
+        assert_eq!(
+            on_key(press(KeyCode::Char('{')), &c),
+            [Intent::View(ViewCmd::SelectSection(
+                crate::intent::SectionPick::By(-1)
+            ))]
+        );
+    }
+
+    #[test]
     fn r_runs_a_sql_tab_and_leaves_a_preview_alone() {
         let f = fixture();
         let mut c = f.ctx(PaneId::Grid);
@@ -2618,6 +2788,7 @@ mod tests {
             Target::Button(ButtonId::RunQuery),
             Target::Button(ButtonId::ModalChoice { index: 0 }),
         ],
+        Target::Section { .. } => [Target::Section { index: 0 }],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],
         Target::Menu => [Target::Menu],

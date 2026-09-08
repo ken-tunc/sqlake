@@ -220,6 +220,21 @@ pub fn scrollbar(
     }
 }
 
+/// One line above a pane's content, and the rectangle left below it.
+///
+/// For the definition pane's summary. A `Block` title would put it in the
+/// border, where it competes with the tab's own name for the same row.
+pub fn caption(frame: &mut Frame<'_>, area: Rect, text: &str) -> Rect {
+    if area.height <= 1 {
+        return area;
+    }
+    frame.render_widget(
+        Paragraph::new(fit(&sanitise(text), area.width)).style(Style::new().fg(Color::DarkGray)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+}
+
 const CLOSE_WIDTH: u16 = 2;
 /// The `+` that opens a SQL tab, and the space after it.
 const NEW_TAB: &str = " + ";
@@ -483,6 +498,7 @@ mod tests {
                 capabilities: None,
                 tree: std::sync::Arc::default(),
             }],
+            definitions: Vec::new(),
             previews: Vec::new(),
             queries: Vec::new(),
             busy: (0..busy)

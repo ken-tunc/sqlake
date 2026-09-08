@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
+use sqlake_core::detail::{Ddl, TableDetail};
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
-use sqlake_core::node::{NodeRef, TableRef};
+use sqlake_core::node::{NodeRef, RelationKind, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
-use sqlake_core::result::Sort;
+use sqlake_core::result::{Column, ResultSet, Row, Sort};
 use sqlake_core::sql::{Estimate, OverBudget, Position};
+use sqlake_core::value::Value;
 
 use crate::action::BusyId;
 use crate::pages::PagedResult;
@@ -182,6 +184,112 @@ impl QueryView {
     }
 }
 
+/// One section of a definition, with its rows in the shape a grid takes.
+///
+/// `PagedResult` rather than the `ResultSet` the driver answered with: the
+/// grid has one input type and a definition is not a reason to give it a
+/// second. Wrapped once here rather than per frame, since a section never
+/// grows — there is no page two of an index list.
+#[derive(Debug, Clone)]
+pub struct SectionView {
+    pub title: String,
+    pub rows: Arc<PagedResult>,
+}
+
+/// What a relation is, as far as it has been fetched.
+///
+/// Cached by `(conn, table)` so that opening the tab twice does not ask the
+/// server twice — and so an agent asking through `sqlake-api` reads what a
+/// person already has open rather than fetching a second copy.
+#[derive(Debug, Clone)]
+pub struct DefinitionView {
+    pub conn: ConnId,
+    pub table: TableRef,
+    pub data: LoadState<Arc<Definition>>,
+}
+
+/// The definition itself, in front-end shape.
+#[derive(Debug, Clone)]
+pub struct Definition {
+    pub kind: RelationKind,
+    pub comment: Option<String>,
+    pub columns: Arc<PagedResult>,
+    pub sections: Vec<SectionView>,
+    pub ddl: Option<Ddl>,
+    pub stats: Vec<(String, String)>,
+}
+
+impl Definition {
+    /// The columns as a grid, and every other section beside them.
+    ///
+    /// Columns are a section like the rest once they are here, which is what
+    /// lets a pane draw one list and one grid rather than a special case in
+    /// front of a loop.
+    #[must_use]
+    pub fn of(detail: &TableDetail) -> Self {
+        let columns = ResultSet::new(
+            vec![
+                Column::new("column", "text", false),
+                Column::new("type", "text", false),
+                Column::new("null", "text", false),
+                Column::new("default", "text", true),
+                Column::new("comment", "text", true),
+            ],
+            detail
+                .columns
+                .iter()
+                .map(|column| {
+                    Row(vec![
+                        Value::Text(column.name.clone()),
+                        Value::Text(column.type_name.clone()),
+                        // A word rather than a boolean: `false` under a column
+                        // headed `null` is two negatives to hold at once.
+                        Value::Text(if column.nullable { "" } else { "not null" }.to_owned()),
+                        column.default.clone().map_or(Value::Null, Value::Text),
+                        column.comment.clone().map_or(Value::Null, Value::Text),
+                    ])
+                })
+                .collect(),
+            Some(detail.columns.len() as u64),
+        );
+        Self {
+            kind: detail.kind,
+            comment: detail.comment.clone(),
+            columns: Arc::new(PagedResult::new(&columns)),
+            sections: detail
+                .sections
+                .iter()
+                .map(|section| SectionView {
+                    title: section.title.clone(),
+                    rows: Arc::new(PagedResult::new(&section.table)),
+                })
+                .collect(),
+            ddl: detail.ddl.clone(),
+            stats: detail.stats.clone(),
+        }
+    }
+
+    /// Every section a pane can show, columns first.
+    ///
+    /// Columns lead because they are what somebody opened the pane for; the
+    /// rest are in the order the driver gave them.
+    #[must_use]
+    pub fn titles(&self) -> Vec<&str> {
+        std::iter::once("Columns")
+            .chain(self.sections.iter().map(|s| s.title.as_str()))
+            .collect()
+    }
+
+    /// The rows under the section at `index` in [`Definition::titles`].
+    #[must_use]
+    pub fn rows(&self, index: usize) -> Option<&Arc<PagedResult>> {
+        match index.checked_sub(1) {
+            None => Some(&self.columns),
+            Some(at) => self.sections.get(at).map(|s| &s.rows),
+        }
+    }
+}
+
 /// What a busy item is waiting for.
 ///
 /// Cancelling abandons a reply that will now never arrive, so something has to
@@ -193,6 +301,7 @@ pub enum BusyOwner {
     Connection(ConnId),
     Node { conn: ConnId, node: NodeRef },
     Preview { conn: ConnId, table: TableRef },
+    Definition { conn: ConnId, table: TableRef },
     Query(QueryId),
 }
 
@@ -228,6 +337,7 @@ pub struct Snapshot {
     /// still a slice and an index — there is simply more than one root now.
     pub explorer: Arc<TreeView>,
     pub previews: Vec<PreviewView>,
+    pub definitions: Vec<DefinitionView>,
     /// Newest last, the order they were started in.
     pub queries: Vec<QueryView>,
     pub busy: Vec<BusyItem>,
@@ -235,6 +345,13 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    #[must_use]
+    pub fn definition(&self, conn: ConnId, table: &TableRef) -> Option<&DefinitionView> {
+        self.definitions
+            .iter()
+            .find(|d| d.conn == conn && &d.table == table)
+    }
+
     #[must_use]
     pub fn query(&self, id: QueryId) -> Option<&QueryView> {
         self.queries.iter().find(|q| q.id == id)

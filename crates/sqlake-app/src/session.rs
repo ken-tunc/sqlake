@@ -10,6 +10,7 @@
 //! application layer should try to arrange.
 
 use sqlake_core::capability::Capabilities;
+use sqlake_core::detail::TableDetail;
 use sqlake_core::driver::{DriverResult, Session};
 use sqlake_core::node::{NodeRef, TableRef, TreeNode};
 use sqlake_core::result::{PageRequest, ResultSet};
@@ -46,6 +47,10 @@ enum SessionCmd {
         /// same channel would queue behind the query it is meant to stop and
         /// arrive after it finished.
         cancel: oneshot::Receiver<()>,
+    },
+    Describe {
+        table: TableRef,
+        reply: oneshot::Sender<DriverResult<TableDetail>>,
     },
     Close,
 }
@@ -100,6 +105,18 @@ impl SessionHandle {
         let (reply, answer) = oneshot::channel();
         self.tx
             .send(SessionCmd::Estimate { sql, reply })
+            .await
+            .map_err(|_| AppError::SessionClosed)?;
+        answer
+            .await
+            .map_err(|_| AppError::SessionClosed)?
+            .map_err(Into::into)
+    }
+
+    pub async fn describe(&self, table: TableRef) -> AppResult<TableDetail> {
+        let (reply, answer) = oneshot::channel();
+        self.tx
+            .send(SessionCmd::Describe { table, reply })
             .await
             .map_err(|_| AppError::SessionClosed)?;
         answer
@@ -178,6 +195,9 @@ async fn run(session: Box<dyn Session>, mut rx: mpsc::Receiver<SessionCmd>) {
                         let _ = reply.send(result);
                     }
                 }
+            }
+            SessionCmd::Describe { table, reply } => {
+                let _ = reply.send(session.describe(&table).await);
             }
             SessionCmd::Close => break,
         }

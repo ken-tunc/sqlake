@@ -61,6 +61,17 @@ impl From<Action> for Intent {
     }
 }
 
+/// Which section of a definition to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionPick {
+    /// By position, from a click on the list.
+    At(usize),
+    /// Relative, from a key. Clamped rather than wrapped: a list of four is
+    /// short enough to see, and wrapping past the end of something you can see
+    /// all of reads as a jump rather than a step.
+    By(i32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewCmd {
     FocusPane(PaneId),
@@ -156,6 +167,15 @@ pub enum ViewCmd {
         conn: ConnId,
         table: TableRef,
     },
+    /// The same for a definition, which is its own kind of tab: a relation can
+    /// have both open, and they are different questions about it.
+    OpenDefinition {
+        conn: ConnId,
+        table: TableRef,
+    },
+    /// Which section of the open definition is drawn, by position in its own
+    /// list. `delta` moves; `at` picks.
+    SelectSection(SectionPick),
     /// Open an empty SQL tab on a connection, focused.
     OpenSqlTab {
         conn: ConnId,
@@ -214,6 +234,8 @@ intent_kinds! {
     Disconnect         => "close a connection",
     ToggleNode         => "expand or collapse a node",
     PreviewTable       => "open a relation",
+    DescribeTable      => "show what a relation is",
+    SelectSection      => "choose a section of a definition",
     SortPreview        => "sort by a column",
     LoadMore           => "fetch the next page",
     OpenSqlTab         => "open a SQL tab",
@@ -258,6 +280,8 @@ impl IntentKind {
                 // Paired with `Action::PreviewTable`: one capability,
                 // "open a relation", not two.
                 ViewCmd::OpenTab { .. } => Self::PreviewTable,
+                ViewCmd::OpenDefinition { .. } => Self::DescribeTable,
+                ViewCmd::SelectSection(_) => Self::SelectSection,
                 ViewCmd::OpenSqlTab { .. } => Self::OpenSqlTab,
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
@@ -274,6 +298,12 @@ impl IntentKind {
                 // row in front of it.
                 Action::ToggleNode { .. } | Action::ExpandNode { .. } => Self::ToggleNode,
                 Action::PreviewTable { .. } => Self::PreviewTable,
+                // Paired with `ViewCmd::OpenDefinition`: one capability,
+                // "show what this relation is".
+                Action::DescribeTable { .. } => Self::DescribeTable,
+                // Paired with `ViewCmd::CloseTab`, the way `ForgetPreview` is:
+                // closing the tab is what causes it.
+                Action::ForgetDefinition { .. } => Self::CloseTab,
                 Action::SortPreview { .. } => Self::SortPreview,
                 Action::LoadMore { .. } => Self::LoadMore,
                 // Paired with `ViewCmd::CloseTab`: one capability.

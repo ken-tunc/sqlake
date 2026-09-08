@@ -112,7 +112,12 @@ pub fn render_rows(
     body(frame, hits, area, grid, ui, sort, sortable);
 }
 
-fn message(frame: &mut Frame<'_>, area: Rect, text: &str, colour: Color) {
+/// One line where a grid would be: loading, failed, or nothing selected.
+///
+/// Public because a definition pane says the same three things about the same
+/// pane, and a second copy of "a sentence in the middle of an empty grid"
+/// would drift from this one in colour and padding.
+pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, colour: Color) {
     frame.render_widget(
         Paragraph::new(format!(" {} ", crate::grid::sanitise(text))).style(Style::new().fg(colour)),
         area,
