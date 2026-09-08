@@ -264,7 +264,7 @@ impl Service {
     async fn estimate_query(&self, connection: &str, sql: &str) -> Result<Response, Failure> {
         let conn = self.connection(connection).await?;
         let query = QueryId::new();
-        let settled = self
+        let costed = self
             .dispatch_and_settle(
                 Action::EstimateQuery {
                     conn,
@@ -273,25 +273,40 @@ impl Service {
                 },
                 move |s| s.query(query).is_some_and(QueryView::is_settled),
             )
-            .await?;
+            .await
+            .and_then(|settled| self.query_info(&settled, query));
         // Forgotten afterwards: an estimate leaves nothing to come back for,
         // and a session accumulating one `QueryView` per question an agent
         // asked is a leak with a plausible-looking cause. Waited on so that it
         // is gone by the time this answers, rather than a moment later.
-        let answer = self.query_info(&settled, query)?;
-        self.dispatch_and_settle(Action::ForgetQuery(query), move |s| {
-            s.query(query).is_none()
-        })
-        .await?;
+        //
+        // Unconditionally, before anything above is allowed to return: an
+        // estimate that outlives the wait is exactly the case that leaves a
+        // `QueryView` — and a busy row reading "estimating a query" — behind
+        // for ever. `ForgetQuery` drops the task too, so nothing is still in
+        // flight to land on it.
+        let forgotten = self
+            .dispatch_and_settle(Action::ForgetQuery(query), move |s| {
+                s.query(query).is_none()
+            })
+            .await;
+        let answer = costed?;
+        forgotten?;
         Ok(Response::Query(answer))
     }
 
-    /// Start a query and answer with its handle.
+    /// Start a query and answer with whatever state it is in.
     ///
     /// Not waited on: a query is not instantaneous, and a caller blocking on a
     /// socket read for four minutes is a poor client. What it waits for is the
     /// store *accepting* the action, so the id it is handed is one the next
     /// request can ask about.
+    ///
+    /// A query fast enough to have finished by then is answered as finished,
+    /// rows and all. That is not a contradiction of "answers a handle rather
+    /// than rows": it does not *wait* for rows, and hiding ones it already has
+    /// would be a second request to fetch what was in hand. There is no limit
+    /// on this request to cut them by, so the service's own budget does.
     async fn run_query(
         &self,
         connection: &str,
@@ -917,6 +932,50 @@ mod tests {
         // And it leaves nothing behind. A session accumulating a `QueryView`
         // per question an agent asked is a leak with a plausible cause.
         assert!(service.store().snapshot().queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_estimate_that_outlives_the_wait_leaves_nothing_behind_either() {
+        // The case the `?` above used to skip: a timed-out estimate is exactly
+        // the one that would strand a `QueryView`, and its busy row with it.
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
+                latency: Duration::from_millis(300),
+                ..Behaviour::instant()
+            }))),
+            Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
+            None,
+        );
+        let conn = ConnId::new();
+        // Not through the service: connecting is slow here too, and the point
+        // is a short wait on the estimate alone.
+        store
+            .dispatch_and_settle(
+                Action::Connect {
+                    profile: ProfileId::parse("mock").expect("a usable id"),
+                    conn,
+                },
+                DEFAULT_TIMEOUT,
+                |s| s.connection_settled(conn),
+            )
+            .await
+            .expect("it connects");
+        let service = Service::new(store).with_timeout(Duration::from_millis(50));
+
+        let answer = service
+            .answer(&Request::QueryEstimate {
+                connection: conn.to_string(),
+                sql: "select * from public.users".into(),
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Timeout { .. })),
+            "{answer:?}"
+        );
+        let snapshot = service.store().snapshot();
+        assert!(snapshot.queries.is_empty(), "the query was forgotten");
+        assert!(snapshot.busy.is_empty(), "and so was the work it was doing");
     }
 
     #[tokio::test]

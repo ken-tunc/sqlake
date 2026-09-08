@@ -297,12 +297,21 @@ impl Command {
                 what: ConnectionCommand::Close,
             } => Needs::LiveConnection,
             Self::Schema { .. } | Self::Table { .. } => Needs::Connection,
-            // Estimating and running name a connection; the other three name a
-            // query the session already has, and a one-shot store has none of
-            // its own to name.
+            // Estimating names a connection and answers a number, which a
+            // store that dies afterwards can still do.
             Self::Query {
-                what: QueryCommand::Estimate { .. } | QueryCommand::Run { .. },
+                what: QueryCommand::Estimate { .. },
             } => Needs::Connection,
+            // Running names one too, but answers a handle — and a handle
+            // nothing can ask about afterwards is the same no-op `connection
+            // open` is refused for. Whether any rows come back at all would
+            // depend on the driver finishing inside one settle, which is a
+            // race to report as success.
+            Self::Query {
+                what: QueryCommand::Run { .. },
+            } => Needs::LiveConnection,
+            // The other three name a query the session already started, and a
+            // one-shot store started none.
             Self::Query { .. } => Needs::LiveSession,
         }
     }
@@ -836,12 +845,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_can_run_a_query_but_not_ask_about_one_afterwards() {
-        // Running needs a connection, which one-shot opens. Asking about a
-        // query needs a session that already started one, and a store that
-        // dies with the command started none.
+    async fn one_shot_can_estimate_a_query_but_not_run_one() {
+        // Estimating answers a number, which a store that dies afterwards can
+        // still do. Running answers a handle, and a handle nothing can ask
+        // about is the same no-op `connection open` is refused for.
         let response = one_shot(
-            &parse(&["query", "run", "select * from public.users"]),
+            &parse(&["query", "estimate", "select * from public.users"]),
             Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
             Arc::new(sqlake_driver_mock::MockProfiles::default()),
             &Settings::default(),
@@ -851,19 +860,24 @@ mod tests {
         .expect("it answers");
         assert!(matches!(response, Response::Query(_)), "{response:?}");
 
-        let response = one_shot(
-            &parse(&["query", "status", "q"]),
-            Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
-            Arc::new(sqlake_driver_mock::MockProfiles::default()),
-            &Settings::default(),
-            None,
-        )
-        .await
-        .expect("it answers");
-        let Response::Failed(Failure::Unsupported { message }) = response else {
-            panic!("{response:?}");
-        };
-        assert!(message.contains("--session"), "{message}");
+        for argv in [
+            &["query", "run", "select 1"][..],
+            &["query", "status", "q"][..],
+        ] {
+            let response = one_shot(
+                &parse(argv),
+                Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+                Arc::new(sqlake_driver_mock::MockProfiles::default()),
+                &Settings::default(),
+                None,
+            )
+            .await
+            .expect("it answers");
+            let Response::Failed(Failure::Unsupported { message }) = response else {
+                panic!("{argv:?} answered {response:?}");
+            };
+            assert!(message.contains("--session"), "{message}");
+        }
     }
 
     #[test]
