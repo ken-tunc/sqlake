@@ -750,13 +750,25 @@ impl Runtime {
             });
         }
 
-        let busy = self.begin_busy(
-            BusyOwner::Definition {
-                conn: conn_id,
-                table: table.clone(),
-            },
-            format!("describing {table}"),
-        );
+        // A refresh supersedes whatever was in flight. Without this the older
+        // reply can land last and overwrite the newer one — the definition
+        // that was asked for again is the one that is thrown away — and its
+        // busy row sits on screen for an answer nothing wants.
+        let owner = BusyOwner::Definition {
+            conn: conn_id,
+            table: table.clone(),
+        };
+        let superseded: Vec<BusyId> = self
+            .busy
+            .iter()
+            .filter(|b| b.owner == owner)
+            .map(|b| b.id)
+            .collect();
+        for busy in superseded {
+            self.drop_task(busy);
+        }
+
+        let busy = self.begin_busy(owner, format!("describing {table}"));
         let events = self.events.clone();
         let for_event = table.clone();
         self.spawn_task(busy, async move {

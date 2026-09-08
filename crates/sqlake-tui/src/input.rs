@@ -804,6 +804,11 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
         (Target::Section { index }, Gesture::Click) => {
             vec![ViewCmd::SelectSection(crate::intent::SectionPick::At(index)).into()]
         }
+        // The list sits inside the grid pane, so the wheel over it has to mean
+        // what the wheel one column to the right means. Without this the
+        // leftmost sixteen columns of the pane are a strip the wheel does
+        // nothing in, which reads as the mouse being broken.
+        (Target::Section { .. }, Gesture::Scroll(delta)) => vec![scroll(PaneId::Grid, delta)],
         (Target::Button(ButtonId::RunQuery), Gesture::Click) => {
             ctx.runnable().map_or_else(Vec::new, |(conn, sql)| {
                 vec![

@@ -496,6 +496,11 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
                 // The list first, because what is left of the pane is what the
                 // grid gets — and working that out twice is how the two come
                 // to disagree.
+                // Clamped here as well as where it is picked: a refresh can
+                // come back with fewer sections than the tab was on, and an
+                // index past the end draws an empty pane with nothing in it
+                // saying why.
+                let section = section.min(definition.titles().len().saturating_sub(1));
                 let body = crate::definition::sections(frame, hits, grid, definition, section);
                 let summary = crate::definition::summary(definition);
                 let rows = definition.rows(section).map(Arc::clone);
@@ -514,9 +519,27 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
                 ui.set_viewport(PaneId::Grid, grid);
                 datagrid::message(frame, grid, why, ratatui::style::Color::Red);
             }
-            _ => {
+            // Nothing held for it can mean two things, and only one of them is
+            // worth a spinner: the store has not seen the fetch yet, or the
+            // connection closed and took the definition with it. Saying
+            // "describing…" for the second is a wait that never ends, because
+            // nothing is going to answer.
+            state => {
                 ui.set_viewport(PaneId::Grid, grid);
-                datagrid::message(frame, grid, "describing…", ratatui::style::Color::Yellow);
+                let live = state.is_some()
+                    || snapshot
+                        .connection(*conn)
+                        .is_some_and(sqlake_app::snapshot::ConnectionView::is_live);
+                if live {
+                    datagrid::message(frame, grid, "describing…", ratatui::style::Color::Yellow);
+                } else {
+                    datagrid::message(
+                        frame,
+                        grid,
+                        "the connection is closed",
+                        ratatui::style::Color::DarkGray,
+                    );
+                }
             }
         }
     }
@@ -1762,6 +1785,44 @@ mod tests {
         let snap = rx.borrow_and_update().clone();
 
         insta::assert_snapshot!(screen(&snap, &mut ui, 100, 20));
+    }
+
+    #[tokio::test]
+    async fn a_definition_whose_connection_closed_stops_saying_it_is_loading() {
+        // Disconnecting drops the store's definitions, so the tab is left
+        // holding nothing — which is not the same as waiting for something.
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenDefinition {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+        store.dispatch(Action::DescribeTable {
+            conn,
+            table: table.clone(),
+            refresh: false,
+        });
+        until(&mut rx, |s| {
+            s.definition(conn, &table)
+                .is_some_and(|d| d.data.ready().is_some())
+        })
+        .await;
+
+        store.dispatch(Action::Disconnect(conn));
+        until(&mut rx, |s| s.definitions.is_empty()).await;
+        let snap = rx.borrow_and_update().clone();
+
+        let screen = screen(&snap, &mut ui, 100, 20);
+        assert!(!screen.contains("describing"), "{screen}");
+        assert!(screen.contains("the connection is closed"), "{screen}");
     }
 
     #[tokio::test]

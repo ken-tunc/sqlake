@@ -12,7 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use sqlake_app::snapshot::Definition;
 
-use crate::grid::{display_width, sanitise};
+use crate::chrome::fit;
+use crate::grid::sanitise;
 use crate::hit::{HitMap, Target, Z_CHROME};
 
 /// How wide the section list gets.
@@ -92,14 +93,6 @@ pub fn summary(definition: &Definition) -> String {
         parts.push(sanitise(comment));
     }
     parts.join(" · ")
-}
-
-fn fit(text: &str, max: u16) -> String {
-    if display_width(text) <= max {
-        text.to_owned()
-    } else {
-        crate::chrome::fit(text, max)
-    }
 }
 
 #[cfg(test)]
