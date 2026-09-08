@@ -81,6 +81,22 @@ fn detail(table: &TableRef, described: &Table) -> TableDetail {
 /// other, and a reader looking for "how is this split up" should not have to
 /// know which word BigQuery used for it.
 fn partitioning(described: &Table) -> Option<DetailSection> {
+    // The requirement is read from two places because BigQuery writes it in
+    // two: `timePartitioning.requirePartitionFilter` is where a time-
+    // partitioned table carries it, and the table-level field — deprecated for
+    // that case, and the only place a range-partitioned table has one — is
+    // where the rest do. Reading only the first tells somebody "optional"
+    // about a table whose unfiltered queries the server will refuse.
+    let required = |inner: Option<bool>| {
+        Value::Text(
+            if inner.or(described.require_partition_filter) == Some(true) {
+                "required"
+            } else {
+                "optional"
+            }
+            .to_owned(),
+        )
+    };
     let mut rows = Vec::new();
     if let Some(time) = &described.time_partitioning {
         rows.push(Row(vec![
@@ -90,36 +106,35 @@ fn partitioning(described: &Table) -> Option<DetailSection> {
             time.field
                 .clone()
                 .map_or_else(|| Value::Text("_PARTITIONTIME".to_owned()), Value::Text),
-            Value::Text(
-                if time.require_partition_filter == Some(true) {
-                    "required"
-                } else {
-                    "optional"
-                }
-                .to_owned(),
-            ),
+            required(time.require_partition_filter),
         ]));
     }
     if let Some(range) = &described.range_partitioning {
         rows.push(Row(vec![
             Value::Text("range".to_owned()),
             range.field.clone().map_or(Value::Null, Value::Text),
-            // A filter requirement is a time-partitioning property; saying
-            // "optional" here would answer a question this kind does not have.
-            Value::Null,
+            required(None),
         ]));
     }
+    section(
+        "Partitioning",
+        vec![
+            Column::new("by", "text", false),
+            Column::new("field", "text", true),
+            Column::new("filter", "text", true),
+        ],
+        rows,
+    )
+}
+
+/// A section, or nothing where there are no rows for one.
+///
+/// An empty table under a title reads as "this has none of that", which is a
+/// different answer from the one a relation without the feature should give.
+fn section(title: &str, columns: Vec<Column>, rows: Vec<Row>) -> Option<DetailSection> {
     (!rows.is_empty()).then(|| DetailSection {
-        title: "Partitioning".to_owned(),
-        table: ResultSet::new(
-            vec![
-                Column::new("by", "text", false),
-                Column::new("field", "text", true),
-                Column::new("filter", "text", true),
-            ],
-            rows,
-            None,
-        ),
+        title: title.to_owned(),
+        table: ResultSet::new(columns, rows, None),
     })
 }
 
@@ -135,38 +150,52 @@ fn clustering(described: &Table) -> Option<DetailSection> {
         .enumerate()
         .map(|(at, field)| Row(vec![Value::Int(at as i64 + 1), Value::Text(field.clone())]))
         .collect();
-    (!rows.is_empty()).then(|| DetailSection {
-        title: "Clustering".to_owned(),
-        table: ResultSet::new(
-            vec![
-                Column::new("position", "int64", false),
-                Column::new("field", "text", false),
-            ],
-            rows,
-            None,
-        ),
-    })
+    section(
+        "Clustering",
+        vec![
+            Column::new("position", "int64", false),
+            Column::new("field", "text", false),
+        ],
+        rows,
+    )
 }
 
 /// A view's own query, which is the one thing here that was actually typed.
 ///
-/// Only a view. A table's DDL lives in `INFORMATION_SCHEMA.TABLES.ddl`, and
-/// reading it is a *query* — billed, with a ten-megabyte minimum, and issued
-/// from a call that takes no `ApprovedQuery`. That would make `describe` the
-/// one place in this client where SQL runs without the gate design.md §4.1 is
-/// about, to fetch something nobody asked for. So a table has no DDL here and
-/// M5's generated one is what it gets.
+/// Only a view — an ordinary one or a materialized one, both of which carry
+/// their query in the same free `tables.get` answer. A table's DDL lives in
+/// `INFORMATION_SCHEMA.TABLES.ddl`, and reading it is a *query* — billed, with
+/// a ten-megabyte minimum, and issued from a call that takes no
+/// `ApprovedQuery`. That would make `describe` the one place in this client
+/// where SQL runs without the gate design.md §4.1 is about, to fetch something
+/// nobody asked for. So a table has no DDL here and M5's generated one is what
+/// it gets.
 ///
 /// The `CREATE VIEW` around it is this client's and the query inside it is the
 /// server's, so the whole is generated even though its middle was not.
 fn ddl(table: &TableRef, described: &Table) -> Option<Ddl> {
-    let view = described.view.as_ref()?;
+    let (keyword, query, legacy) = match (&described.view, &described.materialized_view) {
+        (Some(view), _) => ("VIEW", &view.query, view.use_legacy_sql == Some(true)),
+        // A materialized view is always standard SQL — legacy cannot define
+        // one — so there is no third case to ask about.
+        (None, Some(materialized)) => ("MATERIALIZED VIEW", &materialized.query, false),
+        (None, None) => return None,
+    };
     let [project, dataset, name] = table.path.as_slice() else {
         return None;
     };
+    // A legacy-SQL view's body is not standard SQL, so this wrapper produces a
+    // statement that reads as runnable and is not. Said in the text rather
+    // than left out: the query is still the thing somebody opened the pane
+    // for, and a definition that silently vanished for legacy views would be a
+    // gap with no explanation attached to it.
+    let warning = if legacy {
+        "-- This view is defined in legacy SQL. The statement below wraps its\n         -- body in standard-SQL syntax and will not recreate it as written.\n"
+    } else {
+        ""
+    };
     Some(Ddl::generated(format!(
-        "CREATE VIEW `{project}.{dataset}.{name}` AS\n{}",
-        view.query
+        "{warning}CREATE {keyword} `{project}.{dataset}.{name}` AS\n{query}"
     )))
 }
 
@@ -337,6 +366,53 @@ mod tests {
     }
 
     #[test]
+    fn a_range_partitioned_table_still_says_whether_a_filter_is_required() {
+        // Range partitioning carries the requirement in the table-level
+        // `requirePartitionFilter`, and a blank cell would tell somebody an
+        // unfiltered query is allowed when the server will refuse it.
+        let detail = detail(
+            &users(),
+            &described(serde_json::json!({
+                "tableReference": { "projectId": "p", "datasetId": "d", "tableId": "users" },
+                "schema": { "fields": [{ "name": "id", "type": "INTEGER" }] },
+                "rangePartitioning": {
+                    "field": "id",
+                    "range": { "start": "0", "end": "100", "interval": "10" },
+                },
+                "requirePartitionFilter": true,
+            })),
+        );
+        let rows = &detail
+            .section("Partitioning")
+            .expect("it is partitioned")
+            .table
+            .rows;
+        assert_eq!(rows[0].get(0), Some(&Value::Text("range".to_owned())));
+        assert_eq!(rows[0].get(2), Some(&Value::Text("required".to_owned())));
+    }
+
+    #[test]
+    fn a_materialized_view_gets_the_statement_that_matches_it() {
+        // The query is in the same free answer an ordinary view's is, and a
+        // `CREATE VIEW` around it would be a statement that rebuilds the wrong
+        // thing.
+        let detail = detail(
+            &users(),
+            &described(serde_json::json!({
+                "tableReference": { "projectId": "p", "datasetId": "d", "tableId": "users" },
+                "type": "MATERIALIZED_VIEW",
+                "schema": { "fields": [{ "name": "id", "type": "INTEGER" }] },
+                "materializedView": { "query": "SELECT 1 AS id" },
+            })),
+        );
+        let ddl = detail.ddl.expect("a materialized view has one");
+        assert_eq!(
+            ddl.text(),
+            "CREATE MATERIALIZED VIEW `p.d.users` AS\nSELECT 1 AS id"
+        );
+    }
+
+    #[test]
     fn clustering_keeps_the_order_it_was_declared_in() {
         // Clustering by `(a, b)` and by `(b, a)` sort differently, so the
         // order is the whole content.
@@ -399,6 +475,38 @@ mod tests {
             ddl.text()
         );
         assert!(ddl.text().contains("SELECT 1 AS id"), "{}", ddl.text());
+    }
+
+    #[test]
+    fn a_legacy_sql_view_says_that_its_statement_will_not_run() {
+        // The wrapper is standard SQL and the body is not, so the statement
+        // reads as runnable and is not. Leaving it out would be a gap with no
+        // explanation attached to it.
+        let detail = detail(
+            &users(),
+            &described(serde_json::json!({
+                "tableReference": { "projectId": "p", "datasetId": "d", "tableId": "users" },
+                "type": "VIEW",
+                "schema": { "fields": [{ "name": "id", "type": "INTEGER" }] },
+                "view": { "query": "SELECT 1 AS id", "useLegacySql": true },
+            })),
+        );
+        let ddl = detail.ddl.expect("a view has one");
+        assert!(ddl.text().starts_with("--"), "{}", ddl.text());
+        assert!(ddl.text().contains("legacy SQL"), "{}", ddl.text());
+        assert!(ddl.text().contains("SELECT 1 AS id"), "{}", ddl.text());
+
+        // And a standard-SQL view carries no warning it does not need.
+        let standard = super::detail(
+            &users(),
+            &described(serde_json::json!({
+                "tableReference": { "projectId": "p", "datasetId": "d", "tableId": "users" },
+                "type": "VIEW",
+                "schema": { "fields": [{ "name": "id", "type": "INTEGER" }] },
+                "view": { "query": "SELECT 1 AS id", "useLegacySql": false },
+            })),
+        );
+        assert!(standard.ddl.expect("one").text().starts_with("CREATE VIEW"));
     }
 
     #[test]
