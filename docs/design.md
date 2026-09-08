@@ -39,6 +39,7 @@ sqlake/
     ├── sqlake-app/               # use cases, state, actions. UI-agnostic and testable
     ├── sqlake-tui/               # rendering and input, on ratatui
     ├── sqlake-api/               # agent surface: protocol, schema, socket client and server
+    ├── sqlake-mcp/               # MCP stdio server over sqlake-api
     ├── sqlake-conformance/       # one suite every driver has to pass, run per driver
     ├── sqlake-config/            # profile and settings persistence, secret resolution
     ├── sqlake-driver-postgres/
@@ -47,7 +48,6 @@ sqlake/
 
     # not yet, with the milestone that makes one:
     #   sqlake-store/             # SQLite: history, templates, session restore (M7, M8)
-    #   sqlake-mcp/               # MCP stdio server over sqlake-api (A3)
 ```
 
 `crates/` is the list of what exists; the rest are created by the milestone that first needs

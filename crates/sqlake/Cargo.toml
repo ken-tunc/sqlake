@@ -19,6 +19,7 @@ sqlake-config.workspace = true
 sqlake-core.workspace = true
 sqlake-driver-bigquery.workspace = true
 sqlake-driver-mock.workspace = true
+sqlake-mcp.workspace = true
 sqlake-driver-postgres.workspace = true
 sqlake-tui.workspace = true
 serde_json.workspace = true

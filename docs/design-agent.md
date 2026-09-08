@@ -50,6 +50,7 @@ sqlake connection open|close    against a session that outlives the command
 sqlake schema list              namespaces in a connection
 sqlake table list|preview
 sqlake query estimate|run|status|wait|cancel
+sqlake mcp                      speak MCP on stdio
 ```
 
 Planned, with the milestone that brings each:
@@ -57,7 +58,6 @@ Planned, with the milestone that brings each:
 ```
 sqlake table describe           M5
 sqlake history search           M8
-sqlake mcp                      A3, speaks MCP on stdio
 ```
 
 Every subcommand prints JSON on stdout and diagnostics on stderr, so output is consumable
@@ -195,9 +195,23 @@ the session must not inherit an agent's context window.
 
 ## 5. MCP
 
-`sqlake mcp` speaks MCP over stdio, wrapping the same client used by the subcommands. Tools
-map one-to-one onto the commands in §2, and their definitions are generated from the same
-schema as `api schema`.
+Built. `sqlake mcp` speaks MCP over stdio, wrapping the same `Backend` the subcommands use —
+attached when a session answers, a store of its own otherwise. A local store here does outlive
+the requests made against it, unlike a one-shot command's, so opening connections and starting
+queries in one is not the no-op it would be for `sqlake query run`.
+
+One tool per `RequestKind`, and a tool's input schema is that request's own branch of the
+generated schema with two edits: the `request` tag goes, because the tool's *name* is it — so a
+caller cannot write the wrong one — and `connection` stops being required, because the server
+picks one the way a subcommand does. A call is deserialised as a `Request`, so
+`deny_unknown_fields` and every type in the protocol apply to it unchanged.
+
+`schema` is the one request that is not a tool: `tools/list` is the schema for an MCP client,
+and offering the document as well would be the same surface described twice.
+
+A failure is a *tool* error rather than a JSON-RPC one. The request was understood and routed;
+what failed is the database, and a client handed a protocol error renders it opaquely and shows
+the caller nothing.
 
 It is a separate crate (`sqlake-mcp`) so the MCP SDK stays out of the TUI's dependency tree.
 
@@ -234,7 +248,7 @@ keeps M1–M8 aligned one-to-one with the eight features.
 | --- | --- | --- | --- |
 | **A1** | M2 | Read-only CLI and socket API — **built**, in `sqlake-api` | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
 | **A2** | M4 | Query execution over the API — **built** | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close`. The byte budget and `NeedsApproval`, read-only enforcement. `issuer` in history waits for M8, which is where the history table arrives |
-| **A3** | A2 | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
+| **A3** | A2 | MCP server — **built** | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
 Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
 

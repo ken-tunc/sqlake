@@ -18,6 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::protocol::{Failure, Request, Response};
 use crate::serve::Service;
+use crate::snapshot::{ConnectionInfo, Status};
 
 /// The session a name resolves to when nobody said.
 pub const DEFAULT_SESSION: &str = "default";
@@ -342,6 +343,97 @@ fn restrict(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn closing_refuses_to_guess_which_connection() {
+        // A read through the wrong connection is a wrong answer somebody can
+        // ask again. A close through the wrong one is somebody else's
+        // connection gone, so this is the one place the pick has to be
+        // unambiguous.
+        let two = open(&["mock", "prod"]);
+        assert!(choose(&two, None, false).is_ok(), "a read still picks one");
+
+        let refused = choose(&two, None, true).expect_err("closing should refuse");
+        let Failure::Unsupported { message } = refused else {
+            panic!("{refused:?}");
+        };
+        // Both names, so whoever reads it can pick one. Not the flag that
+        // does the picking: this message crosses the socket to an MCP client
+        // too, where `--connect` means nothing.
+        assert!(
+            message.contains("mock") && message.contains("prod"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn closing_picks_the_one_that_was_named() {
+        let two = open(&["mock", "prod"]);
+        assert_eq!(choose(&two, Some("prod"), true), Ok("id-1".into()));
+        // And one connection is never ambiguous.
+        assert!(choose(&open(&["mock"]), None, true).is_ok());
+    }
+
+    fn open(profiles: &[&str]) -> Vec<ConnectionInfo> {
+        profiles
+            .iter()
+            .enumerate()
+            .map(|(i, profile)| ConnectionInfo {
+                id: format!("id-{i}"),
+                profile: (*profile).to_owned(),
+                name: (*profile).to_owned(),
+                driver: "mock".into(),
+                status: Status::Ready,
+                capabilities: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_session_with_one_connection_needs_no_choosing() {
+        assert_eq!(choose(&open(&["mock"]), None, false), Ok("id-0".into()));
+    }
+
+    #[test]
+    fn connect_picks_among_a_sessions_connections() {
+        // The point of `--connect` when attached: two databases open is
+        // ordinary, and the first is not always the one meant.
+        let open = open(&["staging", "prod"]);
+        assert_eq!(choose(&open, Some("prod"), false), Ok("id-1".into()));
+    }
+
+    #[test]
+    fn a_profile_the_session_has_not_opened_is_named_in_the_failure() {
+        let open = open(&["staging"]);
+        assert_eq!(
+            choose(&open, Some("prod"), false),
+            Err(Failure::NoSuchConnection {
+                connection: "prod".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_connection_that_failed_to_open_is_not_the_one_to_read_through() {
+        // A session opened with two profiles where the first could not
+        // connect: reading through it would answer with that failure, and the
+        // database next to it is right there.
+        let mut open = open(&["staging", "prod"]);
+        open[0].status = Status::Failed {
+            reason: "no route to host".into(),
+        };
+        assert_eq!(choose(&open, None, false), Ok("id-1".into()));
+    }
+
+    #[test]
+    fn a_session_with_nothing_open_is_not_a_wrong_id() {
+        // `NoSuchConnection` would send the caller looking for a typo in an id
+        // it never gave.
+        assert!(matches!(
+            choose(&open(&[]), None, false),
+            Err(Failure::Unsupported { .. })
+        ));
+    }
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
 
@@ -581,4 +673,135 @@ mod tests {
             Response::Schema(_)
         ));
     }
+}
+
+/// Somewhere to send a request: a session somebody else is running, or a store
+/// this process started.
+///
+/// Both front-ends over this surface need the same choice, and they made it
+/// twice before the MCP server arrived: attaching is tried first, because a
+/// running session's connections, tunnels and already-answered credential
+/// prompts are what a fresh store would have to pay for again — and for a
+/// profile that needs a person, cannot.
+#[derive(Debug)]
+pub enum Backend {
+    Attached(Client),
+    /// Held in a `Box` because a `Service` owns a store and this enum is
+    /// passed around by value.
+    Local(Box<Service>),
+}
+
+impl Backend {
+    /// Attach to the session at `path`, or build a local one.
+    ///
+    /// `start` is not called when a session answers, which is the point: it
+    /// opens connections, and opening them to find out they were not needed is
+    /// the cost attaching exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// Only a socket that is there and will not talk. Nothing listening is not
+    /// an error — it is the ordinary case, and the answer to it is a local
+    /// store.
+    pub async fn attach_or_start(
+        path: Option<&Path>,
+        start: impl FnOnce() -> Service,
+    ) -> io::Result<Self> {
+        if let Some(path) = path
+            && let Some(client) = Client::attach(path).await?
+        {
+            return Ok(Self::Attached(client));
+        }
+        Ok(Self::Local(Box::new(start())))
+    }
+
+    /// Whether this is a session that outlives the caller.
+    ///
+    /// What decides `Needs::LiveSession`: a store that dies with the process
+    /// cannot hold a connection or a query for anybody to ask about later.
+    #[must_use]
+    pub const fn is_attached(&self) -> bool {
+        matches!(self, Self::Attached(_))
+    }
+
+    /// Answer one request, wherever this is pointed.
+    ///
+    /// # Errors
+    ///
+    /// A socket that stopped answering. A local store cannot fail this way —
+    /// its failures are [`Failure`]s inside the response, which is the same
+    /// shape an attached one produces for the same reasons.
+    pub async fn request(&mut self, request: &Request) -> io::Result<Response> {
+        match self {
+            Self::Attached(client) => client.request(request).await,
+            Self::Local(service) => Ok(service.answer(request).await),
+        }
+    }
+
+    /// The store behind a local backend, for the one thing a caller has to do
+    /// to it directly: open the connection it will read through.
+    #[must_use]
+    pub const fn local(&self) -> Option<&Service> {
+        match self {
+            Self::Local(service) => Some(service),
+            Self::Attached(_) => None,
+        }
+    }
+}
+
+/// Which of a session's connections to act on.
+///
+/// Shared by every front-end over this surface rather than written once per
+/// front-end: the rules are protocol policy, and two copies would answer
+/// differently about which connection an agent just wrote to.
+///
+/// `destructive` is what closing sets. Everything else reads, and a read
+/// through the wrong connection is a wrong answer somebody can ask again; a
+/// close through the wrong one is somebody else's connection gone.
+///
+/// # Errors
+///
+/// [`Failure`] describing which of the two ways it found nothing: a profile
+/// that names no open connection, or a session with none at all.
+pub fn choose(
+    open: &[ConnectionInfo],
+    connect: Option<&str>,
+    destructive: bool,
+) -> Result<String, Failure> {
+    // Everything when nothing was named: a session with two connections open
+    // is ordinary, and narrowing that is what naming a profile is for.
+    let asked_for = |c: &&ConnectionInfo| connect.is_none_or(|p| c.profile == p);
+    if destructive && open.iter().filter(asked_for).count() > 1 {
+        let names: Vec<&str> = open
+            .iter()
+            .filter(asked_for)
+            .map(|c| c.profile.as_str())
+            .collect();
+        return Err(Failure::Unsupported {
+            message: format!(
+                "more than one connection matches ({}) — name one to say which",
+                names.join(", ")
+            ),
+        });
+    }
+    // A ready one ahead of the rest, because a session whose first connection
+    // failed to open still has a working second: taking one by position alone
+    // would answer with that failure instead of with the database.
+    let chosen = open
+        .iter()
+        .find(|c| asked_for(c) && c.status == Status::Ready)
+        .or_else(|| open.iter().find(asked_for));
+    chosen.map(|c| c.id.clone()).ok_or_else(|| match connect {
+        // The id a caller could have meant is the profile it named, so that is
+        // what the failure carries. Which connections *are* open is one
+        // `connection_list` away and does not belong in this answer.
+        Some(profile) => Failure::NoSuchConnection {
+            connection: profile.to_owned(),
+        },
+        // Not "no such connection": the session is reachable and has none, so
+        // there was never an id to get wrong.
+        None => Failure::Unsupported {
+            message: "the session has no connections open".to_owned(),
+        },
+    })
 }

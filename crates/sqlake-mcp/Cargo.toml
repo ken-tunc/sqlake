@@ -1,0 +1,23 @@
+[package]
+name = "sqlake-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { version = "3.2.0", features = ["server", "transport-io"] }
+serde_json.workspace = true
+sqlake-api.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
+[dev-dependencies]
+sqlake-app.workspace = true
+sqlake-core.workspace = true
+sqlake-driver-mock.workspace = true

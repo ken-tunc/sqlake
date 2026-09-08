@@ -23,7 +23,9 @@ pub use snapshot::{
     ConnectionInfo, EstimateInfo, NodeInfo, NodeStatus, PositionInfo, ProfileInfo, QueryInfo,
     QueryState, SessionInfo, Status,
 };
-pub use socket::{Client, DEFAULT_SESSION, Listener, ListenerHandle, session_name, socket_path};
+pub use socket::{
+    Backend, Client, DEFAULT_SESSION, Listener, ListenerHandle, choose, session_name, socket_path,
+};
 // The JSON a `Value` becomes is one answer, and it lives where both
 // front-ends reach it. Re-exported so a caller of this crate need not know
 // which layer settled it.
