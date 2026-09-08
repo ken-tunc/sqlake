@@ -12,17 +12,17 @@
 use std::time::Duration;
 
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::{LoadState, Snapshot};
+use sqlake_app::snapshot::{BusyOwner, LoadState, QueryView, Snapshot};
 use sqlake_app::store::Store;
 use sqlake_app::tree::NodeState;
 use sqlake_app::wait::WaitError;
-use sqlake_core::id::ConnId;
+use sqlake_core::id::{ConnId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::result::{Sort, SortDir};
 
 use crate::page::{Budget, Page};
 use crate::protocol::{Failure, Request, Response, schema};
-use crate::snapshot::{ConnectionInfo, NodeInfo, SessionInfo};
+use crate::snapshot::{ConnectionInfo, NodeInfo, QueryInfo, SessionInfo};
 
 /// How long a request waits for the store before giving up.
 ///
@@ -37,6 +37,13 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Service {
     store: Store,
     budget: Budget,
+    /// Bytes a query may cost before this surface refuses it, or `None` to
+    /// leave it to the session's own ceiling.
+    ///
+    /// Below the session's, and applied on top of it — never instead. A person
+    /// over their limit is shown a dialog and answers it; an agent over this
+    /// one cannot answer at all, which is why it is meant to be the lower.
+    max_bytes: Option<u64>,
     timeout: Duration,
 }
 
@@ -46,6 +53,7 @@ impl Service {
         Self {
             store,
             budget: Budget::DEFAULT,
+            max_bytes: None,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -53,6 +61,12 @@ impl Service {
     #[must_use]
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
+        self.max_bytes = max_bytes;
         self
     }
 
@@ -101,6 +115,32 @@ impl Service {
                 namespace,
             } => self
                 .children(connection, namespace)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::QueryEstimate { connection, sql } => self
+                .estimate_query(connection, sql)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::QueryRun {
+                connection,
+                sql,
+                max_bytes,
+            } => self
+                .run_query(connection, sql, self.max_bytes(*max_bytes))
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::QueryStatus { query, .. } => self
+                .query_status(query, request.budget(self.budget))
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::QueryWait {
+                query, timeout_ms, ..
+            } => self
+                .query_wait(query, *timeout_ms, request.budget(self.budget))
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::QueryCancel { query } => self
+                .query_cancel(query)
                 .await
                 .unwrap_or_else(Response::Failed),
             Request::TablePreview {
@@ -215,6 +255,178 @@ impl Service {
             .ok_or_else(|| Failure::NoSuchConnection {
                 connection: connection.to_owned(),
             })
+    }
+
+    /// Cost a statement and stop there.
+    ///
+    /// Waited on, unlike running: there is nothing to hold a handle for. The
+    /// answer is one number and it is the whole point of the call.
+    async fn estimate_query(&self, connection: &str, sql: &str) -> Result<Response, Failure> {
+        let conn = self.connection(connection).await?;
+        let query = QueryId::new();
+        let settled = self
+            .dispatch_and_settle(
+                Action::EstimateQuery {
+                    conn,
+                    query,
+                    sql: sql.to_owned(),
+                },
+                move |s| s.query(query).is_some_and(QueryView::is_settled),
+            )
+            .await?;
+        // Forgotten afterwards: an estimate leaves nothing to come back for,
+        // and a session accumulating one `QueryView` per question an agent
+        // asked is a leak with a plausible-looking cause. Waited on so that it
+        // is gone by the time this answers, rather than a moment later.
+        let answer = self.query_info(&settled, query)?;
+        self.dispatch_and_settle(Action::ForgetQuery(query), move |s| {
+            s.query(query).is_none()
+        })
+        .await?;
+        Ok(Response::Query(answer))
+    }
+
+    /// Start a query and answer with its handle.
+    ///
+    /// Not waited on: a query is not instantaneous, and a caller blocking on a
+    /// socket read for four minutes is a poor client. What it waits for is the
+    /// store *accepting* the action, so the id it is handed is one the next
+    /// request can ask about.
+    async fn run_query(
+        &self,
+        connection: &str,
+        sql: &str,
+        max_bytes: Option<u64>,
+    ) -> Result<Response, Failure> {
+        let conn = self.connection(connection).await?;
+        let query = QueryId::new();
+        let settled = self
+            .dispatch_and_settle(
+                Action::RunQuery {
+                    conn,
+                    query,
+                    sql: sql.to_owned(),
+                    // Not the caller's row budget. The store's page is shared
+                    // — a person may be looking at this query in the session
+                    // too — and capping the fetch would make them inherit an
+                    // agent's context window. The budget cuts what is *written
+                    // out*, which is what `Page::of` does below.
+                    max_rows: None,
+                    max_bytes,
+                },
+                move |s| s.query(query).is_some(),
+            )
+            .await?;
+        // The service's own budget, not a request's: this answers a handle
+        // and no rows, so there is nothing for a limit to cut.
+        Ok(Response::Query(QueryInfo::of(
+            self.query(&settled, query)?,
+            self.budget,
+        )))
+    }
+
+    /// The tighter of this surface's ceiling and the caller's.
+    ///
+    /// Only ever downward, the way a page limit is. The store applies the
+    /// session's on top of whatever comes out of here, so the effective
+    /// ceiling is the lowest of the three.
+    fn max_bytes(&self, asked: Option<u64>) -> Option<u64> {
+        match (self.max_bytes, asked) {
+            (Some(ours), Some(asked)) => Some(ours.min(asked)),
+            (ours, asked) => ours.or(asked),
+        }
+    }
+
+    async fn query_status(&self, query: &str, budget: Budget) -> Result<Response, Failure> {
+        let snapshot = self.store.snapshot();
+        let id = self.query_id(&snapshot, query)?;
+        Ok(Response::Query(QueryInfo::of(
+            self.query(&snapshot, id)?,
+            budget,
+        )))
+    }
+
+    /// Block until the query stops being in flight.
+    ///
+    /// `timeout_ms` is the caller's and the server's is the ceiling: a client
+    /// that could ask for an hour would be one that could hold a connection on
+    /// the far side of a socket for an hour.
+    ///
+    /// A wait that runs out answers with the query as it stands rather than
+    /// with a timeout failure. Nothing went wrong — the query is still
+    /// running, which is what the answer says, and asking again is the caller's
+    /// to decide.
+    async fn query_wait(
+        &self,
+        query: &str,
+        timeout_ms: Option<u64>,
+        budget: Budget,
+    ) -> Result<Response, Failure> {
+        let snapshot = self.store.snapshot();
+        let id = self.query_id(&snapshot, query)?;
+        let wanted = timeout_ms.map_or(self.timeout, Duration::from_millis);
+        let waited = self
+            .store
+            .settle(wanted.min(self.timeout), move |s| {
+                s.query(id).is_some_and(QueryView::is_settled)
+            })
+            .await;
+        let snapshot = match waited {
+            Ok(settled) => settled,
+            Err(WaitError::TimedOut) => self.store.snapshot(),
+            Err(other) => return Err(self.waited(other)),
+        };
+        Ok(Response::Query(QueryInfo::of(
+            self.query(&snapshot, id)?,
+            budget,
+        )))
+    }
+
+    /// Stop a query, and answer with what it became.
+    ///
+    /// The busy row is what carries the cancellation, so a query that has
+    /// already finished has nothing to cancel — and is answered as it stands
+    /// rather than refused, because "it is already done" is the same news.
+    async fn query_cancel(&self, query: &str) -> Result<Response, Failure> {
+        let snapshot = self.store.snapshot();
+        let id = self.query_id(&snapshot, query)?;
+        let busy = snapshot
+            .busy
+            .iter()
+            .find(|b| b.owner == BusyOwner::Query(id))
+            .map(|b| b.id);
+
+        let snapshot = match busy {
+            Some(busy) => {
+                self.dispatch_and_settle(Action::Cancel(busy), move |s| {
+                    s.query(id).is_some_and(QueryView::is_settled)
+                })
+                .await?
+            }
+            None => snapshot,
+        };
+        Ok(Response::Query(self.query_info(&snapshot, id)?))
+    }
+
+    fn query_id(&self, snapshot: &Snapshot, query: &str) -> Result<QueryId, Failure> {
+        snapshot
+            .queries
+            .iter()
+            .find(|q| q.id.to_string() == query)
+            .map(|q| q.id)
+            .ok_or_else(|| Failure::NoSuchQuery {
+                query: query.to_owned(),
+            })
+    }
+
+    fn query<'a>(&self, snapshot: &'a Snapshot, id: QueryId) -> Result<&'a QueryView, Failure> {
+        snapshot.query(id).ok_or_else(|| Failure::NoSuchQuery {
+            query: id.to_string(),
+        })
+    }
+
+    fn query_info(&self, snapshot: &Snapshot, id: QueryId) -> Result<QueryInfo, Failure> {
+        Ok(QueryInfo::of(self.query(snapshot, id)?, self.budget))
     }
 
     async fn namespaces(&self, connection: &str) -> Result<Response, Failure> {
@@ -460,6 +672,7 @@ fn expanded(snapshot: &Snapshot, conn: ConnId, node: &NodeRef) -> Result<(), Fai
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use serde_json::Value as Json;
     use sqlake_app::store::Drivers;
@@ -469,7 +682,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{FailureKind, ResponseKind, SortBy};
-    use crate::snapshot::Status;
+    use crate::snapshot::{EstimateInfo, QueryState, Status};
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
         service_of(MockDriver::new(behaviour)).await
@@ -644,6 +857,303 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_query_runs_and_its_rows_come_back_on_the_wire() {
+        let (service, conn) = service(Behaviour::instant()).await;
+        let Response::Query(started) = service
+            .answer(&Request::QueryRun {
+                connection: conn,
+                sql: "select * from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started one");
+        };
+
+        let Response::Query(done) = service
+            .answer(&Request::QueryWait {
+                query: started.id.clone(),
+                timeout_ms: None,
+                // The limit is on the request that reads the rows, not on
+                // the one that started the query — that answers a handle.
+                limit: Some(3),
+            })
+            .await
+        else {
+            panic!("should have waited");
+        };
+        assert_eq!(done.id, started.id, "the same query, not a new one");
+        let QueryState::Ready { page } = done.state else {
+            panic!("{done:?}");
+        };
+        assert_eq!(page.returned, 3, "the caller asked for three");
+        assert!(page.truncated, "and has to be told it did not get them all");
+    }
+
+    #[tokio::test]
+    async fn estimating_costs_a_statement_without_running_it() {
+        let (service, conn) = service_of(
+            MockDriver::new(Behaviour {
+                estimate_bytes: 4096,
+                ..Behaviour::instant()
+            })
+            .with_capabilities(sqlake_driver_mock::ESTIMATES),
+        )
+        .await;
+        let Response::Query(answer) = service
+            .answer(&Request::QueryEstimate {
+                connection: conn,
+                sql: "select * from public.users".into(),
+            })
+            .await
+        else {
+            panic!("should have estimated");
+        };
+        assert_eq!(answer.estimate, Some(EstimateInfo::Bytes { bytes: 4096 }));
+        // Estimated, not ready: no rows were asked for, and saying otherwise
+        // would be this surface running something nobody requested.
+        assert!(matches!(answer.state, QueryState::Estimated), "{answer:?}");
+
+        // And it leaves nothing behind. A session accumulating a `QueryView`
+        // per question an agent asked is a leak with a plausible cause.
+        assert!(service.store().snapshot().queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_query_over_the_agents_ceiling_stops_and_says_what_it_would_cost() {
+        let (service, conn) = service_of(
+            MockDriver::new(Behaviour {
+                estimate_bytes: 5_000,
+                ..Behaviour::instant()
+            })
+            .with_capabilities(sqlake_driver_mock::ESTIMATES),
+        )
+        .await;
+        let service = service.with_max_bytes(Some(1_000));
+
+        let Response::Query(started) = service
+            .answer(&Request::QueryRun {
+                connection: conn,
+                sql: "select * from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started one");
+        };
+        let Response::Query(done) = service
+            .answer(&Request::QueryWait {
+                query: started.id,
+                timeout_ms: None,
+                limit: None,
+            })
+            .await
+        else {
+            panic!("should have waited");
+        };
+
+        // Not a failure: over the budget is an answer, and the number goes to
+        // a person this caller cannot be.
+        let QueryState::NeedsApproval { budget } = done.state else {
+            panic!("{done:?}");
+        };
+        assert_eq!(budget, 1_000);
+        assert_eq!(done.estimate, Some(EstimateInfo::Bytes { bytes: 5_000 }));
+    }
+
+    #[tokio::test]
+    async fn a_caller_can_lower_the_ceiling_and_never_raise_it() {
+        let with_budget = |ours: Option<u64>| {
+            Service::new(Store::spawn(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(MockProfiles::default()),
+                PageRequest::DEFAULT_LIMIT,
+                None,
+            ))
+            .with_max_bytes(ours)
+        };
+
+        assert_eq!(with_budget(Some(1_000)).max_bytes(Some(500)), Some(500));
+        assert_eq!(
+            with_budget(Some(1_000)).max_bytes(Some(9_000)),
+            Some(1_000),
+            "a request cannot raise the surface's own"
+        );
+        assert_eq!(with_budget(None).max_bytes(Some(500)), Some(500));
+        assert_eq!(with_budget(Some(1_000)).max_bytes(None), Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn a_query_can_be_cancelled_while_it_runs() {
+        let (service, conn) = service(Behaviour {
+            query_latency: Duration::from_secs(30),
+            ..Behaviour::instant()
+        })
+        .await;
+        let Response::Query(started) = service
+            .answer(&Request::QueryRun {
+                connection: conn,
+                sql: "select * from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started one");
+        };
+        assert!(matches!(started.state, QueryState::Working), "{started:?}");
+
+        let Response::Query(stopped) = service
+            .answer(&Request::QueryCancel {
+                query: started.id.clone(),
+            })
+            .await
+        else {
+            panic!("should have cancelled it");
+        };
+        let QueryState::Failed { message, .. } = stopped.state else {
+            panic!("{stopped:?}");
+        };
+        assert_eq!(message, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancelling_something_already_finished_says_what_it_became() {
+        // "It is already done" is the same news as "it stopped", and refusing
+        // would make a caller that raced the query handle an error for
+        // something that went right.
+        let (service, conn) = service(Behaviour::instant()).await;
+        let Response::Query(started) = service
+            .answer(&Request::QueryRun {
+                connection: conn,
+                sql: "select * from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started one");
+        };
+        let _ = service
+            .answer(&Request::QueryWait {
+                query: started.id.clone(),
+                timeout_ms: None,
+                limit: None,
+            })
+            .await;
+        let Response::Query(after) = service
+            .answer(&Request::QueryCancel { query: started.id })
+            .await
+        else {
+            panic!("should have answered");
+        };
+        assert!(matches!(after.state, QueryState::Ready { .. }), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn waiting_that_runs_out_answers_with_the_query_rather_than_a_timeout() {
+        // Nothing went wrong: the query is still running, which is what the
+        // answer says, and asking again is the caller's to decide.
+        let (service, conn) = service(Behaviour {
+            query_latency: Duration::from_secs(30),
+            ..Behaviour::instant()
+        })
+        .await;
+        let Response::Query(started) = service
+            .answer(&Request::QueryRun {
+                connection: conn,
+                sql: "select * from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started one");
+        };
+        let Response::Query(still) = service
+            .answer(&Request::QueryWait {
+                query: started.id,
+                timeout_ms: Some(50),
+                limit: None,
+            })
+            .await
+        else {
+            panic!("should have answered");
+        };
+        assert!(matches!(still.state, QueryState::Working), "{still:?}");
+    }
+
+    #[tokio::test]
+    async fn a_query_this_session_never_started_is_named_as_a_query() {
+        let (service, _) = service(Behaviour::instant()).await;
+        for request in [
+            Request::QueryStatus {
+                query: "nope".into(),
+                limit: None,
+            },
+            Request::QueryWait {
+                query: "nope".into(),
+                timeout_ms: None,
+                limit: None,
+            },
+            Request::QueryCancel {
+                query: "nope".into(),
+            },
+        ] {
+            let answer = service.answer(&request).await;
+            assert!(
+                matches!(answer, Response::Failed(Failure::NoSuchQuery { .. })),
+                "{request:?} answered {answer:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_over_the_socket_is_refused_on_a_read_only_connection() {
+        let store = Store::spawn(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::read_only()),
+            PageRequest::DEFAULT_LIMIT,
+            None,
+        );
+        let conn = ConnId::new();
+        store
+            .dispatch_and_settle(
+                Action::Connect {
+                    profile: ProfileId::parse("mock").expect("a usable id"),
+                    conn,
+                },
+                DEFAULT_TIMEOUT,
+                |s| s.connection_settled(conn),
+            )
+            .await
+            .expect("it connects");
+        let service = Service::new(store);
+
+        let Response::Query(started) = service
+            .answer(&Request::QueryRun {
+                connection: conn.to_string(),
+                sql: "delete from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started one");
+        };
+        let Response::Query(done) = service
+            .answer(&Request::QueryWait {
+                query: started.id,
+                timeout_ms: None,
+                limit: None,
+            })
+            .await
+        else {
+            panic!("should have waited");
+        };
+        let QueryState::Failed { message, .. } = done.state else {
+            panic!("{done:?}");
+        };
+        assert!(message.contains("read-only"), "{message}");
+    }
+
+    #[tokio::test]
     async fn no_response_carries_a_credential() {
         fn keys(value: &Json, into: &mut BTreeSet<String>) {
             match value {
@@ -701,7 +1211,7 @@ mod tests {
             Service::new(session.store().clone())
                 .with_budget(narrow)
                 .answer(&Request::TablePreview {
-                    connection: conn,
+                    connection: conn.clone(),
                     table: vec!["public".into(), "users".into()],
                     sort: None,
                     limit: None,
@@ -715,6 +1225,28 @@ mod tests {
             session
                 .answer(&Request::ConnectionOpen {
                     profile: "mock".into(),
+                })
+                .await,
+        );
+
+        // A query, run and waited on, which is the only way to reach `Query`
+        // with rows on it.
+        let Response::Query(started) = session
+            .answer(&Request::QueryRun {
+                connection: conn.clone(),
+                sql: "select * from public.users".into(),
+                max_bytes: None,
+            })
+            .await
+        else {
+            panic!("should have started a query");
+        };
+        responses.push(
+            session
+                .answer(&Request::QueryWait {
+                    query: started.id,
+                    timeout_ms: None,
+                    limit: None,
                 })
                 .await,
         );
@@ -735,6 +1267,7 @@ mod tests {
             Failure::NoSuchProfile {
                 profile: "prod".into(),
             },
+            Failure::NoSuchQuery { query: "q".into() },
             Failure::NotFound {
                 path: vec!["public".into()],
             },
@@ -802,6 +1335,11 @@ mod tests {
             "data",
             "driver",
             "error",
+            // A query's own vocabulary. `sql` is the statement the caller
+            // sent back to it, and `measured` says which unit an estimate is
+            // in — neither is derived from a credential, which is what this
+            // list is watching for.
+            "estimate",
             "free_preview",
             "hierarchy",
             "id",
@@ -809,16 +1347,20 @@ mod tests {
             "message",
             "name",
             "nullable",
+            "measured",
             "omitted_columns",
+            "page",
             "path",
             "profile",
             "profiles",
+            "query",
             "reason",
             "relation_kind",
             "response",
             "returned",
             "rows",
             "sortable_preview",
+            "sql",
             "state",
             "status",
             "total",

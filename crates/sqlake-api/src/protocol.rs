@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
 use crate::page::{Budget, Page};
-use crate::snapshot::{ConnectionInfo, NodeInfo, SessionInfo};
+use crate::snapshot::{ConnectionInfo, NodeInfo, QueryInfo, SessionInfo};
 
 /// Which column to sort a preview by.
 ///
@@ -91,6 +91,57 @@ pub enum Request {
         namespace: Vec<String>,
     },
 
+    /// What a statement would cost, without running it.
+    ///
+    /// The answer an agent surfaces to a person before asking for the query
+    /// itself, which is why it is a request of its own rather than a flag:
+    /// reaching the number through `query_run` would mean asking for something
+    /// and hoping the budget said no.
+    QueryEstimate { connection: String, sql: String },
+
+    /// Run a statement, and answer with a handle rather than with rows.
+    ///
+    /// Immediately: a query is not instantaneous, and a caller blocking on a
+    /// socket read for four minutes is a poor client. `query_wait` is how to
+    /// block on purpose.
+    QueryRun {
+        connection: String,
+        sql: String,
+        /// A tighter byte ceiling than the session's, in bytes.
+        ///
+        /// Only ever downward, for the same reason `limit` is: a request that
+        /// could raise it would be the protection asking permission from the
+        /// party it protects against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    },
+
+    /// Where a query has got to, answered at once whatever that is.
+    QueryStatus {
+        query: String,
+        /// Fewer rows than the server's budget allows. Only ever downward.
+        ///
+        /// Here rather than on `query_run`, which answers a handle and never
+        /// rows: the limit belongs to the request that does the reading, and
+        /// two calls reading the same finished query may want different
+        /// amounts of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+
+    /// Block until a query finishes, fails, or the wait runs out.
+    QueryWait {
+        query: String,
+        /// How long to wait. The server's own timeout is the ceiling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+
+    /// Stop a query this session started.
+    QueryCancel { query: String },
+
     /// A page of one relation.
     TablePreview {
         connection: String,
@@ -140,6 +191,11 @@ request_kinds! {
     NamespaceList   => "namespace_list",
     TableList       => "table_list",
     TablePreview    => "table_preview",
+    QueryEstimate   => "query_estimate",
+    QueryRun        => "query_run",
+    QueryStatus     => "query_status",
+    QueryWait       => "query_wait",
+    QueryCancel     => "query_cancel",
 }
 
 impl Request {
@@ -160,6 +216,11 @@ impl Request {
             Self::NamespaceList { .. } => RequestKind::NamespaceList,
             Self::TableList { .. } => RequestKind::TableList,
             Self::TablePreview { .. } => RequestKind::TablePreview,
+            Self::QueryEstimate { .. } => RequestKind::QueryEstimate,
+            Self::QueryRun { .. } => RequestKind::QueryRun,
+            Self::QueryStatus { .. } => RequestKind::QueryStatus,
+            Self::QueryWait { .. } => RequestKind::QueryWait,
+            Self::QueryCancel { .. } => RequestKind::QueryCancel,
         }
     }
 
@@ -169,6 +230,12 @@ impl Request {
     pub fn budget(&self, server: Budget) -> Budget {
         match self {
             Self::TablePreview {
+                limit: Some(rows), ..
+            }
+            | Self::QueryStatus {
+                limit: Some(rows), ..
+            }
+            | Self::QueryWait {
                 limit: Some(rows), ..
             } => Budget {
                 max_rows: server.max_rows.min(*rows),
@@ -189,6 +256,12 @@ impl Request {
 pub enum Failure {
     /// No connection with this id is open.
     NoSuchConnection { connection: String },
+    /// No query with this id was started by this session.
+    ///
+    /// Its own failure rather than a `NotFound` with a one-element path: a
+    /// query id is not a path through anything, and a caller that lost one
+    /// needs to be told which kind of thing it lost.
+    NoSuchQuery { query: String },
     /// No profile with this id is configured. Distinct from
     /// [`Failure::NoSuchConnection`] because the two are fixed in different
     /// files: one is a typo in the request, the other in `connections.toml`.
@@ -233,6 +306,10 @@ pub enum Response {
     /// deliberately does not make.
     Nodes(Vec<NodeInfo>),
     Page(Page),
+    /// One query, wherever it has got to. The answer to running, waiting,
+    /// asking and cancelling alike: all four are questions about one thing,
+    /// and giving each its own shape would make a caller parse four.
+    Query(QueryInfo),
     Failed(Failure),
 }
 
@@ -252,7 +329,7 @@ macro_rules! kinds {
     };
 }
 
-kinds!(ResponseKind: Snapshot, Schema, Connections, Connection, Nodes, Page, Failed);
+kinds!(ResponseKind: Snapshot, Schema, Connections, Connection, Nodes, Page, Query, Failed);
 
 // One level below `ResponseKind`, because a `Failed` response is not one
 // shape: each variant carries its own fields, so a check that samples one
@@ -260,6 +337,7 @@ kinds!(ResponseKind: Snapshot, Schema, Connections, Connection, Nodes, Page, Fai
 kinds!(
     FailureKind: NoSuchConnection,
     NoSuchProfile,
+    NoSuchQuery,
     NotFound,
     Driver,
     Timeout,
@@ -279,6 +357,7 @@ impl Response {
             Self::Connection(_) => ResponseKind::Connection,
             Self::Nodes(_) => ResponseKind::Nodes,
             Self::Page(_) => ResponseKind::Page,
+            Self::Query(_) => ResponseKind::Query,
             Self::Failed(_) => ResponseKind::Failed,
         }
     }
@@ -293,6 +372,7 @@ impl Failure {
         match self {
             Self::NoSuchConnection { .. } => FailureKind::NoSuchConnection,
             Self::NoSuchProfile { .. } => FailureKind::NoSuchProfile,
+            Self::NoSuchQuery { .. } => FailureKind::NoSuchQuery,
             Self::NotFound { .. } => FailureKind::NotFound,
             Self::Driver { .. } => FailureKind::Driver,
             Self::Timeout { .. } => FailureKind::Timeout,
@@ -390,6 +470,25 @@ mod tests {
             Request::ConnectionClose {
                 connection: "c".into(),
             },
+            Request::QueryEstimate {
+                connection: "c".into(),
+                sql: "select 1".into(),
+            },
+            Request::QueryRun {
+                connection: "c".into(),
+                sql: "select 1".into(),
+                max_bytes: None,
+            },
+            Request::QueryStatus {
+                query: "q".into(),
+                limit: None,
+            },
+            Request::QueryWait {
+                query: "q".into(),
+                timeout_ms: None,
+                limit: None,
+            },
+            Request::QueryCancel { query: "q".into() },
         ];
         for request in &requests {
             let json = serde_json::to_value(request).expect("a request serialises");

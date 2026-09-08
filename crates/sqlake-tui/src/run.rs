@@ -1668,6 +1668,7 @@ mod tests {
             query,
             sql: sql.to_owned(),
             max_rows: None,
+            max_bytes: None,
         });
         until(&mut rx, |s| {
             s.query(query).is_some_and(|q| q.data.error().is_some())
@@ -1705,6 +1706,7 @@ mod tests {
             query,
             sql: "select * from public.users".to_owned(),
             max_rows: None,
+            max_bytes: None,
         });
         until(&mut rx, |s| {
             s.query(query).is_some_and(|q| q.data.ready().is_some())

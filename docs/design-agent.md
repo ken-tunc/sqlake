@@ -53,6 +53,11 @@ sqlake table list|preview
 
 Planned, with the milestone that brings each:
 
+sqlake query estimate|run|status|wait|cancel
+```
+
+Planned, with the milestone that brings each:
+
 ```
 sqlake table describe           M5
 sqlake query estimate|run|status|cancel|wait
@@ -109,12 +114,13 @@ this is new machinery; it is the existing guards with an agent-shaped policy on 
 `Session::execute` accepts only an `ApprovedQuery`, so no caller — agent or human — can run a
 query that was never estimated. What differs for an agent is how approval is granted:
 
-- A **byte budget** rather than a dialog. `agent.max_bytes_billed` in `config.toml`, defaulting
-  well below the profile's own ceiling.
+- A **byte budget** rather than a dialog. `agent.max_bytes_billed` in `config.toml`, refused at
+  load time if it is above the session's own — a ceiling that does nothing is one somebody
+  wrote expecting an effect. `query run --max-bytes` lowers it further and can never raise it.
 - Within budget → the query runs.
-- Over budget → the API returns the `NeedsApproval` variant with the estimate. The agent cannot
-  turn that into an approval itself; it has to surface the number to a human, who approves it
-  through the TUI or by re-issuing with `--approve-up-to`.
+- Over budget → the API answers `{"state": "needs_approval", "budget": …}` with the estimate.
+  The agent cannot turn that into an approval itself; it has to surface the number to a human,
+  who approves it in the TUI.
 
 `NeedsApproval` being a normal output rather than an error (architecture §4.2) is what makes
 this a clean protocol response instead of an error path with special handling.
@@ -152,6 +158,11 @@ Every agent-issued query goes into the same `query_history` table as a human's, 
 
 One history, one place to look when something unexpected happened to the data.
 
+M8's, not A2's, and that is the honest order rather than a slip: there is no history table
+until M8 builds one, and an `issuer` column on nothing is a column. What A2 owes it is that
+every query already carries a `QueryId` and the connection it ran on, so the row M8 writes has
+something to be about.
+
 ### 3.5 Secrets never cross the socket
 
 `Snapshot` carries no `ResolvedProfile` today, and serialisation must not be the thing that
@@ -165,13 +176,20 @@ host, a user or anything derived from a credential.
 Queries are not instantaneous, and an agent blocking on a socket read for four minutes is a
 poor client.
 
-`query run` returns a handle immediately. `query status <id>` reports progress, and
-`query wait <id> --timeout 30s` blocks until the query finishes, fails or the timeout expires
-— the same shape as `herdr agent wait`. `query cancel <id>` maps onto the existing
-`CancelHandle`, so an agent can stop something it started.
+Built. `query run` returns a handle immediately; `query status <id>` reports progress, and
+`query wait <id> --timeout-ms 30000` blocks until the query finishes, fails or the wait runs
+out — a wait that runs out answers with the query as it stands rather than with a timeout,
+because nothing went wrong. `query cancel <id>` stops it, and stops it at the server wherever
+`capabilities.cancel` says so.
 
-This is the one place the agent surface needs something the TUI does not: a stable, external
-id for a running query. `BusyId` is process-local and already exists; it becomes the handle.
+The handle is `QueryId`, not `BusyId` as this once said. `BusyId` names a piece of work in
+flight and is gone the moment it finishes, so `query status` on a query that had already
+finished would have had nothing to name.
+
+The row budget rides on `query status` and `query wait` rather than on `query run`, for the
+same reason: `run` answers a handle and no rows, so a limit there would be an argument that
+does nothing. It cuts what is *written out* and never what the store fetched — a person sharing
+the session must not inherit an agent's context window.
 
 ---
 
@@ -215,7 +233,7 @@ keeps M1–M8 aligned one-to-one with the eight features.
 | # | Lands after | Content | Done when |
 | --- | --- | --- | --- |
 | **A1** | M2 | Read-only CLI and socket API — **built**, in `sqlake-api` | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
-| **A2** | M4 | Query execution over the API | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close` — running SQL is the first thing that needs a connection the caller chose. The byte budget and `NeedsApproval`, read-only enforcement, `issuer` in history |
+| **A2** | M4 | Query execution over the API — **built** | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close`. The byte budget and `NeedsApproval`, read-only enforcement. `issuer` in history waits for M8, which is where the history table arrives |
 | **A3** | A2 | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
 Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**

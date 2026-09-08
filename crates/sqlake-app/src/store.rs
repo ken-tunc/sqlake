@@ -19,7 +19,7 @@ use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
-use sqlake_core::sql::{Access, RawSql};
+use sqlake_core::sql::{Access, Estimate, RawSql};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
@@ -32,9 +32,9 @@ use crate::snapshot::{
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
-    Connect, ConnectInput, ConnectOutput, ExpandNode, ExpandNodeInput, ExpandNodeOutput,
-    PreviewTable, PreviewTableInput, PreviewTableOutput, RunApproved, RunQuery, RunQueryInput,
-    RunQueryOutput, UseCase,
+    Connect, ConnectInput, ConnectOutput, EstimateQuery, EstimateQueryInput, ExpandNode,
+    ExpandNodeInput, ExpandNodeOutput, PreviewTable, PreviewTableInput, PreviewTableOutput,
+    RunApproved, RunQuery, RunQueryInput, RunQueryOutput, UseCase,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -193,6 +193,11 @@ enum Event {
         query: QueryId,
         busy: BusyId,
         result: AppResult<RunQueryOutput>,
+    },
+    Estimated {
+        query: QueryId,
+        busy: BusyId,
+        result: AppResult<Estimate>,
     },
     Previewed {
         conn: ConnId,
@@ -442,7 +447,9 @@ impl Runtime {
                 query,
                 sql,
                 max_rows,
-            } => self.run_query(conn, query, sql, max_rows),
+                max_bytes,
+            } => self.run_query(conn, query, sql, max_rows, max_bytes),
+            Action::EstimateQuery { conn, query, sql } => self.estimate_query(conn, query, sql),
             Action::ApproveQuery(query) => self.approve_query(query),
             Action::ForgetQuery(query) => self.forget_query(query),
             Action::Cancel(id) => self.cancel(id),
@@ -778,7 +785,14 @@ impl Runtime {
     /// The budget comes from this store rather than from the caller: it is the
     /// user's own ceiling, and a front-end that could name its own would be a
     /// front-end that could raise it.
-    fn run_query(&mut self, conn_id: ConnId, id: QueryId, sql: String, max_rows: Option<u32>) {
+    fn run_query(
+        &mut self,
+        conn_id: ConnId,
+        id: QueryId,
+        sql: String,
+        max_rows: Option<u32>,
+        max_bytes: Option<u64>,
+    ) {
         let Some(conn) = self.conns.iter().find(|c| c.id == conn_id) else {
             return;
         };
@@ -807,7 +821,13 @@ impl Runtime {
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running a query");
         let events = self.events.clone();
-        let budget = self.budget;
+        // The tighter of the two. A caller can lower the session's ceiling and
+        // never raise it — which is what makes an agent's budget a budget
+        // rather than a suggestion.
+        let budget = match (self.budget, max_bytes) {
+            (Some(session), Some(asked)) => Some(session.min(asked)),
+            (session, asked) => session.or(asked),
+        };
         self.spawn_task(busy, async move {
             let result = RunQuery { session }
                 .execute(RunQueryInput {
@@ -823,6 +843,70 @@ impl Runtime {
                 result,
             });
         });
+    }
+
+    /// Cost a statement and stop there.
+    ///
+    /// The query is recorded like any other, so the answer arrives where every
+    /// other answer does — and `data` stays `Idle`, which is exactly true: no
+    /// rows were requested.
+    fn estimate_query(&mut self, conn_id: ConnId, id: QueryId, sql: String) {
+        let Some(conn) = self.conns.iter().find(|c| c.id == conn_id) else {
+            return;
+        };
+        let Some(session) = conn.session.clone() else {
+            return;
+        };
+        let access = conn.access;
+        if self.queries.iter().any(|q| q.id == id) {
+            tracing::warn!(query = %id.short(), "estimate: that query id is already in use");
+            return;
+        }
+
+        self.queries.push(QueryView {
+            id,
+            conn: conn_id,
+            sql: sql.clone(),
+            estimate: None,
+            needs_approval: None,
+            data: LoadState::Loading,
+            failed_at: None,
+        });
+
+        let busy = self.begin_busy(BusyOwner::Query(id), "estimating a query");
+        let events = self.events.clone();
+        self.spawn_task(busy, async move {
+            let result = EstimateQuery { session }
+                .execute(EstimateQueryInput {
+                    sql: RawSql::new(sql),
+                    access,
+                })
+                .await;
+            let _ = events.send(Event::Estimated {
+                query: id,
+                busy,
+                result,
+            });
+        });
+    }
+
+    fn estimated(&mut self, id: QueryId, result: AppResult<Estimate>) {
+        let Some(query) = self.queries.iter_mut().find(|q| q.id == id) else {
+            return;
+        };
+        query.failed_at = None;
+        match result {
+            Ok(estimate) => {
+                query.estimate = Some(estimate);
+                // Idle rather than Ready: nothing was run, and there are no
+                // rows to be had from this query without asking again.
+                query.data = LoadState::Idle;
+            }
+            Err(err) => {
+                query.failed_at = err.at();
+                query.data = LoadState::Failed(err.user_message());
+            }
+        }
     }
 
     /// Run what a person has just said yes to.
@@ -1057,6 +1141,14 @@ impl Runtime {
             } => {
                 self.end_busy(busy);
                 self.ran(query, result);
+            }
+            Event::Estimated {
+                query,
+                busy,
+                result,
+            } => {
+                self.end_busy(busy);
+                self.estimated(query, result);
             }
             Event::Previewed {
                 conn,
@@ -1443,6 +1535,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             |s| !s.busy.is_empty(),
         )
@@ -1490,6 +1583,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             |s| !s.busy.is_empty(),
         )
@@ -1504,6 +1598,7 @@ mod tests {
                 query: second,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(second).is_some_and(QueryView::is_settled),
         )
@@ -1531,6 +1626,7 @@ mod tests {
                 query: id,
                 sql: "delete from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(QueryView::is_settled),
         )
@@ -1561,6 +1657,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(QueryView::is_settled),
         )
@@ -1579,6 +1676,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(QueryView::is_settled),
         )
@@ -1603,6 +1701,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             });
         }
         let snap = until(&store, |s| {
@@ -1624,6 +1723,7 @@ mod tests {
             query: id,
             sql: sql.to_owned(),
             max_rows: None,
+            max_bytes: None,
         };
         let _ = settled(&store, run("select * from public.users"), move |s| {
             s.query(id).is_some_and(QueryView::is_settled)
@@ -1655,6 +1755,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
         )
@@ -1696,6 +1797,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
         )
@@ -1727,6 +1829,7 @@ mod tests {
                 query: id,
                 sql: "drop table x; select 1".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(QueryView::is_settled),
         )
@@ -1746,6 +1849,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(QueryView::is_settled),
         )
@@ -1771,6 +1875,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(QueryView::is_settled),
         )
@@ -1798,6 +1903,7 @@ mod tests {
             query: id,
             sql: "select * from public.users".to_owned(),
             max_rows: None,
+            max_bytes: None,
         });
         until(&store, move |s| {
             s.query(id).is_some_and(|q| q.data.is_loading())
@@ -1832,6 +1938,7 @@ mod tests {
                 query: id,
                 sql: "select * from public.users".to_owned(),
                 max_rows: None,
+                max_bytes: None,
             },
             move |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
         )
@@ -1865,6 +1972,7 @@ mod tests {
             query: id,
             sql: "select * from public.users".to_owned(),
             max_rows: None,
+            max_bytes: None,
         });
         until(&store, move |s| !s.busy.is_empty()).await;
 

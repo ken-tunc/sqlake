@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::{Args as ClapArgs, Subcommand};
-use sqlake_api::{ConnectionInfo, Failure, Request, Response, Service, Status};
+use sqlake_api::{ConnectionInfo, Failure, QueryState, Request, Response, Service, Status};
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
+use sqlake_config::Settings;
 use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::profile::{ProfileError, ProfileSummary, Profiles, ResolvedProfile};
 
@@ -45,6 +46,52 @@ pub(crate) enum Command {
     Table {
         #[command(subcommand)]
         what: TableCommand,
+    },
+    /// Statements, and what running them produced.
+    Query {
+        #[command(subcommand)]
+        what: QueryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum QueryCommand {
+    /// What a statement would cost, without running it.
+    Estimate {
+        #[arg(value_name = "SQL")]
+        sql: String,
+    },
+    /// Run a statement. Answers with a handle rather than with rows.
+    Run {
+        #[arg(value_name = "SQL")]
+        sql: String,
+        /// A tighter byte ceiling than the session's. It cannot raise it.
+        #[arg(long, value_name = "BYTES")]
+        max_bytes: Option<u64>,
+    },
+    /// Where a query has got to, answered at once.
+    Status {
+        #[arg(value_name = "ID")]
+        query: String,
+        /// Fewer rows than the budget allows. It cannot ask for more.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Block until a query finishes, fails, or the wait runs out.
+    Wait {
+        #[arg(value_name = "ID")]
+        query: String,
+        /// How long to wait. The session's own timeout is the ceiling.
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
+        /// Fewer rows than the budget allows. It cannot ask for more.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Stop a query this session started.
+    Cancel {
+        #[arg(value_name = "ID")]
+        query: String,
     },
 }
 
@@ -159,6 +206,42 @@ impl Command {
                 connection,
                 namespace: path.segments(),
             },
+            Self::Query {
+                what: QueryCommand::Estimate { sql },
+            } => Request::QueryEstimate {
+                connection,
+                sql: sql.clone(),
+            },
+            Self::Query {
+                what: QueryCommand::Run { sql, max_bytes },
+            } => Request::QueryRun {
+                connection,
+                sql: sql.clone(),
+                max_bytes: *max_bytes,
+            },
+            Self::Query {
+                what: QueryCommand::Status { query, limit },
+            } => Request::QueryStatus {
+                query: query.clone(),
+                limit: *limit,
+            },
+            Self::Query {
+                what:
+                    QueryCommand::Wait {
+                        query,
+                        timeout_ms,
+                        limit,
+                    },
+            } => Request::QueryWait {
+                query: query.clone(),
+                timeout_ms: *timeout_ms,
+                limit: *limit,
+            },
+            Self::Query {
+                what: QueryCommand::Cancel { query },
+            } => Request::QueryCancel {
+                query: query.clone(),
+            },
             Self::Table {
                 what: TableCommand::Preview { path, sort, limit },
             } => Request::TablePreview {
@@ -214,6 +297,13 @@ impl Command {
                 what: ConnectionCommand::Close,
             } => Needs::LiveConnection,
             Self::Schema { .. } | Self::Table { .. } => Needs::Connection,
+            // Estimating and running name a connection; the other three name a
+            // query the session already has, and a one-shot store has none of
+            // its own to name.
+            Self::Query {
+                what: QueryCommand::Estimate { .. } | QueryCommand::Run { .. },
+            } => Needs::Connection,
+            Self::Query { .. } => Needs::LiveSession,
         }
     }
 }
@@ -279,7 +369,7 @@ pub(crate) fn run(
     command: &Command,
     drivers: Drivers,
     profiles: Arc<dyn Profiles>,
-    page_size: u32,
+    settings: &Settings,
     connect: Option<ProfileId>,
     session: Option<PathBuf>,
 ) -> Result<std::process::ExitCode> {
@@ -302,7 +392,7 @@ pub(crate) fn run(
         {
             return attached(&mut client, command, connect.as_ref()).await;
         }
-        one_shot(command, drivers, profiles, page_size, connect).await
+        one_shot(command, drivers, profiles, settings, connect).await
     });
     // The runtime goes without waiting for anything still resolving a profile,
     // for the reason in the doc comment above.
@@ -415,11 +505,9 @@ async fn one_shot(
     command: &Command,
     drivers: Drivers,
     profiles: Arc<dyn Profiles>,
-    page_size: u32,
+    settings: &Settings,
     connect: Option<ProfileId>,
 ) -> Result<Response> {
-    // No budget: an agent runs nothing yet, and A2 is where the answer
-    // to "who says yes for one" is decided rather than assumed here.
     // Before the store is even started: what this refuses is not a failure of
     // the store, and starting one to say so would open a connection first.
     if command.needs().outlives_the_command() {
@@ -429,7 +517,16 @@ async fn one_shot(
                 .to_owned(),
         }));
     }
-    let service = Service::new(Store::spawn(drivers, profiles, page_size, None));
+    // Both ceilings, the way an attached session has both: the store applies
+    // the session's and the service applies the agent's on top, so a one-shot
+    // run refuses exactly what the same command would be refused over a socket.
+    let service = Service::new(Store::spawn(
+        drivers,
+        profiles,
+        settings.page_size,
+        settings.max_bytes_billed,
+    ))
+    .with_max_bytes(settings.agent_max_bytes_billed);
     let connection = if command.needs() == Needs::Nothing {
         String::new()
     } else {
@@ -520,6 +617,16 @@ fn went_wrong(response: &Response) -> Option<String> {
             Status::Failed { reason } => Some(reason.clone()),
             _ => None,
         },
+        // A query the server refused is a failure whatever the transport
+        // thinks. `NeedsApproval` is not one: it is an answer, and the caller
+        // is supposed to take the number to a person.
+        Response::Query(query) => match &query.state {
+            QueryState::Failed { message, at } => Some(match at {
+                Some(at) => format!("{message} (line {}, column {})", at.line, at.column),
+                None => message.clone(),
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -529,6 +636,9 @@ fn diagnostic(failure: &Failure) -> String {
     match failure {
         Failure::NoSuchConnection { connection } => {
             format!("no connection called `{connection}` is open")
+        }
+        Failure::NoSuchQuery { query } => {
+            format!("this session started no query called `{query}`")
         }
         Failure::NoSuchProfile { profile } => {
             format!("no profile called `{profile}` is configured in connections.toml")
@@ -549,6 +659,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::*;
+    use sqlake_api::QueryInfo;
 
     /// Parses the way the real binary does, so the subcommand tree is checked
     /// rather than described.
@@ -666,7 +777,7 @@ mod tests {
                 &parse(argv),
                 Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
                 Arc::new(sqlake_driver_mock::MockProfiles::default()),
-                50,
+                &Settings::default(),
                 None,
             )
             .await
@@ -686,12 +797,111 @@ mod tests {
             &parse(&["connection", "list"]),
             Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
             Arc::new(sqlake_driver_mock::MockProfiles::default()),
-            50,
+            &Settings::default(),
             None,
         )
         .await
         .expect("it answers");
         assert!(matches!(response, Response::Connections(_)), "{response:?}");
+    }
+
+    #[test]
+    fn the_row_limit_is_on_the_request_that_reads_the_rows() {
+        // Not on `run`, which answers a handle and never rows — a limit there
+        // would be an argument that does nothing.
+        assert_eq!(
+            parse(&["query", "run", "select 1"]).request("c".into()),
+            Request::QueryRun {
+                connection: "c".into(),
+                sql: "select 1".into(),
+                max_bytes: None,
+            }
+        );
+        assert_eq!(
+            parse(&["query", "wait", "q", "--limit", "5", "--timeout-ms", "100"])
+                .request(String::new()),
+            Request::QueryWait {
+                query: "q".into(),
+                timeout_ms: Some(100),
+                limit: Some(5),
+            }
+        );
+        assert_eq!(
+            parse(&["query", "status", "q", "--limit", "5"]).request(String::new()),
+            Request::QueryStatus {
+                query: "q".into(),
+                limit: Some(5),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_can_run_a_query_but_not_ask_about_one_afterwards() {
+        // Running needs a connection, which one-shot opens. Asking about a
+        // query needs a session that already started one, and a store that
+        // dies with the command started none.
+        let response = one_shot(
+            &parse(&["query", "run", "select * from public.users"]),
+            Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+            Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            &Settings::default(),
+            None,
+        )
+        .await
+        .expect("it answers");
+        assert!(matches!(response, Response::Query(_)), "{response:?}");
+
+        let response = one_shot(
+            &parse(&["query", "status", "q"]),
+            Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+            Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            &Settings::default(),
+            None,
+        )
+        .await
+        .expect("it answers");
+        let Response::Failed(Failure::Unsupported { message }) = response else {
+            panic!("{response:?}");
+        };
+        assert!(message.contains("--session"), "{message}");
+    }
+
+    #[test]
+    fn a_query_the_server_refused_is_not_a_success() {
+        let failed = QueryInfo {
+            id: "q".into(),
+            connection: "c".into(),
+            sql: "select nope".into(),
+            estimate: None,
+            state: QueryState::Failed {
+                message: "no such column: nope".into(),
+                at: Some(sqlake_api::PositionInfo { line: 1, column: 8 }),
+            },
+        };
+        let why = went_wrong(&Response::Query(failed)).expect("a failure");
+        assert!(why.contains("no such column"), "{why}");
+        // The position too: an agent that has to re-read its own SQL to find
+        // where it went wrong has been told less than the server said.
+        assert!(why.contains("line 1"), "{why}");
+    }
+
+    #[test]
+    fn a_query_waiting_for_a_person_is_not_a_failure() {
+        // Over the budget is an answer, and the caller is supposed to take the
+        // number to somebody. Exiting non-zero would make a shell script treat
+        // a question as a crash.
+        let asking = QueryInfo {
+            id: "q".into(),
+            connection: "c".into(),
+            sql: "select * from big".into(),
+            estimate: Some(sqlake_api::EstimateInfo::Bytes {
+                bytes: 5_000_000_000,
+            }),
+            state: QueryState::NeedsApproval {
+                budget: 1_000_000_000,
+            },
+        };
+        assert_eq!(went_wrong(&Response::Query(asking)), None);
     }
 
     #[test]
