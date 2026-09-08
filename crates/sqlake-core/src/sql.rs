@@ -144,15 +144,14 @@ impl ValidatedSql {
         if !READ_OPENERS.contains(&first.as_str()) {
             return StatementKind::Writes;
         }
-        // `EXPLAIN ANALYZE` runs what it is explaining, so it is whatever that
-        // is. Dropping the `explain` and re-reading the rest says so without a
-        // second rule.
-        let rest = if first == "explain" {
-            &words[1..]
-        } else {
-            &words[..]
-        };
-        if rest.iter().any(|w| WRITING_WORDS.contains(&w.as_str())) {
+        // The opener is already known to be a read, so only what follows it is
+        // worth reading again — which is also what makes `EXPLAIN ANALYZE` come
+        // out right without a rule of its own: `ANALYZE` runs the statement it
+        // is explaining, and it is one of the words below.
+        if words[1..]
+            .iter()
+            .any(|w| WRITING_WORDS.contains(&w.as_str()))
+        {
             return StatementKind::Writes;
         }
         StatementKind::Reads
@@ -202,23 +201,27 @@ pub enum StatementKind {
 
 /// Statements that only read, by the word they open with.
 ///
-/// `EXPLAIN` is here and `EXPLAIN ANALYZE` is not, which the check below
-/// handles by looking at the second word: `ANALYZE` runs the statement it is
-/// explaining, so an `EXPLAIN ANALYZE DELETE` deletes.
+/// `EXPLAIN` is here because it only plans. `EXPLAIN ANALYZE` runs what it is
+/// explaining, and comes out a write because `analyze` is one of the words
+/// below, which are looked for past the opener.
 const READ_OPENERS: [&str; 6] = ["select", "with", "table", "values", "show", "explain"];
 
-/// Words that mean a statement writes, wherever they appear in it.
+/// Words that mean a statement writes, wherever they appear past the opener.
 ///
 /// Checked anywhere rather than only at the front, because `WITH x AS (INSERT
-/// … RETURNING *) SELECT * FROM x` opens with a read-only word and writes. A
-/// classifier that read only the first word would pass it.
+/// … RETURNING *) SELECT * FROM x` opens with a read-only word and writes, and
+/// `SELECT … INTO t FROM u` creates a table on PostgreSQL. A classifier that
+/// read only the first word would pass both.
 ///
-/// Safe to check anywhere because every one of these is reserved in both
-/// dialects, so none can be a bare column name — and a quoted one never reaches
-/// here, since [`scan`] does not report what is inside quotes.
-const WRITING_WORDS: [&str; 17] = [
+/// Several of these — `copy`, `vacuum`, `comment`, `truncate` among them — are
+/// unreserved in PostgreSQL and so can be a bare column name, which makes
+/// `SELECT copy FROM t` a false refusal. That is the direction this is meant to
+/// err in, and the refusal is a profile setting away from being lifted. A
+/// quoted `"copy"` never reaches here at all, since [`scan`] does not report
+/// what is inside quotes.
+const WRITING_WORDS: [&str; 18] = [
     "insert", "update", "delete", "merge", "truncate", "drop", "create", "alter", "grant",
-    "revoke", "call", "replace", "rename", "comment", "vacuum", "analyze", "copy",
+    "revoke", "call", "replace", "rename", "comment", "vacuum", "analyze", "copy", "into",
 ];
 
 /// Where in a statement something is, one-based in lines and columns.
@@ -955,6 +958,9 @@ mod tests {
         // And `EXPLAIN ANALYZE` runs what it explains.
         assert_eq!(kind("explain analyze delete from t"), StatementKind::Writes);
         assert_eq!(kind("explain analyze select 1"), StatementKind::Writes);
+        // PostgreSQL's `SELECT … INTO` creates the table it names, and every
+        // word of it but `into` belongs to a read.
+        assert_eq!(kind("select * into copied from t"), StatementKind::Writes);
     }
 
     #[test]

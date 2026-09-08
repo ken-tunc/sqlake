@@ -779,16 +779,15 @@ impl Runtime {
     /// user's own ceiling, and a front-end that could name its own would be a
     /// front-end that could raise it.
     fn run_query(&mut self, conn_id: ConnId, id: QueryId, sql: String, max_rows: Option<u32>) {
-        let Some(session) = self.session(conn_id) else {
+        let Some(conn) = self.conns.iter().find(|c| c.id == conn_id) else {
+            return;
+        };
+        let Some(session) = conn.session.clone() else {
             return;
         };
         // The connection's own, not the caller's: a front-end that could name
         // its own would be one that could grant itself write access.
-        let access = self
-            .conns
-            .iter()
-            .find(|c| c.id == conn_id)
-            .map_or(Access::ReadOnly, |c| c.access);
+        let access = conn.access;
         // An id already in use is a caller that lost track of one, and reusing
         // it would replace an answer somebody may still be reading.
         if self.queries.iter().any(|q| q.id == id) {

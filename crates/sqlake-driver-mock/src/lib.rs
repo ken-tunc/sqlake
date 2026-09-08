@@ -88,7 +88,7 @@ impl MockProfiles {
         }
     }
 
-    /// The same profiles, marked read-only.
+    /// [`Self::default`]'s single profile, marked read-only.
     #[must_use]
     pub fn read_only() -> Self {
         Self {
