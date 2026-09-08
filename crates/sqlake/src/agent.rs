@@ -59,6 +59,17 @@ pub(crate) enum ApiCommand {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConnectionCommand {
     List,
+    /// Open a connection to a configured profile, in a running session.
+    Open {
+        /// The profile's id, as written in `connections.toml`.
+        #[arg(value_name = "PROFILE")]
+        profile: String,
+    },
+    /// Close one of the session's connections.
+    ///
+    /// Which one is chosen the way every other command chooses: the session's
+    /// ready connection, narrowed by `--connect`.
+    Close,
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,6 +142,14 @@ impl Command {
             Self::Connection {
                 what: ConnectionCommand::List,
             } => Request::ConnectionList {},
+            Self::Connection {
+                what: ConnectionCommand::Open { profile },
+            } => Request::ConnectionOpen {
+                profile: profile.clone(),
+            },
+            Self::Connection {
+                what: ConnectionCommand::Close,
+            } => Request::ConnectionClose { connection },
             Self::Schema {
                 what: SchemaCommand::List,
             } => Request::NamespaceList { connection },
@@ -149,6 +168,19 @@ impl Command {
                 limit: *limit,
             },
         }
+    }
+
+    /// Whether getting the connection wrong cannot be taken back.
+    ///
+    /// Only closing, today. It is not part of [`Needs`] because that says what
+    /// a command *needs*, and this is about what it does with it.
+    const fn is_destructive(&self) -> bool {
+        matches!(
+            self,
+            Self::Connection {
+                what: ConnectionCommand::Close
+            }
+        )
     }
 
     /// What answering this needs, which differs by mode.
@@ -170,6 +202,17 @@ impl Command {
             | Self::Connection {
                 what: ConnectionCommand::List,
             } => Needs::Session,
+            // A store that dies with this process is not a session to open a
+            // connection in — see `Needs::LiveSession`.
+            Self::Connection {
+                what: ConnectionCommand::Open { .. },
+            } => Needs::LiveSession,
+            // Closing is the same no-op in one-shot as opening: the store dies
+            // with the process either way, so the connection it would close is
+            // one it had to open first.
+            Self::Connection {
+                what: ConnectionCommand::Close,
+            } => Needs::LiveConnection,
             Self::Schema { .. } | Self::Table { .. } => Needs::Connection,
         }
     }
@@ -182,8 +225,29 @@ pub(crate) enum Needs {
     Nothing,
     /// A session to ask. One-shot has to start one; attached already has one.
     Session,
+    /// A session that outlives the command.
+    ///
+    /// One-shot cannot answer these at all: its store dies with the process, so
+    /// a connection opened in it is one nothing can use afterwards. Refused
+    /// rather than answered, because "it worked" is the wrong thing to say
+    /// about a no-op.
+    LiveSession,
     /// A particular connection, named in the request.
     Connection,
+    /// Both: a connection to name, in a session that outlives the command.
+    LiveConnection,
+}
+
+impl Needs {
+    /// Whether a store that dies with the command can answer this at all.
+    const fn outlives_the_command(self) -> bool {
+        matches!(self, Self::LiveSession | Self::LiveConnection)
+    }
+
+    /// Whether the request carries a connection id to be chosen first.
+    const fn names_a_connection(self) -> bool {
+        matches!(self, Self::Connection | Self::LiveConnection)
+    }
 }
 
 /// A store with nothing to connect to.
@@ -264,20 +328,21 @@ async fn attached(
     command: &Command,
     connect: Option<&ProfileId>,
 ) -> Result<Response> {
-    let connection = match command.needs() {
-        Needs::Nothing | Needs::Session => String::new(),
-        Needs::Connection => {
-            let open = match client.request(&Request::ConnectionList {}).await? {
-                Response::Connections(open) => open,
-                // The session answered something else, which is a protocol
-                // failure rather than this caller's to explain away.
-                other => return Ok(Response::Failed(unexpected(&other))),
-            };
-            match choose(&open, connect) {
-                Ok(id) => id,
-                Err(failure) => return Ok(Response::Failed(failure)),
-            }
+    // Not for `LiveSession`: opening a connection names a profile rather than
+    // a connection, so there is nothing to choose.
+    let connection = if command.needs().names_a_connection() {
+        let open = match client.request(&Request::ConnectionList {}).await? {
+            Response::Connections(open) => open,
+            // The session answered something else, which is a protocol
+            // failure rather than this caller's to explain away.
+            other => return Ok(Response::Failed(unexpected(&other))),
+        };
+        match choose(&open, connect, command.is_destructive()) {
+            Ok(id) => id,
+            Err(failure) => return Ok(Response::Failed(failure)),
         }
+    } else {
+        String::new()
     };
     client
         .request(&command.request(connection))
@@ -285,17 +350,41 @@ async fn attached(
         .context("asking the session")
 }
 
-/// Which of the session's connections to read through.
+/// Which of the session's connections to act on.
 ///
 /// Split from the asking so the decision is testable without a socket: the
 /// asking is one request, and the choosing is the part with rules.
-fn choose(open: &[ConnectionInfo], connect: Option<&ProfileId>) -> Result<String, Failure> {
+///
+/// `must_be_unambiguous` is what closing sets. Every other command reads, and
+/// a read through the wrong connection is a wrong answer somebody can ask
+/// again; a close through the wrong one is somebody else's connection gone.
+fn choose(
+    open: &[ConnectionInfo],
+    connect: Option<&ProfileId>,
+    must_be_unambiguous: bool,
+) -> Result<String, Failure> {
     // Everything when nothing was named: a session with two connections open
     // is ordinary, and narrowing that is what `--connect` is for.
     let asked_for = |c: &&ConnectionInfo| connect.is_none_or(|p| c.profile == p.as_str());
     // A ready one ahead of the rest, because a session whose first connection
     // failed to open still has a working second: taking one by position alone
     // would answer with that failure instead of with the database.
+    // For anything destructive, an arbitrary pick is not a wrong answer that
+    // can be asked again — it is the wrong connection, closed. So closing
+    // refuses to guess where a read is content to.
+    if must_be_unambiguous && open.iter().filter(asked_for).count() > 1 {
+        let names: Vec<&str> = open
+            .iter()
+            .filter(asked_for)
+            .map(|c| c.profile.as_str())
+            .collect();
+        return Err(Failure::Unsupported {
+            message: format!(
+                "more than one connection matches ({}) — name one with `--connect`",
+                names.join(", ")
+            ),
+        });
+    }
     let chosen = open
         .iter()
         .find(|c| asked_for(c) && c.status == Status::Ready)
@@ -331,6 +420,15 @@ async fn one_shot(
 ) -> Result<Response> {
     // No budget: an agent runs nothing yet, and A2 is where the answer
     // to "who says yes for one" is decided rather than assumed here.
+    // Before the store is even started: what this refuses is not a failure of
+    // the store, and starting one to say so would open a connection first.
+    if command.needs().outlives_the_command() {
+        return Ok(Response::Failed(Failure::Unsupported {
+            message: "this needs a session that outlives the command — start one with \
+                      `sqlake --session <name>` and try again"
+                .to_owned(),
+        }));
+    }
     let service = Service::new(Store::spawn(drivers, profiles, page_size, None));
     let connection = if command.needs() == Needs::Nothing {
         String::new()
@@ -398,11 +496,32 @@ fn print(response: &Response) -> Result<std::process::ExitCode> {
     let json = serde_json::to_string_pretty(response).context("serialising the response")?;
     println!("{json}");
 
-    if let Response::Failed(failure) = response {
-        eprintln!("{}", diagnostic(failure));
-        return Ok(std::process::ExitCode::FAILURE);
+    match went_wrong(response) {
+        Some(why) => {
+            eprintln!("{why}");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        None => Ok(std::process::ExitCode::SUCCESS),
     }
-    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Why this answer is not a success, if it is not one.
+///
+/// Split from the printing because `ExitCode` can be neither compared nor
+/// displayed, so a test of the decision has to be a test of something else.
+fn went_wrong(response: &Response) -> Option<String> {
+    match response {
+        Response::Failed(failure) => Some(diagnostic(failure)),
+        // A connection that would not open is answered *as* a connection, on
+        // purpose — but it is not a success. An agent running `connection open
+        // prod && table list` would otherwise carry on against a database it
+        // never reached, which is exactly what the status is there to say.
+        Response::Connection(conn) => match &conn.status {
+            Status::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The one-line version, for a person watching the terminal.
@@ -410,6 +529,9 @@ fn diagnostic(failure: &Failure) -> String {
     match failure {
         Failure::NoSuchConnection { connection } => {
             format!("no connection called `{connection}` is open")
+        }
+        Failure::NoSuchProfile { profile } => {
+            format!("no profile called `{profile}` is configured in connections.toml")
         }
         Failure::NotFound { path } => format!("`{}` is not in this connection", path.join(".")),
         Failure::Driver { message } => message.clone(),
@@ -440,6 +562,136 @@ mod tests {
         Cli::try_parse_from(std::iter::once("sqlake").chain(args.iter().copied()))
             .expect("the arguments parse")
             .command
+    }
+
+    #[test]
+    fn closing_refuses_to_guess_which_connection() {
+        // A read through the wrong connection is a wrong answer somebody can
+        // ask again. A close through the wrong one is somebody else's
+        // connection gone, so this is the one place the pick has to be
+        // unambiguous.
+        let two = open(&["mock", "prod"]);
+        assert!(choose(&two, None, false).is_ok(), "a read still picks one");
+
+        let refused = choose(&two, None, true).expect_err("closing should refuse");
+        let Failure::Unsupported { message } = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(message.contains("--connect"), "{message}");
+        assert!(
+            message.contains("mock") && message.contains("prod"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn closing_picks_the_one_that_was_named() {
+        let two = open(&["mock", "prod"]);
+        let prod = ProfileId::parse("prod").expect("a usable id");
+        assert_eq!(choose(&two, Some(&prod), true), Ok("id-1".into()));
+        // And one connection is never ambiguous.
+        assert!(choose(&open(&["mock"]), None, true).is_ok());
+    }
+
+    #[test]
+    fn a_connection_that_would_not_open_is_not_a_success() {
+        // An agent running `connection open prod && table list` must not carry
+        // on against a database it never reached.
+        let failed = ConnectionInfo {
+            id: "id".into(),
+            profile: "prod".into(),
+            name: "prod".into(),
+            driver: "postgres".into(),
+            status: Status::Failed {
+                reason: "password authentication failed".into(),
+            },
+            capabilities: None,
+        };
+        assert_eq!(
+            went_wrong(&Response::Connection(failed)).as_deref(),
+            Some("password authentication failed")
+        );
+    }
+
+    #[test]
+    fn a_connection_that_opened_is_a_success() {
+        let ready = ConnectionInfo {
+            id: "id".into(),
+            profile: "prod".into(),
+            name: "prod".into(),
+            driver: "postgres".into(),
+            status: Status::Ready,
+            capabilities: None,
+        };
+        assert_eq!(went_wrong(&Response::Connection(ready.clone())), None);
+        // And closing one is what a caller asked for, not a failure.
+        assert_eq!(
+            went_wrong(&Response::Connection(ConnectionInfo {
+                status: Status::Closed,
+                ..ready
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn opening_a_connection_names_a_profile_and_closing_names_a_connection() {
+        assert_eq!(
+            parse(&["connection", "open", "prod-pg"]).request(String::new()),
+            Request::ConnectionOpen {
+                profile: "prod-pg".into(),
+            }
+        );
+        // `close` takes no argument: which connection is chosen the way every
+        // other command chooses one, and `--connect` narrows it.
+        assert_eq!(
+            parse(&["connection", "close"]).request("c".into()),
+            Request::ConnectionClose {
+                connection: "c".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_refuses_what_would_not_outlive_it() {
+        // A store that dies with the process is not a session to open a
+        // connection in, and "it worked" is the wrong thing to say about a
+        // no-op. Closing is the same no-op from the other end: one-shot would
+        // have to open a connection before it had one to close.
+        for argv in [
+            ["connection", "open", "mock"].as_slice(),
+            ["connection", "close"].as_slice(),
+        ] {
+            let response = one_shot(
+                &parse(argv),
+                Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+                Arc::new(sqlake_driver_mock::MockProfiles::default()),
+                50,
+                None,
+            )
+            .await
+            .expect("it answers rather than erroring");
+
+            let Response::Failed(Failure::Unsupported { message }) = response else {
+                panic!("{argv:?}: {response:?}");
+            };
+            assert!(message.contains("--session"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_shot_still_answers_everything_that_does_not_outlive_it() {
+        // The refusal above is about one thing, not about one-shot mode.
+        let response = one_shot(
+            &parse(&["connection", "list"]),
+            Drivers::new().with(Arc::new(sqlake_driver_mock::MockDriver::default())),
+            Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            50,
+            None,
+        )
+        .await
+        .expect("it answers");
+        assert!(matches!(response, Response::Connections(_)), "{response:?}");
     }
 
     #[test]
@@ -519,7 +771,7 @@ mod tests {
 
     #[test]
     fn a_session_with_one_connection_needs_no_choosing() {
-        assert_eq!(choose(&open(&["mock"]), None), Ok("id-0".into()));
+        assert_eq!(choose(&open(&["mock"]), None, false), Ok("id-0".into()));
     }
 
     #[test]
@@ -528,7 +780,7 @@ mod tests {
         // ordinary, and the first is not always the one meant.
         let open = open(&["staging", "prod"]);
         let prod = ProfileId::parse("prod").expect("a usable id");
-        assert_eq!(choose(&open, Some(&prod)), Ok("id-1".into()));
+        assert_eq!(choose(&open, Some(&prod), false), Ok("id-1".into()));
     }
 
     #[test]
@@ -536,7 +788,7 @@ mod tests {
         let open = open(&["staging"]);
         let prod = ProfileId::parse("prod").expect("a usable id");
         assert_eq!(
-            choose(&open, Some(&prod)),
+            choose(&open, Some(&prod), false),
             Err(Failure::NoSuchConnection {
                 connection: "prod".into()
             })
@@ -552,7 +804,7 @@ mod tests {
         open[0].status = Status::Failed {
             reason: "no route to host".into(),
         };
-        assert_eq!(choose(&open, None), Ok("id-1".into()));
+        assert_eq!(choose(&open, None, false), Ok("id-1".into()));
     }
 
     #[test]
@@ -560,7 +812,7 @@ mod tests {
         // `NoSuchConnection` would send the caller looking for a typo in an id
         // it never gave.
         assert!(matches!(
-            choose(&open(&[]), None),
+            choose(&open(&[]), None, false),
             Err(Failure::Unsupported { .. })
         ));
     }
