@@ -116,6 +116,25 @@ pub enum Action {
         sql: String,
         /// Rows to fetch back, or all of them.
         max_rows: Option<u32>,
+        /// A ceiling of the caller's own, applied on top of the session's.
+        ///
+        /// Only ever downward, the way a page limit is: the budget exists to
+        /// stop something spending more than its owner meant to, and a request
+        /// that could raise it would be that protection asking permission from
+        /// the party it protects against. An agent with a tighter budget than
+        /// the person sharing the session is the case this is for.
+        max_bytes: Option<u64>,
+    },
+
+    /// Cost a statement without running it.
+    ///
+    /// Its own action rather than a flag on `RunQuery`: what a caller wants
+    /// here is the number *and no query*, and reaching it through the running
+    /// path would mean asking for something and hoping the budget said no.
+    EstimateQuery {
+        conn: ConnId,
+        query: QueryId,
+        sql: String,
     },
 
     /// Run a query that stopped over the budget, because somebody said yes.
@@ -148,6 +167,7 @@ impl fmt::Display for Action {
             Self::LoadMore { table, .. } => write!(f, "load_more({table})"),
             Self::ForgetPreview { table, .. } => write!(f, "forget_preview({table})"),
             Self::RunQuery { query, .. } => write!(f, "run({})", query.short()),
+            Self::EstimateQuery { query, .. } => write!(f, "estimate({})", query.short()),
             Self::ApproveQuery(id) => write!(f, "approve({})", id.short()),
             Self::ForgetQuery(id) => write!(f, "forget_query({})", id.short()),
             Self::Cancel(id) => write!(f, "cancel({})", id.get()),

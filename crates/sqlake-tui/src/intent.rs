@@ -282,7 +282,9 @@ impl IntentKind {
                 // has no view half. `ForgetQuery` shares `CloseTab`'s kind for
                 // the same reason `ForgetPreview` does — closing the tab is
                 // what causes it.
-                Action::RunQuery { .. } => Self::RunQuery,
+                // One capability: costing a statement is what running it does
+                // first, and the TUI has no gesture that stops in between.
+                Action::RunQuery { .. } | Action::EstimateQuery { .. } => Self::RunQuery,
                 Action::ApproveQuery(_) => Self::ApproveQuery,
                 Action::ForgetQuery(_) => Self::CloseTab,
                 Action::Cancel(_) => Self::Cancel,

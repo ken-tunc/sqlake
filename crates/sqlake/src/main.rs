@@ -96,10 +96,10 @@ fn main() -> Result<std::process::ExitCode> {
     // the screen, and installing a hook that restores a terminal nobody entered
     // would leave a stray reset in the middle of a caller's JSON.
     if let Some(command) = &args.command {
-        let (profiles, page_size, connect) = if command.needs() == agent::Needs::Nothing {
+        let (profiles, settings, connect) = if command.needs() == agent::Needs::Nothing {
             (
                 Arc::new(agent::NoProfiles) as Arc<dyn Profiles>,
-                Settings::default().page_size,
+                Settings::default(),
                 None,
             )
         } else {
@@ -124,7 +124,7 @@ fn main() -> Result<std::process::ExitCode> {
             } else {
                 named.into_iter().next()
             };
-            (profiles, settings.page_size, connect)
+            (profiles, settings, connect)
         };
         // Resolved even for a command that starts its own store: attaching is
         // tried first, and a session that is running is always the better
@@ -144,7 +144,7 @@ fn main() -> Result<std::process::ExitCode> {
                     None
                 }
             };
-        return agent::run(command, drivers(), profiles, page_size, connect, session);
+        return agent::run(command, drivers(), profiles, &settings, connect, session);
     }
 
     // Every mode change is undone by the guard's `Drop`, and the hook routes a
@@ -182,7 +182,12 @@ fn main() -> Result<std::process::ExitCode> {
     // a client that has taken the display over. The listener is held until the
     // client exits, and removes its socket on the way out.
     let _listening = match &args.session {
-        Some(name) => Some(listen(&runtime, name, &store)?),
+        Some(name) => Some(listen(
+            &runtime,
+            name,
+            &store,
+            settings.agent_max_bytes_billed,
+        )?),
         None => None,
     };
 
@@ -230,13 +235,19 @@ fn listen(
     runtime: &tokio::runtime::Runtime,
     name: &str,
     store: &Store,
+    agent_budget: Option<u64>,
 ) -> Result<sqlake_api::ListenerHandle> {
     let path = sqlake_api::socket_path(name).context("finding somewhere to put the socket")?;
     let listener = runtime
         .block_on(sqlake_api::Listener::bind(path.clone()))
         .with_context(|| format!("listening on {}", path.display()))?;
     tracing::info!(session = name, path = %path.display(), "answering the agent surface");
-    Ok(listener.spawn_on(runtime, Arc::new(sqlake_api::Service::new(store.clone()))))
+    // The agent's own ceiling, not the session's: a person at this terminal
+    // answers a dialog, and whatever reaches the socket cannot.
+    Ok(listener.spawn_on(
+        runtime,
+        Arc::new(sqlake_api::Service::new(store.clone()).with_max_bytes(agent_budget)),
+    ))
 }
 
 /// What `e` hands the buffer to, and where the working files go.

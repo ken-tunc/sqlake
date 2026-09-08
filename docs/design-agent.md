@@ -36,7 +36,7 @@ than reuse — which is what the peer relationship in architecture §2 is protec
 Modelled on herdr: a long-lived process holding session state, a socket API against it, and
 thin noun-verb subcommands over that API.
 
-Built, as of A1:
+Built, as of A2:
 
 ```
 sqlake                          launch the TUI (unchanged)
@@ -49,14 +49,13 @@ sqlake connection list
 sqlake connection open|close    against a session that outlives the command
 sqlake schema list              namespaces in a connection
 sqlake table list|preview
+sqlake query estimate|run|status|wait|cancel
 ```
 
 Planned, with the milestone that brings each:
 
 ```
 sqlake table describe           M5
-sqlake query estimate|run|status|cancel|wait
-                                A2
 sqlake history search           M8
 sqlake mcp                      A3, speaks MCP on stdio
 ```
@@ -78,6 +77,12 @@ human already opened solves that, and it is exactly herdr's value proposition.
 
 One-shot mode is what makes the surface usable in CI and in a fresh shell, and it is also the
 simpler of the two, so it is built first.
+
+It answers what a store that dies with the command can honestly answer. Reading and estimating
+it can; `connection open` and `query run` it cannot, because both hand back something — a
+connection, a handle — that nothing afterwards can use. Both are refused rather than answered,
+because "it worked" is the wrong thing to say about a no-op. **That leaves no way to run a
+query and get its rows in one command**, which is a real gap and open question 5.
 
 ### 2.2 Socket
 
@@ -109,12 +114,13 @@ this is new machinery; it is the existing guards with an agent-shaped policy on 
 `Session::execute` accepts only an `ApprovedQuery`, so no caller — agent or human — can run a
 query that was never estimated. What differs for an agent is how approval is granted:
 
-- A **byte budget** rather than a dialog. `agent.max_bytes_billed` in `config.toml`, defaulting
-  well below the profile's own ceiling.
+- A **byte budget** rather than a dialog. `agent.max_bytes_billed` in `config.toml`, refused at
+  load time if it is above the session's own — a ceiling that does nothing is one somebody
+  wrote expecting an effect. `query run --max-bytes` lowers it further and can never raise it.
 - Within budget → the query runs.
-- Over budget → the API returns the `NeedsApproval` variant with the estimate. The agent cannot
-  turn that into an approval itself; it has to surface the number to a human, who approves it
-  through the TUI or by re-issuing with `--approve-up-to`.
+- Over budget → the API answers `{"state": "needs_approval", "budget": …}` with the estimate.
+  The agent cannot turn that into an approval itself; it has to surface the number to a human,
+  who approves it in the TUI.
 
 `NeedsApproval` being a normal output rather than an error (architecture §4.2) is what makes
 this a clean protocol response instead of an error path with special handling.
@@ -152,6 +158,11 @@ Every agent-issued query goes into the same `query_history` table as a human's, 
 
 One history, one place to look when something unexpected happened to the data.
 
+M8's, not A2's, and that is the honest order rather than a slip: there is no history table
+until M8 builds one, and an `issuer` column on nothing is a column. What A2 owes it is that
+every query already carries a `QueryId` and the connection it ran on, so the row M8 writes has
+something to be about.
+
 ### 3.5 Secrets never cross the socket
 
 `Snapshot` carries no `ResolvedProfile` today, and serialisation must not be the thing that
@@ -165,13 +176,20 @@ host, a user or anything derived from a credential.
 Queries are not instantaneous, and an agent blocking on a socket read for four minutes is a
 poor client.
 
-`query run` returns a handle immediately. `query status <id>` reports progress, and
-`query wait <id> --timeout 30s` blocks until the query finishes, fails or the timeout expires
-— the same shape as `herdr agent wait`. `query cancel <id>` maps onto the existing
-`CancelHandle`, so an agent can stop something it started.
+Built. `query run` returns a handle immediately; `query status <id>` reports progress, and
+`query wait <id> --timeout-ms 30000` blocks until the query finishes, fails or the wait runs
+out — a wait that runs out answers with the query as it stands rather than with a timeout,
+because nothing went wrong. `query cancel <id>` stops it, and stops it at the server wherever
+`capabilities.cancel` says so.
 
-This is the one place the agent surface needs something the TUI does not: a stable, external
-id for a running query. `BusyId` is process-local and already exists; it becomes the handle.
+The handle is `QueryId`, not `BusyId` as this once said. `BusyId` names a piece of work in
+flight and is gone the moment it finishes, so `query status` on a query that had already
+finished would have had nothing to name.
+
+The row budget rides on `query status` and `query wait` rather than on `query run`, for the
+same reason: `run` answers a handle and no rows, so a limit there would be an argument that
+does nothing. It cuts what is *written out* and never what the store fetched — a person sharing
+the session must not inherit an agent's context window.
 
 ---
 
@@ -215,7 +233,7 @@ keeps M1–M8 aligned one-to-one with the eight features.
 | # | Lands after | Content | Done when |
 | --- | --- | --- | --- |
 | **A1** | M2 | Read-only CLI and socket API — **built**, in `sqlake-api` | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
-| **A2** | M4 | Query execution over the API | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close` — running SQL is the first thing that needs a connection the caller chose. The byte budget and `NeedsApproval`, read-only enforcement, `issuer` in history |
+| **A2** | M4 | Query execution over the API — **built** | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close`. The byte budget and `NeedsApproval`, read-only enforcement. `issuer` in history waits for M8, which is where the history table arrives |
 | **A3** | A2 | MCP server | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
 Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
@@ -274,14 +292,21 @@ Two of these are settled, by the code named against them.
    that — a directory that exports `SQLAKE_SESSION` has it — rather than something the client
    has to know what a project is to support. `sqlake-api::socket` carries it, including why a
    name has to be one path component.
-2. **Whether `query run` should stream.** NDJSON on the socket would let an agent process rows
-   as they arrive, but the row-budget in §3.3 makes streaming less useful than it sounds. Still
-   A2's to answer; the socket already speaks newline-delimited JSON, so the transport is not
-   what decides it.
-3. ~~**Schema format.**~~ JSON Schema, generated by `schemars` from the protocol types. A
+2. **How a one-shot caller runs a query at all.** `query run` needs a session that outlives
+   it, because the handle it answers with is otherwise useless — so a CI job that wants rows
+   from a statement has no single command to reach them with. A `--wait` that turned run and
+   wait into one call would fix it, at the cost of a subcommand that is two requests; a session
+   started for the job is the answer today and is more setup than the case deserves.
+3. **Whether `query run` should stream.** NDJSON on the socket would let an agent process rows
+   as they arrive, and A2 did not need it: `query wait` blocks and the row budget in §3.3 caps
+   what comes back anyway, so streaming would move rows the caller has already said it does not
+   want. Left open rather than settled — a result too large for one message is the case that
+   would decide it, and nothing has met one.
+4. ~~**Schema format.**~~ JSON Schema, generated by `schemars` from the protocol types. A
    hand-written schema is a second description of the protocol that nothing checks, and it
    drifts in the direction that matters: it keeps describing a call after the call changes.
-4. **Whether the TUI should show agent activity.** A line in the status bar when an
+5. **Whether the TUI should show agent activity.** A line in the status bar when an
    agent-issued query is running would make the shared session legible rather than spooky.
-   Unanswered on purpose — A1 is read-only, so there is nothing yet whose running a person
-   would want to know about.
+   A2 changes this from a preference into something worth doing: an agent can now start a
+   query on the session a person is using, and `[⟳ running a query]` in their status bar is
+   the only thing that would tell them why their connection is busy.

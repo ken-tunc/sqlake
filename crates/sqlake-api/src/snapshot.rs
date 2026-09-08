@@ -8,10 +8,13 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlake_app::snapshot::{ConnStatus, ConnectionView, Snapshot};
+use sqlake_app::snapshot::{ConnStatus, ConnectionView, LoadState, QueryView, Snapshot};
 use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::capability::Capabilities;
 use sqlake_core::id::ConnId;
+use sqlake_core::sql::{Estimate, Position};
+
+use crate::page::{Budget, Page};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "state")]
@@ -341,5 +344,126 @@ mod tests {
             it.error.as_deref().is_some_and(|e| e.contains("denied")),
             "{it:?}"
         );
+    }
+}
+
+/// Where in a statement a failure was, when the server said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct PositionInfo {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl From<Position> for PositionInfo {
+    fn from(at: Position) -> Self {
+        Self {
+            line: at.line,
+            column: at.column,
+        }
+    }
+}
+
+/// What a query was expected to cost.
+///
+/// Tagged by what was measured rather than flattened to a number, because the
+/// two are not comparable: BigQuery's bytes turn into money and PostgreSQL's
+/// planner cost units do not, and a caller handed `{"cost": 155.0}` with no
+/// unit would be entitled to treat them the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "measured")]
+pub enum EstimateInfo {
+    /// Bytes the query will be billed for.
+    Bytes { bytes: u64 },
+    /// The planner's own units. Comparable between two plans on one server and
+    /// meaningless anywhere else, so nothing gates on it.
+    Cost { cost: f64 },
+    /// This driver does not estimate. `capabilities.cost_estimate` says so in
+    /// advance, so it is expected rather than a failure.
+    Unknown {},
+}
+
+impl From<Estimate> for EstimateInfo {
+    fn from(estimate: Estimate) -> Self {
+        match estimate {
+            Estimate::Bytes(bytes) => Self::Bytes { bytes },
+            Estimate::Cost(cost) => Self::Cost { cost },
+            Estimate::Unknown => Self::Unknown {},
+        }
+    }
+}
+
+/// Where a query has got to.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum QueryState {
+    /// Being estimated, or running. `query wait` is what blocks on it.
+    Working,
+    /// Costed and not run, which is all `query estimate` asks for.
+    Estimated,
+    /// Over the budget, and stopped.
+    ///
+    /// Not an error: design.md §4.2. A caller cannot approve it itself — the
+    /// number goes to a person, who says yes in the TUI or by re-running under
+    /// a budget that allows it.
+    NeedsApproval {
+        budget: u64,
+    },
+    Ready {
+        page: Page,
+    },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<PositionInfo>,
+    },
+}
+
+/// One run of a statement, and what has come of it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct QueryInfo {
+    pub id: String,
+    pub connection: String,
+    /// The statement, as it was sent. Kept so a result can be read next to
+    /// what produced it.
+    pub sql: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<EstimateInfo>,
+    #[serde(flatten)]
+    pub state: QueryState,
+}
+
+impl QueryInfo {
+    /// The wire form of a query, with its rows cut to what a caller can hold.
+    #[must_use]
+    pub fn of(query: &QueryView, budget: Budget) -> Self {
+        let state = match (&query.needs_approval, &query.data) {
+            (Some(over), _) => QueryState::NeedsApproval {
+                budget: over.budget,
+            },
+            (_, LoadState::Loading) => QueryState::Working,
+            (_, LoadState::Ready(rows)) => QueryState::Ready {
+                page: Page::of(rows, budget),
+            },
+            (_, LoadState::Failed(message)) => QueryState::Failed {
+                message: message.clone(),
+                at: query.failed_at.map(PositionInfo::from),
+            },
+            // Idle is "nothing was requested", which after an estimate is the
+            // literal truth: no rows were asked for.
+            (_, LoadState::Idle) => QueryState::Estimated,
+        };
+        Self {
+            id: query.id.to_string(),
+            connection: query.conn.to_string(),
+            sql: query.sql.clone(),
+            estimate: query.estimate.map(EstimateInfo::from),
+            state,
+        }
+    }
+
+    /// Whether this is an answer rather than a progress report.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        !matches!(self.state, QueryState::Working)
     }
 }

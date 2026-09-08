@@ -791,6 +791,10 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
                         query: QueryId::new(),
                         sql,
                         max_rows: None,
+                        // The session's own ceiling is the only one here: a person
+                        // running a query in front of them has already agreed to
+                        // whatever `max_bytes_billed` says.
+                        max_bytes: None,
                     }
                     .into(),
                 ]
@@ -1169,6 +1173,10 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
                     query: QueryId::new(),
                     sql,
                     max_rows: None,
+                    // The session's own ceiling is the only one here: a person
+                    // running a query in front of them has already agreed to
+                    // whatever `max_bytes_billed` says.
+                    max_bytes: None,
                 }
                 .into(),
             ]

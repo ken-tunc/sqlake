@@ -44,6 +44,13 @@ pub struct Settings {
     /// answers in planner cost units, and a fixed cutoff on a number nobody
     /// can price would be a superstition compiled into the client.
     pub max_bytes_billed: Option<u64>,
+    /// The ceiling an *agent* runs under, in bytes.
+    ///
+    /// Separate from and below [`Settings::max_bytes_billed`], which is the
+    /// session's. A person over their own limit is shown a dialog and answers
+    /// it; an agent over this one cannot answer at all — the number goes to a
+    /// person, which is the whole point of it being lower.
+    pub agent_max_bytes_billed: Option<u64>,
 }
 
 impl Settings {
@@ -83,6 +90,7 @@ impl Default for Settings {
             // they meet as a dialog in the middle of their work, about a
             // number they never picked.
             max_bytes_billed: None,
+            agent_max_bytes_billed: None,
         }
     }
 }
@@ -93,6 +101,14 @@ pub(crate) struct SettingsFile {
     page_size: Option<u32>,
     editor: Option<String>,
     editor_args: Option<Vec<String>>,
+    max_bytes_billed: Option<ByteSize>,
+    agent: Option<AgentFile>,
+}
+
+/// `[agent]` in `config.toml`: what applies to a caller that is not a person.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentFile {
     max_bytes_billed: Option<ByteSize>,
 }
 
@@ -108,6 +124,22 @@ impl SettingsFile {
         }
         let editor = self.editor;
         let max_bytes_billed = self.max_bytes_billed.map(ByteSize::get);
+        let agent_max_bytes_billed = self
+            .agent
+            .as_ref()
+            .and_then(|a| a.max_bytes_billed)
+            .map(ByteSize::get);
+        if let (Some(session), Some(agent)) = (max_bytes_billed, agent_max_bytes_billed)
+            && agent > session
+        {
+            return Err(ConfigError::invalid(
+                path,
+                format!(
+                    "`agent.max_bytes_billed` is {agent} and the session's is {session}, so the \
+                     agent's does nothing — it is meant to be the lower of the two"
+                ),
+            ));
+        }
         let editor_args = self
             .editor_args
             .unwrap_or_else(|| defaults.editor_args.clone());
@@ -129,6 +161,7 @@ impl SettingsFile {
                 editor,
                 editor_args,
                 max_bytes_billed,
+                agent_max_bytes_billed,
             }),
         }
     }
@@ -226,6 +259,30 @@ mod tests {
         // Nothing by default: a ceiling somebody did not choose is one they
         // meet as a dialog about a number they never picked.
         assert_eq!(parse("").unwrap().max_bytes_billed, None);
+    }
+
+    #[test]
+    fn an_agent_has_a_ceiling_of_its_own() {
+        let s = parse("max_bytes_billed = \"20GB\"\n[agent]\nmax_bytes_billed = \"1GB\"").unwrap();
+        assert_eq!(s.max_bytes_billed, Some(20_000_000_000));
+        assert_eq!(s.agent_max_bytes_billed, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn an_agent_ceiling_above_the_sessions_is_refused() {
+        // It would do nothing — the lower of the two is what applies — and a
+        // setting that does nothing is one somebody wrote expecting an effect.
+        let err = parse("max_bytes_billed = \"1GB\"\n[agent]\nmax_bytes_billed = \"20GB\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lower"), "{err}");
+    }
+
+    #[test]
+    fn an_agent_ceiling_alone_is_fine() {
+        // No session limit is no limit, so anything is below it.
+        let s = parse("[agent]\nmax_bytes_billed = \"1GB\"").unwrap();
+        assert_eq!(s.agent_max_bytes_billed, Some(1_000_000_000));
     }
 
     #[test]

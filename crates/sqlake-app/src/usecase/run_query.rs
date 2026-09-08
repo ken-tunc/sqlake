@@ -145,8 +145,18 @@ fn in_source(err: AppError, sql: &ValidatedSql) -> AppError {
 ///
 /// Not a `DriverError`: nothing was sent, and reporting it as one would say the
 /// server refused something it never saw.
-fn invalid(err: InvalidSql) -> AppError {
+pub(crate) fn invalid(err: InvalidSql) -> AppError {
     AppError::Refused(err.to_string())
+}
+
+/// A write on a connection that only reads.
+///
+/// Shared with [`EstimateQuery`](crate::usecase::EstimateQuery) so the two
+/// paths refuse in the same words: an agent that estimated something and was
+/// told one thing, then ran it and was told another, would be reading two
+/// answers to one question.
+pub(crate) fn refused_write(sql: &ValidatedSql) -> AppError {
+    AppError::Refused(NotApproved::ReadOnly(sql.clone()).to_string())
 }
 
 #[cfg(test)]
