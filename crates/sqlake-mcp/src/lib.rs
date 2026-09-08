@@ -37,9 +37,14 @@ pub use tools::{all as tools_list, kind_of};
 /// Serves the agent surface as MCP tools.
 #[derive(Debug)]
 pub struct Server {
-    /// One at a time. The socket is a single connection and a local store is a
-    /// single actor, so concurrent tool calls would queue inside either one
-    /// anyway — here the wait is visible instead of buried.
+    /// One tool call at a time, and held for the whole of one — not just for
+    /// each request it makes. Choosing a connection is a request of its own,
+    /// and a second call that closed that connection in between would leave the
+    /// first acting on an id the server had just decided was the right one.
+    ///
+    /// No throughput is lost by it: the socket is a single connection and a
+    /// local store is a single actor, so concurrent calls would queue inside
+    /// either one anyway.
     backend: Mutex<Backend>,
     /// Which profile to prefer when a tool names no connection. What
     /// `--connect` sets for a subcommand.
@@ -83,8 +88,16 @@ impl Server {
         // The tool's name *is* the request's tag, so a caller never writes it
         // — which also means it cannot write the wrong one.
         fields.insert("request".to_owned(), Json::from(kind.tag()));
+        // A client that fills every optional argument in rather than leaving it
+        // out sends `null`, and null is not a connection id — it is the same
+        // thing as saying nothing, so it gets the same answer instead of a
+        // `deny_unknown_fields` complaint about a field the schema does list.
+        if fields.get("connection").is_some_and(Json::is_null) {
+            fields.remove("connection");
+        }
+        let mut backend = self.backend.lock().await;
         if tools::takes_a_connection(kind) && !fields.contains_key("connection") {
-            let picked = self.pick(kind).await?;
+            let picked = pick(&mut backend, self.connect.as_deref(), kind).await?;
             fields.insert("connection".to_owned(), Json::from(picked));
         }
 
@@ -95,35 +108,36 @@ impl Server {
             serde_json::from_value(Json::Object(fields)).map_err(|why| Failure::Malformed {
                 message: format!("`{}` was called with {why}", call.name),
             })?;
-        self.send(&request).await
+        send(&mut backend, &request).await
     }
+}
 
-    async fn send(&self, request: &Request) -> Result<Response, Failure> {
-        self.backend
-            .lock()
-            .await
-            .request(request)
-            .await
-            .map_err(|why| Failure::Driver {
-                message: format!("the session stopped answering: {why}"),
-            })
-    }
+async fn send(backend: &mut Backend, request: &Request) -> Result<Response, Failure> {
+    backend
+        .request(request)
+        .await
+        .map_err(|why| Failure::Driver {
+            message: format!("the session stopped answering: {why}"),
+        })
+}
 
-    /// The connection a tool that named none acts on.
-    ///
-    /// The same rules a subcommand follows, from the same function: a caller
-    /// that had to list connections before every call would spend half its
-    /// turns on bookkeeping, and one that guessed would guess differently from
-    /// the CLI.
-    async fn pick(&self, kind: RequestKind) -> Result<String, Failure> {
-        let listed = self.send(&Request::ConnectionList {}).await?;
-        let Response::Connections(open) = listed else {
-            return Err(Failure::Malformed {
-                message: format!("the session answered a connection list with {listed:?}"),
-            });
-        };
-        choose(&open, self.connect.as_deref(), tools::is_destructive(kind))
-    }
+/// The connection a tool that named none acts on.
+///
+/// The same rules a subcommand follows, from the same function: a caller that
+/// had to list connections before every call would spend half its turns on
+/// bookkeeping, and one that guessed would guess differently from the CLI.
+async fn pick(
+    backend: &mut Backend,
+    connect: Option<&str>,
+    kind: RequestKind,
+) -> Result<String, Failure> {
+    let listed = send(backend, &Request::ConnectionList {}).await?;
+    let Response::Connections(open) = listed else {
+        return Err(Failure::Malformed {
+            message: format!("the session answered a connection list with {listed:?}"),
+        });
+    };
+    choose(&open, connect, tools::is_destructive(kind))
 }
 
 impl ServerHandler for Server {
@@ -184,10 +198,14 @@ impl ServerHandler for Server {
 /// One tool, as `list_tools` describes it.
 #[must_use]
 pub fn tool(kind: RequestKind) -> Tool {
+    tool_with(kind, tools::input_schema(kind))
+}
+
+fn tool_with(kind: RequestKind, input_schema: rmcp::model::JsonObject) -> Tool {
     let mut tool = Tool::new(
         Cow::Borrowed(kind.tag()),
         Cow::Borrowed(tools::describes(kind)),
-        Arc::new(tools::input_schema(kind)),
+        Arc::new(input_schema),
     );
     // Hints, and the ones a client actually acts on: an agent asked to be
     // careful is told which of these change something before it calls one.

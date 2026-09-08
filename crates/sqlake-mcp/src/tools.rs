@@ -13,10 +13,11 @@ use sqlake_api::{RequestKind, schema};
 /// Every tool this server offers, in the order `RequestKind` lists them.
 #[must_use]
 pub fn all() -> Vec<Tool> {
+    let document = schema();
     RequestKind::ALL
         .iter()
         .filter(|kind| offered(**kind))
-        .map(|kind| crate::tool(*kind))
+        .map(|kind| crate::tool_with(*kind, from_document(&document, *kind)))
         .collect()
 }
 
@@ -121,9 +122,16 @@ pub const fn describes(kind: RequestKind) -> &'static str {
 /// rather than quoting it.
 #[must_use]
 pub fn input_schema(kind: RequestKind) -> JsonObject {
-    let document = schema();
+    from_document(&schema(), kind)
+}
+
+/// The same, against a document generated once.
+///
+/// [`all`] wants twelve of these, and `schema()` rebuilds the whole protocol
+/// document each time it is called.
+pub(crate) fn from_document(document: &Json, kind: RequestKind) -> JsonObject {
     let defs = document.get("$defs").cloned().unwrap_or(Json::Null);
-    let mut branch = branch_for(&document, kind).unwrap_or_else(|| {
+    let mut branch = branch_for(document, kind).unwrap_or_else(|| {
         // A kind with no branch means the generated schema and `RequestKind`
         // disagree, which `the_schema_describes_every_request_and_no_others`
         // in `sqlake-api` already forbids. An empty object here would be a
@@ -153,11 +161,57 @@ pub fn input_schema(kind: RequestKind) -> JsonObject {
         required.retain(|name| name != "request" && name != "connection");
     }
     // The `$ref`s inside a branch are written `#/$defs/…`, and `#` is now this
-    // document's root rather than the one they were generated under.
-    if !defs.is_null() {
-        branch.insert("$defs".into(), defs);
+    // document's root rather than the one they were generated under — so the
+    // definitions have to come along. Only the ones reached, though: the
+    // document's `$defs` is mostly *response* types, and carrying all of it
+    // onto all twelve tools would put a hundred kilobytes of schema an agent
+    // cannot call in front of it, which is the context this surface exists to
+    // spend carefully.
+    if let Some(defs) = defs.as_object() {
+        let reached = reachable(&Json::Object(branch.clone()), defs);
+        if !reached.is_empty() {
+            branch.insert("$defs".into(), Json::Object(reached));
+        }
     }
     branch
+}
+
+/// The definitions a schema names, and the ones those name in turn.
+///
+/// Transitive because a definition is free to refer to another, and a `$ref`
+/// left dangling is worse than the bulk it saved: a client that validates would
+/// reject every call.
+fn reachable(from: &Json, defs: &Map<String, Json>) -> Map<String, Json> {
+    let mut kept = Map::new();
+    let mut pending = vec![from.clone()];
+    while let Some(node) = pending.pop() {
+        for name in refs(&node) {
+            if let Some(definition) = defs.get(&name)
+                && kept.insert(name, definition.clone()).is_none()
+            {
+                pending.push(definition.clone());
+            }
+        }
+    }
+    kept
+}
+
+/// Every `#/$defs/<name>` under a node.
+fn refs(node: &Json) -> Vec<String> {
+    match node {
+        Json::Object(fields) => {
+            let mut found: Vec<String> = fields
+                .get("$ref")
+                .and_then(Json::as_str)
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+                .map(|name| vec![name.to_owned()])
+                .unwrap_or_default();
+            found.extend(fields.values().flat_map(refs));
+            found
+        }
+        Json::Array(items) => items.iter().flat_map(refs).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The `oneOf` branch describing one request.
@@ -246,6 +300,36 @@ mod tests {
         if text.contains("$ref") {
             assert!(schema.contains_key("$defs"), "{text}");
         }
+    }
+
+    #[test]
+    fn a_schema_carries_no_definition_it_does_not_name() {
+        // Every `$ref` a tool names resolves, and nothing else rides along: the
+        // protocol document's `$defs` is mostly response types, and twelve
+        // copies of it is a hundred kilobytes of schema an agent reads before
+        // it can call anything.
+        let names = |schema: &JsonObject| -> Vec<String> {
+            schema
+                .get("$defs")
+                .and_then(Json::as_object)
+                .map(|d| d.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        for kind in RequestKind::ALL {
+            if !offered(*kind) {
+                continue;
+            }
+            let schema = input_schema(*kind);
+            let mut carried = names(&schema);
+            carried.sort();
+            let mut named: Vec<String> = refs(&Json::Object(schema));
+            named.sort();
+            named.dedup();
+            assert_eq!(carried, named, "{}", kind.tag());
+        }
+        // And the one branch that does refer to something still gets it.
+        assert_eq!(names(&input_schema(RequestKind::TablePreview)), ["SortBy"]);
+        assert!(names(&input_schema(RequestKind::QueryCancel)).is_empty());
     }
 
     #[test]

@@ -411,7 +411,12 @@ pub(crate) fn run(
     // attach-or-one-shot dance below — it does the same choice itself and then
     // holds whichever it got for as long as a client is talking to it.
     if command.is_mcp() {
-        return runtime.block_on(serve_mcp(drivers, profiles, settings, connect, session));
+        let served = runtime.block_on(serve_mcp(drivers, profiles, settings, connect, session));
+        // Not dropped: dropping the runtime waits for blocking tasks, and
+        // resolving a profile is one — so a keyring dialog nobody is looking at
+        // would hold the process up after the client has already gone.
+        runtime.shutdown_background();
+        return served;
     }
 
     let response = runtime.block_on(async {
@@ -477,12 +482,16 @@ async fn serve_mcp(
     // needs a connection. Opened here rather than left to the client, so an
     // agent's first turn is a question about the database rather than about
     // this process.
-    if let Some(service) = backend.local()
-        && let Err(failure) = open(service.store(), connect.clone()).await?
-    {
-        // Said on stderr and not fatal: `connection_open` can still be called,
-        // and stdout belongs to the protocol.
-        eprintln!("no connection opened: {}", diagnostic(&failure));
+    if let Some(service) = backend.local() {
+        // Nothing here is fatal, including "no profiles are configured": the
+        // client can still call `connection_open`, and a server that refused to
+        // start would leave an agent with no way to find that out. Said on
+        // stderr, because stdout belongs to the protocol.
+        match open(service.store(), connect.clone()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => eprintln!("no connection opened: {}", diagnostic(&failure)),
+            Err(why) => eprintln!("no connection opened: {why:#}"),
+        }
     }
 
     sqlake_mcp::Server::new(backend, connect.map(|id| id.as_str().to_owned()))
@@ -532,11 +541,17 @@ async fn attached(
 }
 
 /// The same refusal, with the flag that answers it.
+///
+/// Recognised by [`sqlake_api::AMBIGUOUS`] rather than by a phrase written here
+/// as well, so a reworded refusal is a compile-time concern rather than a hint
+/// that quietly stops appearing.
 fn with_the_flag(failure: Failure) -> Failure {
     match failure {
-        Failure::Unsupported { message } if message.contains("name one") => Failure::Unsupported {
-            message: format!("{message} — `--connect <profile>`"),
-        },
+        Failure::Unsupported { message } if message.contains(sqlake_api::AMBIGUOUS) => {
+            Failure::Unsupported {
+                message: format!("{message}: `--connect <profile>`"),
+            }
+        }
         other => other,
     }
 }
@@ -720,6 +735,36 @@ mod tests {
         Cli::try_parse_from(std::iter::once("sqlake").chain(args.iter().copied()))
             .expect("the arguments parse")
             .command
+    }
+
+    #[test]
+    fn a_refusal_to_guess_names_the_flag_that_answers_it() {
+        // The protocol's message says which connections there are and not how
+        // to pick between them, because an MCP client has no flags. A person at
+        // a terminal does, and this is the layer that knows it.
+        let two = [connection("mock", 0), connection("prod", 1)];
+        let refused = sqlake_api::choose(&two, None, true).expect_err("closing should refuse");
+        let Failure::Unsupported { message } = with_the_flag(refused) else {
+            panic!("the refusal should survive being annotated");
+        };
+        assert!(message.contains("--connect"), "{message}");
+
+        // And nothing else is annotated: only the one refusal a flag answers.
+        let other = Failure::Unsupported {
+            message: "this driver cannot cancel".to_owned(),
+        };
+        assert_eq!(with_the_flag(other.clone()), other);
+    }
+
+    fn connection(profile: &str, index: usize) -> ConnectionInfo {
+        ConnectionInfo {
+            id: format!("id-{index}"),
+            profile: profile.to_owned(),
+            name: profile.to_owned(),
+            driver: "mock".into(),
+            status: Status::Ready,
+            capabilities: None,
+        }
     }
 
     #[test]

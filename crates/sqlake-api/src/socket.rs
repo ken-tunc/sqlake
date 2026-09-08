@@ -343,6 +343,17 @@ fn restrict(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+
+    use sqlake_app::action::Action;
+    use sqlake_app::store::{Drivers, Store};
+    use sqlake_core::id::{ConnId, ProfileId};
+    use sqlake_core::result::PageRequest;
+    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
+
+    use super::*;
+    use crate::serve::DEFAULT_TIMEOUT;
 
     #[test]
     fn closing_refuses_to_guess_which_connection() {
@@ -434,17 +445,6 @@ mod tests {
             Err(Failure::Unsupported { .. })
         ));
     }
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Arc;
-
-    use sqlake_app::action::Action;
-    use sqlake_app::store::{Drivers, Store};
-    use sqlake_core::id::{ConnId, ProfileId};
-    use sqlake_core::result::PageRequest;
-    use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
-
-    use super::*;
-    use crate::serve::DEFAULT_TIMEOUT;
 
     /// A session listening on a socket, with one connection already open —
     /// which is the situation attaching exists for.
@@ -763,6 +763,15 @@ impl Backend {
 ///
 /// [`Failure`] describing which of the two ways it found nothing: a profile
 /// that names no open connection, or a session with none at all.
+/// The tail of the refusal [`choose`] gives when more than one connection
+/// matches.
+///
+/// A constant rather than a phrase written twice: a front-end that has a way to
+/// say which — the CLI has `--connect` — appends it to this refusal, and it
+/// finds the refusal by this text. Two copies would drift, and the drift is
+/// silent: the hint just stops appearing.
+pub const AMBIGUOUS: &str = "name one to say which";
+
 pub fn choose(
     open: &[ConnectionInfo],
     connect: Option<&str>,
@@ -779,7 +788,7 @@ pub fn choose(
             .collect();
         return Err(Failure::Unsupported {
             message: format!(
-                "more than one connection matches ({}) — name one to say which",
+                "more than one connection matches ({}) — {AMBIGUOUS}",
                 names.join(", ")
             ),
         });
