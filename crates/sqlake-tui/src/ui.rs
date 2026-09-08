@@ -730,6 +730,22 @@ impl UiState {
         snapshot.definition(tab.conn, tab.defines()?)?.data.ready()
     }
 
+    /// Whether the active definition tab is on its generated statement, which
+    /// the pane draws as text rather than as a grid.
+    ///
+    /// Clamped the way the draw pass clamps it, so a section index left over
+    /// from a longer definition scrolls whatever is actually on the screen.
+    fn statement_shown(&self, snapshot: &Snapshot) -> bool {
+        let Some(definition) = self.definition(snapshot) else {
+            return false;
+        };
+        let Some(section) = self.active_tab.and_then(|id| self.section_of(id)) else {
+            return false;
+        };
+        let at = section.min(definition.titles().len().saturating_sub(1));
+        definition.statement(at).is_some()
+    }
+
     /// Which section the active definition tab is on.
     #[must_use]
     pub fn section_of(&self, tab: TabId) -> Option<usize> {
@@ -1095,7 +1111,13 @@ impl UiState {
             // of its own, so `j`, `PageDown` and `G` all work in it with
             // nothing added — only the count of what is being scrolled
             // through differs.
-            PaneId::Grid if self.active_sql().is_some() => self.sql_lines,
+            // The definition tab's DDL section is drawn by the same text
+            // renderer and so is measured the same way: its section has no
+            // rows at all, and counting those would pin it to the first
+            // screenful of a statement that is usually longer than one.
+            PaneId::Grid if self.active_sql().is_some() || self.statement_shown(snapshot) => {
+                self.sql_lines
+            }
             PaneId::Grid => self.row_count(snapshot),
             PaneId::Detail => self.detail_rows,
             PaneId::TabBar | PaneId::StatusBar => 0,
@@ -2139,6 +2161,50 @@ mod tests {
             &snap,
         );
         // Twenty lines in a pane four tall: sixteen is the last screenful.
+        assert_eq!(ui.sql_offset(), 16);
+    }
+
+    #[test]
+    fn a_definition_scrolls_its_statement_by_line() {
+        // The DDL section has no rows at all, so a clamp that counted them
+        // would leave a long `CREATE TABLE` stuck on its first screenful.
+        let conn = ConnId::new();
+        let mut snap = snapshot(conn, 3, 10, 3);
+        let mut detail = sqlake_core::detail::TableDetail::new(
+            table(),
+            sqlake_core::node::RelationKind::Table,
+            Vec::new(),
+        );
+        detail.ddl = Some(sqlake_core::detail::Ddl::generated("CREATE TABLE t ()"));
+        snap.definitions.push(sqlake_app::snapshot::DefinitionView {
+            conn,
+            table: table(),
+            data: LoadState::Ready(Arc::new(Definition::of(&detail))),
+        });
+
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::OpenDefinition {
+                conn,
+                table: table(),
+            },
+            &snap,
+        );
+        // Columns, then the DDL: this definition has no driver sections.
+        let _ = ui.apply(
+            ViewCmd::SelectSection(crate::intent::SectionPick::At(1)),
+            &snap,
+        );
+        ui.set_viewport(PaneId::Grid, Rect::new(0, 0, 40, 4));
+        ui.set_sql_lines(20);
+
+        let _ = ui.apply(
+            ViewCmd::ScrollBy {
+                pane: PaneId::Grid,
+                delta: 100,
+            },
+            &snap,
+        );
         assert_eq!(ui.sql_offset(), 16);
     }
 

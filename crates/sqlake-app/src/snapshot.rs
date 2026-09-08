@@ -269,24 +269,46 @@ impl Definition {
         }
     }
 
-    /// Every section a pane can show, columns first.
+    /// Every section a pane can show: columns, the driver's own, and the DDL
+    /// last if there is one.
     ///
-    /// Columns lead because they are what somebody opened the pane for; the
-    /// rest are in the order the driver gave them.
+    /// Columns lead because they are what somebody opened the pane for. The
+    /// DDL is last because it is the longest and the one most often skipped —
+    /// and it is in this list at all so a pane has one list to draw rather
+    /// than a list and a special case beside it.
     #[must_use]
     pub fn titles(&self) -> Vec<&str> {
         std::iter::once("Columns")
             .chain(self.sections.iter().map(|s| s.title.as_str()))
+            .chain(self.ddl.is_some().then_some("DDL"))
             .collect()
     }
 
     /// The rows under the section at `index` in [`Definition::titles`].
+    ///
+    /// `None` for the DDL, which is text rather than rows — see
+    /// [`Definition::statement`]. A caller that draws whichever of the two is
+    /// there cannot show the wrong one.
     #[must_use]
     pub fn rows(&self, index: usize) -> Option<&Arc<PagedResult>> {
         match index.checked_sub(1) {
             None => Some(&self.columns),
             Some(at) => self.sections.get(at).map(|s| &s.rows),
         }
+    }
+
+    /// The statement, when `index` is the DDL section.
+    ///
+    /// Text and not a grid: a `CREATE TABLE` is lines, and a cell holding one
+    /// is a cell with `␊` in it. The pane already has a text renderer, from
+    /// the SQL tab.
+    #[must_use]
+    pub fn statement(&self, index: usize) -> Option<&Ddl> {
+        // The index [`Definition::titles`] puts it at, worked out rather than
+        // built: the list is allocated, and this is asked once a frame.
+        (index == self.sections.len() + 1)
+            .then_some(self.ddl.as_ref())
+            .flatten()
     }
 }
 

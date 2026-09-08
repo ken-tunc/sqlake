@@ -369,6 +369,46 @@ async fn a_definition_matches_what_the_server_was_told() {
     );
     assert_eq!(column_of(&events, "Partitioning", 1), ["events_2026"]);
 
+    // The generated statement: everything the fixture put on `users`, and
+    // nothing this cannot know about.
+    let ddl = users
+        .ddl
+        .as_ref()
+        .expect("a table has one")
+        .text()
+        .to_owned();
+    assert!(
+        ddl.starts_with("CREATE TABLE \"public\".\"users\" ("),
+        "{ddl}"
+    );
+    assert!(ddl.contains("\"id\" integer NOT NULL"), "{ddl}");
+    assert!(ddl.contains("\"email\" text"), "{ddl}");
+    assert!(
+        ddl.contains("CONSTRAINT \"email_has_an_at\" CHECK"),
+        "{ddl}"
+    );
+    assert!(ddl.contains("PRIMARY KEY (id)"), "{ddl}");
+    // The unique index is owned by no constraint here, so it comes out as a
+    // statement of its own; the primary key's index does not, because writing
+    // both means a statement that fails on the second.
+    assert!(ddl.contains("CREATE UNIQUE INDEX users_email_key"), "{ddl}");
+    assert!(
+        !ddl.contains("CREATE UNIQUE INDEX users_pkey"),
+        "the primary key's own index is written twice: {ddl}"
+    );
+
+    // A view's body is the server's, with `CREATE VIEW` added here.
+    let view = session
+        .describe(&TableRef::new([DATABASE, "public", "recent_users"]))
+        .await
+        .expect("should describe");
+    let view_ddl = view.ddl.as_ref().expect("a view has one").text().to_owned();
+    assert!(
+        view_ddl.starts_with("CREATE VIEW \"public\".\"recent_users\" AS"),
+        "{view_ddl}"
+    );
+    assert!(view_ddl.contains("FROM users"), "{view_ddl}");
+
     session.close().await;
 }
 

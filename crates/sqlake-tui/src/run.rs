@@ -504,14 +504,40 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
                 let body = crate::definition::sections(frame, hits, grid, definition, section);
                 let summary = crate::definition::summary(definition);
                 let rows = definition.rows(section).map(Arc::clone);
+                let statement = definition.statement(section).map(|d| d.text().to_owned());
                 let body = chrome::caption(frame, body, &summary);
-                ui.set_viewport(PaneId::Grid, datagrid::body_area(body));
-                if let Some(rows) = rows {
-                    // Not sortable: a definition is not paged, so there is no
-                    // second fetch for a header click to ask for.
-                    datagrid::render_rows(frame, hits, body, &rows, ui.grid_mut(id), false, None);
-                    if frames.detail.height > 0 {
-                        detail = ui.grid_mut(id).detail();
+                // One or the other: `rows` is `None` for the DDL section and
+                // `statement` is `None` for every other, which is what stops
+                // this drawing both into the same rectangle.
+                if let Some(statement) = statement {
+                    // Text rather than a grid, and said to be generated: this
+                    // is the one thing in the pane that reads as something to
+                    // copy and run, and it is not what the server was told.
+                    let body = chrome::caption(
+                        frame,
+                        body,
+                        "built from the catalogue — not the statement this was created with",
+                    );
+                    ui.set_viewport(PaneId::Grid, body);
+                    ui.set_sql_lines(crate::sql::line_count(&statement));
+                    crate::sql::render(frame, body, &statement, ui.sql_offset(), None);
+                } else {
+                    ui.set_viewport(PaneId::Grid, datagrid::body_area(body));
+                    if let Some(rows) = rows {
+                        // Not sortable: a definition is not paged, so there is
+                        // no second fetch for a header click to ask for.
+                        datagrid::render_rows(
+                            frame,
+                            hits,
+                            body,
+                            &rows,
+                            ui.grid_mut(id),
+                            false,
+                            None,
+                        );
+                        if frames.detail.height > 0 {
+                            detail = ui.grid_mut(id).detail();
+                        }
                     }
                 }
             }
