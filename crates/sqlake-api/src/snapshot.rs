@@ -8,9 +8,11 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sqlake_app::PagedResult;
 use sqlake_app::snapshot::{ConnStatus, ConnectionView, LoadState, QueryView, Snapshot};
 use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::capability::Capabilities;
+use sqlake_core::detail::{ColumnDef, TableDetail};
 use sqlake_core::id::ConnId;
 use sqlake_core::sql::{Estimate, Position};
 
@@ -465,5 +467,126 @@ impl QueryInfo {
     #[must_use]
     pub const fn is_settled(&self) -> bool {
         !matches!(self.state, QueryState::Working)
+    }
+}
+
+/// One column, as the catalogue describes it.
+///
+/// `nullable` is a boolean here and the word "not null" in the TUI. That is
+/// the whole reason [`sqlake_app`] holds neither: a reader that branches on
+/// the answer wants the boolean, and a reader looking at a grid wants the
+/// word.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct ColumnDefInfo {
+    pub name: String,
+    /// The driver's own name for the type, uninterpreted.
+    pub type_name: String,
+    pub nullable: bool,
+    /// The default expression as the server stores it — `now()` rather than a
+    /// value, because that is what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+impl From<&ColumnDef> for ColumnDefInfo {
+    fn from(column: &ColumnDef) -> Self {
+        Self {
+            name: column.name.clone(),
+            type_name: column.type_name.clone(),
+            nullable: column.nullable,
+            default: column.default.clone(),
+            comment: column.comment.clone(),
+        }
+    }
+}
+
+/// One table of facts about a relation, under the driver's own title.
+///
+/// A [`Page`] rather than a shape of its own: an index list and a query result
+/// are both rows under columns, and a caller that can read one can read the
+/// other without being taught a second format.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct SectionInfo {
+    pub title: String,
+    pub page: Page,
+}
+
+/// One named fact about a relation — a row count, a size, a modification time.
+///
+/// An object rather than the pair it is in the driver, because a two-element
+/// array on the wire is a shape a reader has to be told the meaning of.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct StatInfo {
+    pub name: String,
+    pub value: String,
+}
+
+/// What a relation is, as opposed to what is in it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct DefinitionInfo {
+    pub table: Vec<String>,
+    pub relation_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    pub columns: Vec<ColumnDefInfo>,
+    /// Columns left out by the budget, named rather than counted, for the
+    /// reason [`Page::omitted_columns`] is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted_columns: Vec<String>,
+    /// Whatever this driver has — indexes, triggers, partitioning. Empty is a
+    /// normal answer rather than a gap: BigQuery has no triggers to have.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SectionInfo>,
+    /// Built here from the catalogue, not the statement the relation was
+    /// created with — which is what the field is named for. Neither server
+    /// hands the original over for free, and running this covers what it
+    /// covers and no more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_ddl: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stats: Vec<StatInfo>,
+}
+
+impl DefinitionInfo {
+    /// The wire form, cut to what a caller can hold.
+    ///
+    /// Columns are cut by the *row* budget rather than the column one: a
+    /// thousand-column table is a thousand rows to somebody reading its
+    /// definition, and `max_columns` is about how wide one row may be.
+    #[must_use]
+    pub fn of(detail: &TableDetail, budget: Budget) -> Self {
+        let kept = detail.columns.len().min(budget.max_rows);
+        Self {
+            table: detail.table.path.clone(),
+            relation_kind: detail.kind.as_str().to_owned(),
+            comment: detail.comment.clone(),
+            columns: detail.columns[..kept]
+                .iter()
+                .map(ColumnDefInfo::from)
+                .collect(),
+            omitted_columns: detail.columns[kept..]
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            sections: detail
+                .sections
+                .iter()
+                .map(|section| SectionInfo {
+                    title: section.title.clone(),
+                    page: Page::of(&PagedResult::new(&section.table), budget),
+                })
+                .collect(),
+            generated_ddl: detail.ddl.as_ref().map(|d| d.text().to_owned()),
+            stats: detail
+                .stats
+                .iter()
+                .map(|(name, value)| StatInfo {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
     }
 }

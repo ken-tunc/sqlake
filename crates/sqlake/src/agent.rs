@@ -138,6 +138,15 @@ pub(crate) enum TableCommand {
         #[command(flatten)]
         path: Path,
     },
+    /// What a relation is: its columns, its indexes, and a generated
+    /// `CREATE` statement.
+    Describe {
+        #[command(flatten)]
+        path: Path,
+        /// Ask the driver again rather than reading what the session holds.
+        #[arg(long)]
+        refresh: bool,
+    },
     /// A page of one relation.
     Preview {
         #[command(flatten)]
@@ -252,6 +261,13 @@ impl Command {
             // Never asked for: `run` sends this one to the MCP server instead
             // of to a session, and `is_mcp` is what stops it getting here.
             Self::Mcp => Request::Snapshot {},
+            Self::Table {
+                what: TableCommand::Describe { path, refresh },
+            } => Request::TableDescribe {
+                connection,
+                table: path.segments(),
+                refresh: *refresh,
+            },
             Self::Table {
                 what: TableCommand::Preview { path, sort, limit },
             } => Request::TablePreview {
@@ -984,6 +1000,22 @@ mod tests {
                 limit: None,
             }
         );
+    }
+
+    #[test]
+    fn describing_asks_the_driver_again_only_when_told_to() {
+        assert_eq!(
+            parse(&["table", "describe", "public.users"]).request("c".into()),
+            Request::TableDescribe {
+                connection: "c".into(),
+                table: vec!["public".into(), "users".into()],
+                refresh: false,
+            }
+        );
+        assert!(matches!(
+            parse(&["table", "describe", "public.users", "--refresh"]).request("c".into()),
+            Request::TableDescribe { refresh: true, .. }
+        ));
     }
 
     #[test]

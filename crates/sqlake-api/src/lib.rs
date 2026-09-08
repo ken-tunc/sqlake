@@ -20,8 +20,8 @@ pub use protocol::{
 };
 pub use serve::{DEFAULT_TIMEOUT, Service};
 pub use snapshot::{
-    ConnectionInfo, EstimateInfo, NodeInfo, NodeStatus, PositionInfo, ProfileInfo, QueryInfo,
-    QueryState, SessionInfo, Status,
+    ColumnDefInfo, ConnectionInfo, DefinitionInfo, EstimateInfo, NodeInfo, NodeStatus,
+    PositionInfo, ProfileInfo, QueryInfo, QueryState, SectionInfo, SessionInfo, StatInfo, Status,
 };
 pub use socket::{
     AMBIGUOUS, Backend, Client, DEFAULT_SESSION, Listener, ListenerHandle, choose, session_name,

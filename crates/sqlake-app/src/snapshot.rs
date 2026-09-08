@@ -8,13 +8,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sqlake_core::capability::{Capabilities, DriverKind};
-use sqlake_core::detail::{Ddl, TableDetail};
+use sqlake_core::detail::TableDetail;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
-use sqlake_core::node::{NodeRef, RelationKind, TableRef};
+use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
-use sqlake_core::result::{Column, ResultSet, Row, Sort};
+use sqlake_core::result::Sort;
 use sqlake_core::sql::{Estimate, OverBudget, Position};
-use sqlake_core::value::Value;
 
 use crate::action::BusyId;
 use crate::pages::PagedResult;
@@ -184,132 +183,20 @@ impl QueryView {
     }
 }
 
-/// One section of a definition, with its rows in the shape a grid takes.
-///
-/// `PagedResult` rather than the `ResultSet` the driver answered with: the
-/// grid has one input type and a definition is not a reason to give it a
-/// second. Wrapped once here rather than per frame, since a section never
-/// grows — there is no page two of an index list.
-#[derive(Debug, Clone)]
-pub struct SectionView {
-    pub title: String,
-    pub rows: Arc<PagedResult>,
-}
-
 /// What a relation is, as far as it has been fetched.
 ///
 /// Cached by `(conn, table)` so that opening the tab twice does not ask the
 /// server twice — and so an agent asking through `sqlake-api` reads what a
 /// person already has open rather than fetching a second copy.
+///
+/// The driver's own [`TableDetail`], not a shape picked for a screen. The two
+/// front-ends want opposite things from it — a grid of strings, and JSON with
+/// `nullable` still a boolean — so neither rendering belongs here.
 #[derive(Debug, Clone)]
 pub struct DefinitionView {
     pub conn: ConnId,
     pub table: TableRef,
-    pub data: LoadState<Arc<Definition>>,
-}
-
-/// The definition itself, in front-end shape.
-#[derive(Debug, Clone)]
-pub struct Definition {
-    pub kind: RelationKind,
-    pub comment: Option<String>,
-    pub columns: Arc<PagedResult>,
-    pub sections: Vec<SectionView>,
-    pub ddl: Option<Ddl>,
-    pub stats: Vec<(String, String)>,
-}
-
-impl Definition {
-    /// The columns as a grid, and every other section beside them.
-    ///
-    /// Columns are a section like the rest once they are here, which is what
-    /// lets a pane draw one list and one grid rather than a special case in
-    /// front of a loop.
-    #[must_use]
-    pub fn of(detail: &TableDetail) -> Self {
-        let columns = ResultSet::new(
-            vec![
-                Column::new("column", "text", false),
-                Column::new("type", "text", false),
-                Column::new("null", "text", false),
-                Column::new("default", "text", true),
-                Column::new("comment", "text", true),
-            ],
-            detail
-                .columns
-                .iter()
-                .map(|column| {
-                    Row(vec![
-                        Value::Text(column.name.clone()),
-                        Value::Text(column.type_name.clone()),
-                        // A word rather than a boolean: `false` under a column
-                        // headed `null` is two negatives to hold at once.
-                        Value::Text(if column.nullable { "" } else { "not null" }.to_owned()),
-                        column.default.clone().map_or(Value::Null, Value::Text),
-                        column.comment.clone().map_or(Value::Null, Value::Text),
-                    ])
-                })
-                .collect(),
-            Some(detail.columns.len() as u64),
-        );
-        Self {
-            kind: detail.kind,
-            comment: detail.comment.clone(),
-            columns: Arc::new(PagedResult::new(&columns)),
-            sections: detail
-                .sections
-                .iter()
-                .map(|section| SectionView {
-                    title: section.title.clone(),
-                    rows: Arc::new(PagedResult::new(&section.table)),
-                })
-                .collect(),
-            ddl: detail.ddl.clone(),
-            stats: detail.stats.clone(),
-        }
-    }
-
-    /// Every section a pane can show: columns, the driver's own, and the DDL
-    /// last if there is one.
-    ///
-    /// Columns lead because they are what somebody opened the pane for. The
-    /// DDL is last because it is the longest and the one most often skipped —
-    /// and it is in this list at all so a pane has one list to draw rather
-    /// than a list and a special case beside it.
-    #[must_use]
-    pub fn titles(&self) -> Vec<&str> {
-        std::iter::once("Columns")
-            .chain(self.sections.iter().map(|s| s.title.as_str()))
-            .chain(self.ddl.is_some().then_some("DDL"))
-            .collect()
-    }
-
-    /// The rows under the section at `index` in [`Definition::titles`].
-    ///
-    /// `None` for the DDL, which is text rather than rows — see
-    /// [`Definition::statement`]. A caller that draws whichever of the two is
-    /// there cannot show the wrong one.
-    #[must_use]
-    pub fn rows(&self, index: usize) -> Option<&Arc<PagedResult>> {
-        match index.checked_sub(1) {
-            None => Some(&self.columns),
-            Some(at) => self.sections.get(at).map(|s| &s.rows),
-        }
-    }
-
-    /// The statement, when `index` is the DDL section.
-    ///
-    /// Text and not a grid: a `CREATE TABLE` is lines, and a cell holding one
-    /// is a cell with `␊` in it. The pane already has a text renderer, from
-    /// the SQL tab.
-    #[must_use]
-    pub fn statement(&self, index: usize) -> Option<&Ddl> {
-        // The index [`Definition::titles`] puts it at, worked out rather than
-        // built: the list is allocated, and this is asked once a frame.
-        (index == self.sections.len() + 1)
-            .then_some(self.ddl.as_ref())
-            .flatten()
-    }
+    pub data: LoadState<Arc<TableDetail>>,
 }
 
 /// What a busy item is waiting for.
@@ -445,6 +332,14 @@ impl Snapshot {
     pub fn preview_settled(&self, conn: ConnId, table: &TableRef) -> bool {
         !self.busy.iter().any(
             |b| matches!(&b.owner, BusyOwner::Preview { conn: c, table: t } if *c == conn && t == table),
+        )
+    }
+
+    /// Whether the store has finished describing this relation.
+    #[must_use]
+    pub fn definition_settled(&self, conn: ConnId, table: &TableRef) -> bool {
+        !self.busy.iter().any(
+            |b| matches!(&b.owner, BusyOwner::Definition { conn: c, table: t } if *c == conn && t == table),
         )
     }
 

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
 use crate::page::{Budget, Page};
-use crate::snapshot::{ConnectionInfo, NodeInfo, QueryInfo, SessionInfo};
+use crate::snapshot::{ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo};
 
 /// Which column to sort a preview by.
 ///
@@ -157,6 +157,25 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
     },
+
+    /// What a relation is, as opposed to what is in it: its columns, its
+    /// indexes, and a `CREATE` statement built from the catalogue.
+    ///
+    /// Separate from `table_preview` because the two answer different
+    /// questions and a caller usually wants one of them: reading a page to
+    /// find out what the columns are costs a scan the catalogue does not.
+    TableDescribe {
+        connection: String,
+        table: Vec<String>,
+        /// Ask the driver again rather than reading what the session already
+        /// holds.
+        ///
+        /// Here and not on `table_preview`, where a page is re-fetched by
+        /// paging anyway: a definition is fetched once, so a relation altered
+        /// since would otherwise stay wrong for as long as the session lives.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refresh: bool,
+    },
 }
 
 /// Generates the kind enum and its complete list together, so the two cannot
@@ -191,6 +210,7 @@ request_kinds! {
     NamespaceList   => "namespace_list",
     TableList       => "table_list",
     TablePreview    => "table_preview",
+    TableDescribe   => "table_describe",
     QueryEstimate   => "query_estimate",
     QueryRun        => "query_run",
     QueryStatus     => "query_status",
@@ -216,6 +236,7 @@ impl Request {
             Self::NamespaceList { .. } => RequestKind::NamespaceList,
             Self::TableList { .. } => RequestKind::TableList,
             Self::TablePreview { .. } => RequestKind::TablePreview,
+            Self::TableDescribe { .. } => RequestKind::TableDescribe,
             Self::QueryEstimate { .. } => RequestKind::QueryEstimate,
             Self::QueryRun { .. } => RequestKind::QueryRun,
             Self::QueryStatus { .. } => RequestKind::QueryStatus,
@@ -306,6 +327,10 @@ pub enum Response {
     /// deliberately does not make.
     Nodes(Vec<NodeInfo>),
     Page(Page),
+    /// What a relation is. Its own response rather than a `Page`: half of a
+    /// definition is not rows, and the half that is comes under titles the
+    /// driver chose.
+    Definition(DefinitionInfo),
     /// One query, wherever it has got to. The answer to running, waiting,
     /// asking and cancelling alike: all four are questions about one thing,
     /// and giving each its own shape would make a caller parse four.
@@ -329,7 +354,17 @@ macro_rules! kinds {
     };
 }
 
-kinds!(ResponseKind: Snapshot, Schema, Connections, Connection, Nodes, Page, Query, Failed);
+kinds!(
+    ResponseKind: Snapshot,
+    Schema,
+    Connections,
+    Connection,
+    Nodes,
+    Page,
+    Definition,
+    Query,
+    Failed,
+);
 
 // One level below `ResponseKind`, because a `Failed` response is not one
 // shape: each variant carries its own fields, so a check that samples one
@@ -357,6 +392,7 @@ impl Response {
             Self::Connection(_) => ResponseKind::Connection,
             Self::Nodes(_) => ResponseKind::Nodes,
             Self::Page(_) => ResponseKind::Page,
+            Self::Definition(_) => ResponseKind::Definition,
             Self::Query(_) => ResponseKind::Query,
             Self::Failed(_) => ResponseKind::Failed,
         }
@@ -463,6 +499,11 @@ mod tests {
                 table: vec!["public".into(), "users".into()],
                 sort: None,
                 limit: None,
+            },
+            Request::TableDescribe {
+                connection: "c".into(),
+                table: vec!["public".into(), "users".into()],
+                refresh: false,
             },
             Request::ConnectionOpen {
                 profile: "mock".into(),

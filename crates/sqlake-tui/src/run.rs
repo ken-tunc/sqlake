@@ -492,19 +492,29 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     if let Some((id, conn, TabContent::Definition { table, section })) = &active {
         let (id, section) = (*id, *section);
         match snapshot.definition(*conn, table).map(|d| &d.data) {
-            Some(sqlake_app::snapshot::LoadState::Ready(definition)) => {
-                // The list first, because what is left of the pane is what the
-                // grid gets — and working that out twice is how the two come
-                // to disagree.
-                // Clamped here as well as where it is picked: a refresh can
-                // come back with fewer sections than the tab was on, and an
-                // index past the end draws an empty pane with nothing in it
-                // saying why.
-                let section = section.min(definition.titles().len().saturating_sub(1));
-                let body = crate::definition::sections(frame, hits, grid, definition, section);
-                let summary = crate::definition::summary(definition);
-                let rows = definition.rows(section).map(Arc::clone);
-                let statement = definition.statement(section).map(|d| d.text().to_owned());
+            Some(sqlake_app::snapshot::LoadState::Ready(ready)) => {
+                let held = Arc::clone(ready);
+                ui.lay_out(id, &held);
+                // Everything the layout is asked for happens here, while the
+                // borrow of it is shared; the calls below need `&mut ui` and
+                // would otherwise cost a clone of the whole thing each frame.
+                let (body, summary, rows, statement) = {
+                    let definition = ui.laid(id).expect("just laid out");
+                    // The list first, because what is left of the pane is what
+                    // the grid gets — and working that out twice is how the
+                    // two come to disagree.
+                    // Clamped here as well as where it is picked: a refresh can
+                    // come back with fewer sections than the tab was on, and an
+                    // index past the end draws an empty pane with nothing in it
+                    // saying why.
+                    let section = section.min(definition.titles().len().saturating_sub(1));
+                    (
+                        crate::definition::sections(frame, hits, grid, definition, section),
+                        crate::definition::summary(definition),
+                        definition.rows(section).map(Arc::clone),
+                        definition.statement(section).map(|d| d.text().to_owned()),
+                    )
+                };
                 let body = chrome::caption(frame, body, &summary);
                 // One or the other: `rows` is `None` for the DDL section and
                 // `statement` is `None` for every other, which is what stops
@@ -1893,7 +1903,8 @@ mod tests {
         // Columns lead, because that is what somebody opened the pane for.
         assert_eq!(ui.section_of(tab), Some(0));
         let rows_now = |ui: &UiState| {
-            let definition = ui.definition(&snap).expect("it arrived");
+            let definition =
+                crate::definition::Laid::out(ui.definition(&snap).expect("it arrived"));
             definition
                 .rows(ui.section_of(tab).expect("a definition tab"))
                 .map(|r| r.row_count())
@@ -1919,7 +1930,10 @@ mod tests {
                 &snap,
             );
         }
-        let last = ui.definition(&snap).expect("it arrived").titles().len() - 1;
+        let last = crate::definition::Laid::out(ui.definition(&snap).expect("it arrived"))
+            .titles()
+            .len()
+            - 1;
         assert_eq!(ui.section_of(tab), Some(last));
     }
 

@@ -48,7 +48,7 @@ sqlake api schema               print the request/response schema
 sqlake connection list
 sqlake connection open|close    against a session that outlives the command
 sqlake schema list              namespaces in a connection
-sqlake table list|preview
+sqlake table list|preview|describe
 sqlake query estimate|run|status|wait|cancel
 sqlake mcp                      speak MCP on stdio
 ```
@@ -56,7 +56,6 @@ sqlake mcp                      speak MCP on stdio
 Planned, with the milestone that brings each:
 
 ```
-sqlake table describe           M5
 sqlake history search           M8
 ```
 
