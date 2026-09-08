@@ -25,7 +25,10 @@ use sqlake_app::PagedResult;
 
 use crate::detail::RenderedDetail;
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::{ConnStatus, ConnectionView, Definition, LoadState, Snapshot};
+use sqlake_app::snapshot::{ConnStatus, ConnectionView, LoadState, Snapshot};
+use sqlake_core::detail::TableDetail;
+
+use crate::definition::Laid;
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_app::tree::VisibleNode;
@@ -405,6 +408,8 @@ pub struct UiState {
     /// new id.
     reported_query_errors: HashSet<QueryId>,
     grids: HashMap<TabId, GridUi>,
+    /// Each definition tab's laid-out copy, and the detail it was built from.
+    laid: HashMap<TabId, (Arc<TableDetail>, Laid)>,
     /// How tall the detail pane is, or `None` while it is closed.
     ///
     /// View state like the splitter: which cell is being read closely is one
@@ -706,7 +711,7 @@ impl UiState {
         let Some(id) = self.active_tab else { return };
         let last = self
             .definition(snapshot)
-            .map_or(0, |d| d.titles().len().saturating_sub(1));
+            .map_or(0, |d| Laid::out(d).titles().len().saturating_sub(1));
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
             return;
         };
@@ -724,10 +729,29 @@ impl UiState {
 
     /// The definition the active tab is showing, once it has arrived.
     #[must_use]
-    pub fn definition<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<Definition>> {
+    pub fn definition<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<TableDetail>> {
         let id = self.active_tab?;
         let tab = self.tabs.iter().find(|t| t.id == id)?;
         snapshot.definition(tab.conn, tab.defines()?)?.data.ready()
+    }
+
+    /// The same, laid out for this screen and kept until it changes.
+    ///
+    /// Rebuilt only when the detail behind it is a different `Arc`, for the
+    /// reason `GridUi::grid` is: a snapshot is republished for reasons that
+    /// have nothing to do with this tab — a spinner tick will do it — and
+    /// laying out every column again on each one is work with nothing to show
+    /// for it.
+    pub fn laid(&mut self, tab: TabId, detail: &Arc<TableDetail>) -> &Laid {
+        let stale = self
+            .laid
+            .get(&tab)
+            .is_none_or(|(held, _)| !Arc::ptr_eq(held, detail));
+        if stale {
+            self.laid
+                .insert(tab, (Arc::clone(detail), Laid::out(detail)));
+        }
+        &self.laid.get(&tab).expect("just built when it was stale").1
     }
 
     /// Whether the active definition tab is on its generated statement, which
@@ -742,8 +766,12 @@ impl UiState {
         let Some(section) = self.active_tab.and_then(|id| self.section_of(id)) else {
             return false;
         };
-        let at = section.min(definition.titles().len().saturating_sub(1));
-        definition.statement(at).is_some()
+        // Laid out to be asked, rather than reaching for the cache: this is a
+        // question about the section list, and building one list is cheaper
+        // than a borrow that would make this take `&mut self`.
+        let laid = Laid::out(definition);
+        let at = section.min(laid.titles().len().saturating_sub(1));
+        laid.statement(at).is_some()
     }
 
     /// Which section the active definition tab is on.
@@ -1019,6 +1047,7 @@ impl UiState {
             ViewCmd::CloseTab(id) => {
                 let position = self.tabs.iter().position(|t| t.id == id);
                 self.tabs.retain(|t| t.id != id);
+                self.laid.remove(&id);
                 // The cached grid and column widths belonged to this tab and
                 // nothing else; without dropping them a long session
                 // accumulates a `GridUi` — and the `RenderedGrid` it caches —
@@ -1357,7 +1386,7 @@ impl UiState {
     ///
     /// `None` covers a real frame: a tab opened this tick has nothing in the
     /// snapshot until the store answers.
-    fn rows_of<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
+    fn rows_of<'a>(&'a self, snapshot: &'a Snapshot) -> Option<&'a Arc<PagedResult>> {
         let tab = self.active_tab?;
         let open = self.tabs.iter().find(|t| t.id == tab)?;
         match &open.content {
@@ -1368,11 +1397,16 @@ impl UiState {
             TabContent::Sql { query, .. } => snapshot.query((*query)?)?.data.ready(),
             // The section this tab is looking at, which is a different grid
             // per tab even for the same relation.
-            TabContent::Definition { table, section } => snapshot
-                .definition(open.conn, table)?
-                .data
-                .ready()?
-                .rows(*section),
+            // Read out of the layout the last draw built rather than laying
+            // the detail out again: this is on the path of every scroll and
+            // click, and `&self` could not cache what it built anyway. A
+            // definition whose detail arrived after that draw has no rows here
+            // for one frame, which is a frame nobody can have scrolled in yet.
+            TabContent::Definition { table, section } => {
+                let detail = snapshot.definition(open.conn, table)?.data.ready()?;
+                let (held, laid) = self.laid.get(&tab)?;
+                Arc::ptr_eq(held, detail).then(|| laid.rows(*section))?
+            }
         }
     }
 
@@ -2179,7 +2213,7 @@ mod tests {
         snap.definitions.push(sqlake_app::snapshot::DefinitionView {
             conn,
             table: table(),
-            data: LoadState::Ready(Arc::new(Definition::of(&detail))),
+            data: LoadState::Ready(Arc::new(detail)),
         });
 
         let mut ui = UiState::new();

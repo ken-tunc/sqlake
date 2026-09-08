@@ -10,11 +10,118 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use sqlake_app::snapshot::Definition;
+use std::sync::Arc;
+
+use sqlake_app::PagedResult;
+use sqlake_core::detail::{Ddl, TableDetail};
+use sqlake_core::result::{Column as ResultColumn, ResultSet, Row};
+use sqlake_core::value::Value;
 
 use crate::chrome::fit;
 use crate::grid::sanitise;
 use crate::hit::{HitMap, Target, Z_CHROME};
+
+/// A definition laid out for this screen.
+///
+/// Built here rather than in `sqlake-app`, which is forbidden a display
+/// decision — and turning `nullable: false` into the words `not null` is one.
+/// `sqlake-api` renders the same [`TableDetail`] as JSON with the boolean
+/// still a boolean, which is the opposite rendering the layering rule exists
+/// to keep separate.
+#[derive(Debug, Clone)]
+pub struct Laid {
+    kind: &'static str,
+    comment: Option<String>,
+    columns: Arc<PagedResult>,
+    sections: Vec<(String, Arc<PagedResult>)>,
+    ddl: Option<Ddl>,
+    stats: Vec<(String, String)>,
+}
+
+impl Laid {
+    /// The columns as a grid, and every other section beside them.
+    ///
+    /// Columns become a section like the rest here, which is what lets the
+    /// pane draw one list and one grid rather than a special case in front of
+    /// a loop.
+    #[must_use]
+    pub fn out(detail: &TableDetail) -> Self {
+        let columns = ResultSet::new(
+            vec![
+                ResultColumn::new("column", "text", false),
+                ResultColumn::new("type", "text", false),
+                ResultColumn::new("null", "text", false),
+                ResultColumn::new("default", "text", true),
+                ResultColumn::new("comment", "text", true),
+            ],
+            detail
+                .columns
+                .iter()
+                .map(|column| {
+                    Row(vec![
+                        Value::Text(column.name.clone()),
+                        Value::Text(column.type_name.clone()),
+                        // A word rather than a boolean: `false` under a column
+                        // headed `null` is two negatives to hold at once.
+                        Value::Text(if column.nullable { "" } else { "not null" }.to_owned()),
+                        column.default.clone().map_or(Value::Null, Value::Text),
+                        column.comment.clone().map_or(Value::Null, Value::Text),
+                    ])
+                })
+                .collect(),
+            Some(detail.columns.len() as u64),
+        );
+        Self {
+            kind: detail.kind.as_str(),
+            comment: detail.comment.clone(),
+            columns: Arc::new(PagedResult::new(&columns)),
+            sections: detail
+                .sections
+                .iter()
+                .map(|section| {
+                    (
+                        section.title.clone(),
+                        Arc::new(PagedResult::new(&section.table)),
+                    )
+                })
+                .collect(),
+            ddl: detail.ddl.clone(),
+            stats: detail.stats.clone(),
+        }
+    }
+
+    /// Every section this pane can show: columns, the driver's own, and the
+    /// DDL last if there is one.
+    ///
+    /// Columns lead because they are what somebody opened the pane for. The
+    /// DDL is last because it is the longest and the one most often skipped.
+    #[must_use]
+    pub fn titles(&self) -> Vec<&str> {
+        std::iter::once("Columns")
+            .chain(self.sections.iter().map(|(title, _)| title.as_str()))
+            .chain(self.ddl.is_some().then_some("DDL"))
+            .collect()
+    }
+
+    /// The rows under the section at `index`, or `None` for the DDL — which is
+    /// text. A caller drawing whichever of the two is there cannot show the
+    /// wrong one.
+    #[must_use]
+    pub fn rows(&self, index: usize) -> Option<&Arc<PagedResult>> {
+        match index.checked_sub(1) {
+            None => Some(&self.columns),
+            Some(at) => self.sections.get(at).map(|(_, rows)| rows),
+        }
+    }
+
+    /// The statement, when `index` is the DDL section.
+    #[must_use]
+    pub fn statement(&self, index: usize) -> Option<&Ddl> {
+        (index == self.sections.len() + 1)
+            .then_some(self.ddl.as_ref())
+            .flatten()
+    }
+}
 
 /// How wide the section list gets.
 ///
@@ -31,7 +138,7 @@ pub fn sections(
     frame: &mut Frame<'_>,
     hits: &mut HitMap,
     area: Rect,
-    definition: &Definition,
+    definition: &Laid,
     selected: usize,
 ) -> Rect {
     let titles = definition.titles();
@@ -81,8 +188,8 @@ pub fn sections(
 /// One line, because the sections below it are the content and a header that
 /// grows pushes them off the screen.
 #[must_use]
-pub fn summary(definition: &Definition) -> String {
-    let mut parts = vec![definition.kind.as_str().to_owned()];
+pub fn summary(definition: &Laid) -> String {
+    let mut parts = vec![definition.kind.to_owned()];
     parts.extend(
         definition
             .stats
@@ -99,14 +206,12 @@ pub fn summary(definition: &Definition) -> String {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use sqlake_core::detail::{ColumnDef, DetailSection, TableDetail};
+    use sqlake_core::detail::{ColumnDef, DetailSection};
     use sqlake_core::node::{RelationKind, TableRef};
-    use sqlake_core::result::{Column, ResultSet, Row};
-    use sqlake_core::value::Value;
 
     use super::*;
 
-    fn definition(section_titles: &[&str]) -> Definition {
+    fn definition(section_titles: &[&str]) -> Laid {
         let mut detail = TableDetail::new(
             TableRef::new(["public", "users"]),
             RelationKind::Table,
@@ -123,16 +228,16 @@ mod tests {
             detail.sections.push(DetailSection {
                 title: (*title).to_owned(),
                 table: ResultSet::new(
-                    vec![Column::new("name", "text", false)],
+                    vec![ResultColumn::new("name", "text", false)],
                     vec![Row(vec![Value::Text("a".to_owned())])],
                     None,
                 ),
             });
         }
-        Definition::of(&detail)
+        Laid::out(&detail)
     }
 
-    fn drawn(definition: &Definition, selected: usize, w: u16) -> (String, Rect) {
+    fn drawn(definition: &Laid, selected: usize, w: u16) -> (String, Rect) {
         let mut terminal = Terminal::new(TestBackend::new(w, 6)).unwrap();
         let mut hits = HitMap::new();
         let mut grid = Rect::default();

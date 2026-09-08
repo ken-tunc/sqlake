@@ -492,7 +492,10 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     if let Some((id, conn, TabContent::Definition { table, section })) = &active {
         let (id, section) = (*id, *section);
         match snapshot.definition(*conn, table).map(|d| &d.data) {
-            Some(sqlake_app::snapshot::LoadState::Ready(definition)) => {
+            Some(sqlake_app::snapshot::LoadState::Ready(ready)) => {
+                let held = Arc::clone(ready);
+                let definition = ui.laid(id, &held).clone();
+                let definition = &definition;
                 // The list first, because what is left of the pane is what the
                 // grid gets — and working that out twice is how the two come
                 // to disagree.
@@ -1893,7 +1896,8 @@ mod tests {
         // Columns lead, because that is what somebody opened the pane for.
         assert_eq!(ui.section_of(tab), Some(0));
         let rows_now = |ui: &UiState| {
-            let definition = ui.definition(&snap).expect("it arrived");
+            let definition =
+                crate::definition::Laid::out(ui.definition(&snap).expect("it arrived"));
             definition
                 .rows(ui.section_of(tab).expect("a definition tab"))
                 .map(|r| r.row_count())
@@ -1919,7 +1923,10 @@ mod tests {
                 &snap,
             );
         }
-        let last = ui.definition(&snap).expect("it arrived").titles().len() - 1;
+        let last = crate::definition::Laid::out(ui.definition(&snap).expect("it arrived"))
+            .titles()
+            .len()
+            - 1;
         assert_eq!(ui.section_of(tab), Some(last));
     }
 

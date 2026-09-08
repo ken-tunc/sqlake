@@ -28,8 +28,8 @@ use crate::error::{AppError, AppResult};
 use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
-    BusyItem, BusyOwner, ConnStatus, ConnectionView, Definition, DefinitionView, LoadState,
-    PreviewView, QueryView, Snapshot,
+    BusyItem, BusyOwner, ConnStatus, ConnectionView, DefinitionView, LoadState, PreviewView,
+    QueryView, Snapshot,
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
@@ -798,7 +798,7 @@ impl Runtime {
             return;
         };
         definition.data = match result {
-            Ok(detail) => LoadState::Ready(Arc::new(Definition::of(&detail))),
+            Ok(detail) => LoadState::Ready(Arc::new(detail)),
             Err(err) => LoadState::Failed(err.user_message()),
         };
     }
