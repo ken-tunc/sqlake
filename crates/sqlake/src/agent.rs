@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::{Args as ClapArgs, Subcommand};
-use sqlake_api::{ConnectionInfo, Failure, QueryState, Request, Response, Service, Status};
+use sqlake_api::{Failure, QueryState, Request, Response, Service, Status};
 use sqlake_app::action::Action;
 use sqlake_app::store::{Drivers, Store};
 use sqlake_config::Settings;
@@ -52,6 +52,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         what: QueryCommand,
     },
+    /// Speak MCP on stdin and stdout, exposing the same operations as tools.
+    ///
+    /// After the subcommands rather than instead of them: the CLI is testable
+    /// with a shell and usable by anything that can run a command, and this is
+    /// implemented in terms of it. Building MCP first would have meant
+    /// debugging two layers at once.
+    Mcp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -242,6 +249,9 @@ impl Command {
             } => Request::QueryCancel {
                 query: query.clone(),
             },
+            // Never asked for: `run` sends this one to the MCP server instead
+            // of to a session, and `is_mcp` is what stops it getting here.
+            Self::Mcp => Request::Snapshot {},
             Self::Table {
                 what: TableCommand::Preview { path, sort, limit },
             } => Request::TablePreview {
@@ -264,6 +274,15 @@ impl Command {
                 what: ConnectionCommand::Close
             }
         )
+    }
+
+    /// Whether this is the long-running MCP server rather than one request.
+    ///
+    /// Its own question because everything else about a command — the request
+    /// it names, what that needs — is about answering once, and this one never
+    /// does.
+    pub(crate) const fn is_mcp(&self) -> bool {
+        matches!(self, Self::Mcp)
     }
 
     /// What answering this needs, which differs by mode.
@@ -313,6 +332,10 @@ impl Command {
             // The other three name a query the session already started, and a
             // one-shot store started none.
             Self::Query { .. } => Needs::LiveSession,
+            // A session, because every tool it offers needs one — and it holds
+            // the backend open for as long as a client is talking to it, so a
+            // local store here is a store that lives, unlike a one-shot's.
+            Self::Mcp => Needs::Session,
         }
     }
 }
@@ -383,6 +406,19 @@ pub(crate) fn run(
     session: Option<PathBuf>,
 ) -> Result<std::process::ExitCode> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+
+    // The MCP server is not one request, so it does not go through the
+    // attach-or-one-shot dance below — it does the same choice itself and then
+    // holds whichever it got for as long as a client is talking to it.
+    if command.is_mcp() {
+        let served = runtime.block_on(serve_mcp(drivers, profiles, settings, connect, session));
+        // Not dropped: dropping the runtime waits for blocking tasks, and
+        // resolving a profile is one — so a keyring dialog nobody is looking at
+        // would hold the process up after the client has already gone.
+        runtime.shutdown_background();
+        return served;
+    }
+
     let response = runtime.block_on(async {
         // Attached first, because reusing a session is the whole reason the
         // socket exists: its connections, its tunnels and its already-answered
@@ -417,6 +453,54 @@ pub(crate) fn run(
     print(&response)
 }
 
+/// Speak MCP on stdin and stdout until the client goes away.
+///
+/// Attached when a session answers, and a store of its own otherwise. Unlike a
+/// one-shot command, a local store here *does* outlive the requests made
+/// against it — the process stays up — so opening connections and starting
+/// queries in one is not the no-op it would be for `sqlake query run`.
+async fn serve_mcp(
+    drivers: Drivers,
+    profiles: Arc<dyn Profiles>,
+    settings: &Settings,
+    connect: Option<ProfileId>,
+    session: Option<PathBuf>,
+) -> Result<std::process::ExitCode> {
+    let backend = sqlake_api::Backend::attach_or_start(session.as_deref(), || {
+        Service::new(Store::spawn(
+            drivers,
+            profiles,
+            settings.page_size,
+            settings.max_bytes_billed,
+        ))
+        .with_max_bytes(settings.agent_max_bytes_billed)
+    })
+    .await
+    .context("reaching a session")?;
+
+    // A local store has nothing open, and every tool but `connection_open`
+    // needs a connection. Opened here rather than left to the client, so an
+    // agent's first turn is a question about the database rather than about
+    // this process.
+    if let Some(service) = backend.local() {
+        // Nothing here is fatal, including "no profiles are configured": the
+        // client can still call `connection_open`, and a server that refused to
+        // start would leave an agent with no way to find that out. Said on
+        // stderr, because stdout belongs to the protocol.
+        match open(service.store(), connect.clone()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => eprintln!("no connection opened: {}", diagnostic(&failure)),
+            Err(why) => eprintln!("no connection opened: {why:#}"),
+        }
+    }
+
+    sqlake_mcp::Server::new(backend, connect.map(|id| id.as_str().to_owned()))
+        .serve_stdio()
+        .await
+        .map_err(|why| anyhow::anyhow!("the MCP server stopped: {why}"))?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
 /// Ask a session that is already running.
 ///
 /// The connection is chosen here rather than named by the caller: a person
@@ -436,9 +520,16 @@ async fn attached(
             // failure rather than this caller's to explain away.
             other => return Ok(Response::Failed(unexpected(&other))),
         };
-        match choose(&open, connect, command.is_destructive()) {
+        match sqlake_api::choose(
+            &open,
+            connect.map(ProfileId::as_str),
+            command.is_destructive(),
+        ) {
             Ok(id) => id,
-            Err(failure) => return Ok(Response::Failed(failure)),
+            // The protocol's message says which connections there are and not
+            // how to choose between them, because it is read over a socket by
+            // clients that have no flags. This layer has one.
+            Err(failure) => return Ok(Response::Failed(with_the_flag(failure))),
         }
     } else {
         String::new()
@@ -449,58 +540,20 @@ async fn attached(
         .context("asking the session")
 }
 
-/// Which of the session's connections to act on.
+/// The same refusal, with the flag that answers it.
 ///
-/// Split from the asking so the decision is testable without a socket: the
-/// asking is one request, and the choosing is the part with rules.
-///
-/// `must_be_unambiguous` is what closing sets. Every other command reads, and
-/// a read through the wrong connection is a wrong answer somebody can ask
-/// again; a close through the wrong one is somebody else's connection gone.
-fn choose(
-    open: &[ConnectionInfo],
-    connect: Option<&ProfileId>,
-    must_be_unambiguous: bool,
-) -> Result<String, Failure> {
-    // Everything when nothing was named: a session with two connections open
-    // is ordinary, and narrowing that is what `--connect` is for.
-    let asked_for = |c: &&ConnectionInfo| connect.is_none_or(|p| c.profile == p.as_str());
-    // A ready one ahead of the rest, because a session whose first connection
-    // failed to open still has a working second: taking one by position alone
-    // would answer with that failure instead of with the database.
-    // For anything destructive, an arbitrary pick is not a wrong answer that
-    // can be asked again — it is the wrong connection, closed. So closing
-    // refuses to guess where a read is content to.
-    if must_be_unambiguous && open.iter().filter(asked_for).count() > 1 {
-        let names: Vec<&str> = open
-            .iter()
-            .filter(asked_for)
-            .map(|c| c.profile.as_str())
-            .collect();
-        return Err(Failure::Unsupported {
-            message: format!(
-                "more than one connection matches ({}) — name one with `--connect`",
-                names.join(", ")
-            ),
-        });
+/// Recognised by [`sqlake_api::AMBIGUOUS`] rather than by a phrase written here
+/// as well, so a reworded refusal is a compile-time concern rather than a hint
+/// that quietly stops appearing.
+fn with_the_flag(failure: Failure) -> Failure {
+    match failure {
+        Failure::Unsupported { message } if message.contains(sqlake_api::AMBIGUOUS) => {
+            Failure::Unsupported {
+                message: format!("{message}: `--connect <profile>`"),
+            }
+        }
+        other => other,
     }
-    let chosen = open
-        .iter()
-        .find(|c| asked_for(c) && c.status == Status::Ready)
-        .or_else(|| open.iter().find(asked_for));
-    chosen.map(|c| c.id.clone()).ok_or_else(|| match connect {
-        // The id a caller could have meant is the profile it named, so that is
-        // what the failure carries. Which connections *are* open is one
-        // `connection list` away and does not belong in this answer.
-        Some(profile) => Failure::NoSuchConnection {
-            connection: profile.as_str().to_owned(),
-        },
-        // Not "no such connection": the session is reachable and has none, so
-        // there was never an id to get wrong.
-        None => Failure::Unsupported {
-            message: "the session has no connections open".to_owned(),
-        },
-    })
 }
 
 fn unexpected(response: &Response) -> Failure {
@@ -668,7 +721,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::*;
-    use sqlake_api::QueryInfo;
+    use sqlake_api::{ConnectionInfo, QueryInfo};
 
     /// Parses the way the real binary does, so the subcommand tree is checked
     /// rather than described.
@@ -685,32 +738,33 @@ mod tests {
     }
 
     #[test]
-    fn closing_refuses_to_guess_which_connection() {
-        // A read through the wrong connection is a wrong answer somebody can
-        // ask again. A close through the wrong one is somebody else's
-        // connection gone, so this is the one place the pick has to be
-        // unambiguous.
-        let two = open(&["mock", "prod"]);
-        assert!(choose(&two, None, false).is_ok(), "a read still picks one");
-
-        let refused = choose(&two, None, true).expect_err("closing should refuse");
-        let Failure::Unsupported { message } = refused else {
-            panic!("{refused:?}");
+    fn a_refusal_to_guess_names_the_flag_that_answers_it() {
+        // The protocol's message says which connections there are and not how
+        // to pick between them, because an MCP client has no flags. A person at
+        // a terminal does, and this is the layer that knows it.
+        let two = [connection("mock", 0), connection("prod", 1)];
+        let refused = sqlake_api::choose(&two, None, true).expect_err("closing should refuse");
+        let Failure::Unsupported { message } = with_the_flag(refused) else {
+            panic!("the refusal should survive being annotated");
         };
         assert!(message.contains("--connect"), "{message}");
-        assert!(
-            message.contains("mock") && message.contains("prod"),
-            "{message}"
-        );
+
+        // And nothing else is annotated: only the one refusal a flag answers.
+        let other = Failure::Unsupported {
+            message: "this driver cannot cancel".to_owned(),
+        };
+        assert_eq!(with_the_flag(other.clone()), other);
     }
 
-    #[test]
-    fn closing_picks_the_one_that_was_named() {
-        let two = open(&["mock", "prod"]);
-        let prod = ProfileId::parse("prod").expect("a usable id");
-        assert_eq!(choose(&two, Some(&prod), true), Ok("id-1".into()));
-        // And one connection is never ambiguous.
-        assert!(choose(&open(&["mock"]), None, true).is_ok());
+    fn connection(profile: &str, index: usize) -> ConnectionInfo {
+        ConnectionInfo {
+            id: format!("id-{index}"),
+            profile: profile.to_owned(),
+            name: profile.to_owned(),
+            driver: "mock".into(),
+            status: Status::Ready,
+            capabilities: None,
+        }
     }
 
     #[test]
@@ -976,69 +1030,6 @@ mod tests {
         for (command, expected) in commands {
             assert_eq!(command.request("c".into()), expected);
         }
-    }
-
-    fn open(profiles: &[&str]) -> Vec<ConnectionInfo> {
-        profiles
-            .iter()
-            .enumerate()
-            .map(|(i, profile)| ConnectionInfo {
-                id: format!("id-{i}"),
-                profile: (*profile).to_owned(),
-                name: (*profile).to_owned(),
-                driver: "mock".into(),
-                status: sqlake_api::Status::Ready,
-                capabilities: None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_session_with_one_connection_needs_no_choosing() {
-        assert_eq!(choose(&open(&["mock"]), None, false), Ok("id-0".into()));
-    }
-
-    #[test]
-    fn connect_picks_among_a_sessions_connections() {
-        // The point of `--connect` when attached: two databases open is
-        // ordinary, and the first is not always the one meant.
-        let open = open(&["staging", "prod"]);
-        let prod = ProfileId::parse("prod").expect("a usable id");
-        assert_eq!(choose(&open, Some(&prod), false), Ok("id-1".into()));
-    }
-
-    #[test]
-    fn a_profile_the_session_has_not_opened_is_named_in_the_failure() {
-        let open = open(&["staging"]);
-        let prod = ProfileId::parse("prod").expect("a usable id");
-        assert_eq!(
-            choose(&open, Some(&prod), false),
-            Err(Failure::NoSuchConnection {
-                connection: "prod".into()
-            })
-        );
-    }
-
-    #[test]
-    fn a_connection_that_failed_to_open_is_not_the_one_to_read_through() {
-        // A session opened with two profiles where the first could not
-        // connect: reading through it would answer with that failure, and the
-        // database next to it is right there.
-        let mut open = open(&["staging", "prod"]);
-        open[0].status = Status::Failed {
-            reason: "no route to host".into(),
-        };
-        assert_eq!(choose(&open, None, false), Ok("id-1".into()));
-    }
-
-    #[test]
-    fn a_session_with_nothing_open_is_not_a_wrong_id() {
-        // `NoSuchConnection` would send the caller looking for a typo in an id
-        // it never gave.
-        assert!(matches!(
-            choose(&open(&[]), None, false),
-            Err(Failure::Unsupported { .. })
-        ));
     }
 
     #[test]

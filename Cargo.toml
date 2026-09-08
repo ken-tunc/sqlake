@@ -19,6 +19,7 @@ sqlake-core = { path = "crates/sqlake-core" }
 sqlake-driver-bigquery = { path = "crates/sqlake-driver-bigquery" }
 sqlake-driver-mock = { path = "crates/sqlake-driver-mock" }
 sqlake-driver-postgres = { path = "crates/sqlake-driver-postgres" }
+sqlake-mcp = { path = "crates/sqlake-mcp" }
 sqlake-tui = { path = "crates/sqlake-tui" }
 
 anyhow = "1"
