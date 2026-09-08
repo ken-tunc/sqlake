@@ -13,12 +13,14 @@ use async_trait::async_trait;
 use crate::error::AppResult;
 
 pub mod connect;
+pub mod describe_table;
 pub mod estimate_query;
 pub mod expand_node;
 pub mod preview_table;
 pub mod run_query;
 
 pub use connect::{Connect, ConnectInput, ConnectOutput};
+pub use describe_table::{DescribeTable, DescribeTableInput};
 pub use estimate_query::{EstimateQuery, EstimateQueryInput};
 pub use expand_node::{ExpandNode, ExpandNodeInput, ExpandNodeOutput};
 pub use preview_table::{PreviewTable, PreviewTableInput, PreviewTableOutput};

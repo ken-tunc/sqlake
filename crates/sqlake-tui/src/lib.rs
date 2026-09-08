@@ -14,6 +14,7 @@
 pub mod chrome;
 pub mod copy;
 pub mod datagrid;
+pub mod definition;
 pub mod detail;
 pub mod editor;
 pub mod grid;

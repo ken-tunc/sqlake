@@ -25,7 +25,7 @@ use sqlake_app::PagedResult;
 
 use crate::detail::RenderedDetail;
 use sqlake_app::action::Action;
-use sqlake_app::snapshot::{ConnStatus, ConnectionView, LoadState, Snapshot};
+use sqlake_app::snapshot::{ConnStatus, ConnectionView, Definition, LoadState, Snapshot};
 #[cfg(test)]
 use sqlake_app::tree::TreeView;
 use sqlake_app::tree::VisibleNode;
@@ -61,6 +61,18 @@ pub enum TabContent {
         text: String,
         query: Option<QueryId>,
     },
+    /// What a relation is, rather than what is in it.
+    ///
+    /// Its own kind rather than a mode on `Preview`: a relation can have both
+    /// open at once, and they are different questions about it — which is also
+    /// why the tab bar has to be able to tell them apart by name.
+    Definition {
+        table: TableRef,
+        /// Which of the definition's sections is drawn, by position in its own
+        /// list. Kept per tab, because two definitions open at once are two
+        /// people's places in two lists.
+        section: usize,
+    },
 }
 
 /// A tab this screen has open on one connection.
@@ -88,7 +100,20 @@ impl OpenTab {
     pub const fn table(&self) -> Option<&TableRef> {
         match &self.content {
             TabContent::Preview(table) => Some(table),
-            TabContent::Sql { .. } => None,
+            // Deliberately not the definition's. Everything that reads this
+            // wants the relation a *preview* is of — sorting it, paging it,
+            // forgetting the store's copy of it — and a definition shares none
+            // of that: it is fetched once, never paged and never sorted.
+            TabContent::Sql { .. } | TabContent::Definition { .. } => None,
+        }
+    }
+
+    /// The relation this tab is a definition of.
+    #[must_use]
+    pub const fn defines(&self) -> Option<&TableRef> {
+        match &self.content {
+            TabContent::Definition { table, .. } => Some(table),
+            TabContent::Preview(_) | TabContent::Sql { .. } => None,
         }
     }
 
@@ -105,6 +130,9 @@ impl TabContent {
         match self {
             Self::Preview(table) => Cow::Borrowed(table.name()),
             Self::Sql { number, .. } => Cow::Owned(format!("SQL#{number}")),
+            // Named apart from the preview of the same relation, because two
+            // tabs reading `users` would otherwise be two tabs called `users`.
+            Self::Definition { table, .. } => Cow::Owned(format!("{}: def", table.name())),
         }
     }
 }
@@ -669,6 +697,48 @@ impl UiState {
         }
     }
 
+    /// Move or set which section of the open definition is drawn.
+    ///
+    /// Clamped to what the definition actually has, and to nothing at all
+    /// while it is still loading: a section index that outran the list would
+    /// draw an empty grid under a title that is not there.
+    fn select_section(&mut self, pick: crate::intent::SectionPick, snapshot: &Snapshot) {
+        let Some(id) = self.active_tab else { return };
+        let last = self
+            .definition(snapshot)
+            .map_or(0, |d| d.titles().len().saturating_sub(1));
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        let TabContent::Definition { section, .. } = &mut tab.content else {
+            return;
+        };
+        *section = match pick {
+            crate::intent::SectionPick::At(at) => at.min(last),
+            crate::intent::SectionPick::By(delta) => step(*section, delta).min(last),
+        };
+        // The new section is a different grid, so the cursor and the scroll
+        // that belonged to the old one do not mean anything in it.
+        self.grids.remove(&id);
+    }
+
+    /// The definition the active tab is showing, once it has arrived.
+    #[must_use]
+    pub fn definition<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Arc<Definition>> {
+        let id = self.active_tab?;
+        let tab = self.tabs.iter().find(|t| t.id == id)?;
+        snapshot.definition(tab.conn, tab.defines()?)?.data.ready()
+    }
+
+    /// Which section the active definition tab is on.
+    #[must_use]
+    pub fn section_of(&self, tab: TabId) -> Option<usize> {
+        match &self.tabs.iter().find(|t| t.id == tab)?.content {
+            TabContent::Definition { section, .. } => Some(*section),
+            TabContent::Preview(_) | TabContent::Sql { .. } => None,
+        }
+    }
+
     /// Mint a tab and focus it.
     fn open(&mut self, conn: ConnId, content: TabContent) {
         self.next_tab += 1;
@@ -682,7 +752,7 @@ impl UiState {
     pub fn buffer_of(&self, tab: TabId) -> Option<&str> {
         match &self.tabs.iter().find(|t| t.id == tab)?.content {
             TabContent::Sql { text, .. } => Some(text),
-            TabContent::Preview(_) => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } => None,
         }
     }
 
@@ -691,7 +761,7 @@ impl UiState {
     pub fn query_of(&self, tab: TabId) -> Option<QueryId> {
         match &self.tabs.iter().find(|t| t.id == tab)?.content {
             TabContent::Sql { query, .. } => *query,
-            TabContent::Preview(_) => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } => None,
         }
     }
 
@@ -896,6 +966,21 @@ impl UiState {
                     self.open(conn, TabContent::Preview(table));
                 }
             }
+            // Raised rather than duplicated, the same way a preview is: one
+            // definition of one relation is all there is to look at.
+            ViewCmd::OpenDefinition { conn, table } => {
+                if let Some(existing) = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.conn == conn && t.defines() == Some(&table))
+                {
+                    self.active_tab = Some(existing.id);
+                } else {
+                    self.open(conn, TabContent::Definition { table, section: 0 });
+                }
+            }
+            ViewCmd::SelectSection(pick) => self.select_section(pick, snapshot),
+
             // Never raised onto an existing one, unlike a preview: two SQL
             // tabs on one connection are two different questions, and there is
             // nothing to match them on anyway.
@@ -1259,6 +1344,13 @@ impl UiState {
             // before there has been one, which is what makes the pane show the
             // buffer instead.
             TabContent::Sql { query, .. } => snapshot.query((*query)?)?.data.ready(),
+            // The section this tab is looking at, which is a different grid
+            // per tab even for the same relation.
+            TabContent::Definition { table, section } => snapshot
+                .definition(open.conn, table)?
+                .data
+                .ready()?
+                .rows(*section),
         }
     }
 
@@ -1395,6 +1487,7 @@ mod tests {
                 tree: std::sync::Arc::default(),
             }],
             explorer,
+            definitions: Vec::new(),
             previews: vec![PreviewView {
                 exhausted: false,
                 attempts: 0,

@@ -28,13 +28,15 @@ use crate::error::{AppError, AppResult};
 use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
-    BusyItem, BusyOwner, ConnStatus, ConnectionView, LoadState, PreviewView, QueryView, Snapshot,
+    BusyItem, BusyOwner, ConnStatus, ConnectionView, Definition, DefinitionView, LoadState,
+    PreviewView, QueryView, Snapshot,
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
-    Connect, ConnectInput, ConnectOutput, EstimateQuery, EstimateQueryInput, ExpandNode,
-    ExpandNodeInput, ExpandNodeOutput, PreviewTable, PreviewTableInput, PreviewTableOutput,
-    RunApproved, RunQuery, RunQueryInput, RunQueryOutput, UseCase,
+    Connect, ConnectInput, ConnectOutput, DescribeTable, DescribeTableInput, EstimateQuery,
+    EstimateQueryInput, ExpandNode, ExpandNodeInput, ExpandNodeOutput, PreviewTable,
+    PreviewTableInput, PreviewTableOutput, RunApproved, RunQuery, RunQueryInput, RunQueryOutput,
+    UseCase,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -123,6 +125,7 @@ impl Store {
             events: event_tx,
             conns: Vec::new(),
             previews: Vec::new(),
+            definitions: Vec::new(),
             queries: Vec::new(),
             busy: Vec::new(),
             tasks: HashMap::new(),
@@ -198,6 +201,12 @@ enum Event {
         query: QueryId,
         busy: BusyId,
         result: AppResult<Estimate>,
+    },
+    Described {
+        conn: ConnId,
+        table: TableRef,
+        busy: BusyId,
+        result: AppResult<sqlake_core::detail::TableDetail>,
     },
     Previewed {
         conn: ConnId,
@@ -327,6 +336,10 @@ struct Runtime {
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     previews: Vec<Preview>,
+    /// Fetched once each and kept, which is why `disconnect` drops them: a
+    /// definition is exactly the thing somebody changes in another window, and
+    /// nothing about it is re-fetched by scrolling the way a preview is.
+    definitions: Vec<DefinitionView>,
     /// Every run this session has started, in order.
     ///
     /// Kept rather than replaced: a front-end may have several SQL tabs, and
@@ -433,6 +446,12 @@ impl Runtime {
             Action::ToggleNode { conn, node } => self.open_node(conn, node, Open::Toggle),
             Action::ExpandNode { conn, node } => self.open_node(conn, node, Open::ExpandOnly),
             Action::PreviewTable { conn, table } => self.preview_table(conn, table),
+            Action::DescribeTable {
+                conn,
+                table,
+                refresh,
+            } => self.describe_table(conn, table, refresh),
+            Action::ForgetDefinition { conn, table } => self.forget_definition(conn, &table),
             Action::SortPreview {
                 conn,
                 table,
@@ -554,7 +573,7 @@ impl Runtime {
             .iter()
             .filter(|b| match &b.owner {
                 BusyOwner::Connection(c) | BusyOwner::Node { conn: c, .. } => *c == id,
-                BusyOwner::Preview { conn, .. } => *conn == id,
+                BusyOwner::Preview { conn, .. } | BusyOwner::Definition { conn, .. } => *conn == id,
                 BusyOwner::Query(query) => {
                     self.queries.iter().any(|q| q.id == *query && q.conn == id)
                 }
@@ -573,8 +592,11 @@ impl Runtime {
         }
 
         // Previews belong to a connection; leaving them behind would show
-        // stale rows with no way to refresh them.
+        // stale rows with no way to refresh them. A definition is worse:
+        // nothing about it is ever re-fetched by scrolling, so one left behind
+        // shows a dropped column until the process restarts.
         self.previews.retain(|p| p.conn != id);
+        self.definitions.retain(|d| d.conn != id);
         // A query's rows do not: they are an answer that was given, and the
         // connection closing does not make it untrue. What it does make
         // impossible is running it again, which is a fact about the connection
@@ -693,6 +715,110 @@ impl Runtime {
             attempts: 0,
         });
         self.fetch_page(conn_id, table, page, false);
+    }
+
+    /// Fetch a definition, or leave the one already there alone.
+    ///
+    /// Cached hard: unlike a preview, nothing about a definition is re-fetched
+    /// by using it, so asking again has to be asked for. `refresh` is that,
+    /// and a failed one always retries — a definition stuck on a message is
+    /// not an answer to keep.
+    fn describe_table(&mut self, conn_id: ConnId, table: TableRef, refresh: bool) {
+        let Some(session) = self.session(conn_id) else {
+            return;
+        };
+        if table.path.is_empty() {
+            tracing::warn!("describe: a relation with no name");
+            return;
+        }
+
+        let existing = self
+            .definitions
+            .iter()
+            .position(|d| d.conn == conn_id && d.table == table);
+        if let Some(at) = existing {
+            let held = &self.definitions[at];
+            if !refresh && held.data.error().is_none() {
+                return;
+            }
+            self.definitions[at].data = LoadState::Loading;
+        } else {
+            self.definitions.push(DefinitionView {
+                conn: conn_id,
+                table: table.clone(),
+                data: LoadState::Loading,
+            });
+        }
+
+        // A refresh supersedes whatever was in flight. Without this the older
+        // reply can land last and overwrite the newer one — the definition
+        // that was asked for again is the one that is thrown away — and its
+        // busy row sits on screen for an answer nothing wants.
+        let owner = BusyOwner::Definition {
+            conn: conn_id,
+            table: table.clone(),
+        };
+        let superseded: Vec<BusyId> = self
+            .busy
+            .iter()
+            .filter(|b| b.owner == owner)
+            .map(|b| b.id)
+            .collect();
+        for busy in superseded {
+            self.drop_task(busy);
+        }
+
+        let busy = self.begin_busy(owner, format!("describing {table}"));
+        let events = self.events.clone();
+        let for_event = table.clone();
+        self.spawn_task(busy, async move {
+            let result = DescribeTable { session }
+                .execute(DescribeTableInput { table })
+                .await;
+            let _ = events.send(Event::Described {
+                conn: conn_id,
+                table: for_event,
+                busy,
+                result,
+            });
+        });
+    }
+
+    fn described(
+        &mut self,
+        conn_id: ConnId,
+        table: &TableRef,
+        result: AppResult<sqlake_core::detail::TableDetail>,
+    ) {
+        let Some(definition) = self
+            .definitions
+            .iter_mut()
+            .find(|d| d.conn == conn_id && &d.table == table)
+        else {
+            return;
+        };
+        definition.data = match result {
+            Ok(detail) => LoadState::Ready(Arc::new(Definition::of(&detail))),
+            Err(err) => LoadState::Failed(err.user_message()),
+        };
+    }
+
+    fn forget_definition(&mut self, conn_id: ConnId, table: &TableRef) {
+        let owner = BusyOwner::Definition {
+            conn: conn_id,
+            table: table.clone(),
+        };
+        let running: Vec<BusyId> = self
+            .busy
+            .iter()
+            .filter(|b| b.owner == owner)
+            .map(|b| b.id)
+            .collect();
+        for busy in running {
+            self.drop_task(busy);
+        }
+        self.definitions
+            .retain(|d| !(d.conn == conn_id && &d.table == table));
     }
 
     fn sort_preview(&mut self, conn_id: ConnId, table: TableRef, column: usize) {
@@ -1100,6 +1226,15 @@ impl Runtime {
                     query.data = LoadState::Failed(reason.to_owned());
                 }
             }
+            BusyOwner::Definition { conn, table } => {
+                if let Some(definition) = self
+                    .definitions
+                    .iter_mut()
+                    .find(|d| d.conn == *conn && &d.table == table)
+                {
+                    definition.data = LoadState::Failed(reason.to_owned());
+                }
+            }
             BusyOwner::Preview { conn, table } => {
                 if let Some(preview) = self.preview_mut(*conn, table) {
                     preview.pending = None;
@@ -1149,6 +1284,15 @@ impl Runtime {
             } => {
                 self.end_busy(busy);
                 self.estimated(query, result);
+            }
+            Event::Described {
+                conn,
+                table,
+                busy,
+                result,
+            } => {
+                self.end_busy(busy);
+                self.described(conn, &table, result);
             }
             Event::Previewed {
                 conn,
@@ -1388,6 +1532,7 @@ impl Runtime {
                 .collect(),
             // Cloned wholesale: a `QueryView` is already the shape a front-end
             // wants, and the rows behind it are an `Arc`.
+            definitions: self.definitions.clone(),
             queries: self.queries.clone(),
             busy: self.busy.clone(),
             should_quit: self.should_quit,
@@ -1435,6 +1580,11 @@ mod tests {
             page_size,
             None,
         )
+    }
+
+    /// The relation every definition test asks about.
+    fn users() -> TableRef {
+        TableRef::new(["public", "users"])
     }
 
     fn pid(id: &str) -> ProfileId {
@@ -1663,6 +1813,148 @@ mod tests {
         )
         .await;
         assert!(snap.query(id).unwrap().data.ready().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_relation_is_described_once_and_kept() {
+        let (store, conn) = connected_store().await;
+        let table = users();
+        let describe = |refresh| Action::DescribeTable {
+            conn,
+            table: table.clone(),
+            refresh,
+        };
+        let snap = settled(&store, describe(false), {
+            let table = table.clone();
+            move |s| {
+                s.definition(conn, &table)
+                    .is_some_and(|d| d.data.ready().is_some())
+            }
+        })
+        .await;
+        let definition = snap.definition(conn, &table).unwrap();
+        assert!(definition.data.ready().is_some());
+        let applied = snap.applied;
+
+        // Asked again without `refresh`, nothing is fetched: a definition is
+        // not re-read by using it, so a second ask is answered from what is
+        // already there.
+        let snap = settled(&store, describe(false), move |s| s.applied > applied).await;
+        assert!(snap.busy.is_empty(), "it asked the server again");
+        assert_eq!(snap.definitions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshing_asks_again() {
+        // The only way out of a stale definition short of closing the
+        // connection, which is why it needs a gesture of its own.
+        //
+        // Slow on purpose: against an instant driver the busy row appears and
+        // is gone inside one snapshot, so "it asked" would be a race rather
+        // than an assertion.
+        let (store, conn) = connected(store(Behaviour {
+            latency: Duration::from_millis(300),
+            ..Behaviour::instant()
+        }))
+        .await;
+        let table = users();
+        let ready = {
+            let table = table.clone();
+            move |s: &Snapshot| {
+                s.definition(conn, &table)
+                    .is_some_and(|d| d.data.ready().is_some())
+            }
+        };
+        let _ = settled(
+            &store,
+            Action::DescribeTable {
+                conn,
+                table: table.clone(),
+                refresh: false,
+            },
+            ready.clone(),
+        )
+        .await;
+        let snap = settled(
+            &store,
+            Action::DescribeTable {
+                conn,
+                table: table.clone(),
+                refresh: true,
+            },
+            |s| !s.busy.is_empty(),
+        )
+        .await;
+        assert!(
+            snap.busy
+                .iter()
+                .any(|b| matches!(b.owner, BusyOwner::Definition { .. })),
+            "refreshing should have asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definition_that_failed_retries_without_being_asked_twice() {
+        // A definition stuck on a message is not an answer worth keeping, so
+        // reopening the tab is enough — unlike a successful one, which is.
+        let (store, conn) = connected(store(Behaviour {
+            failing_nodes: vec![vec!["public".to_owned(), "users".to_owned()]],
+            latency: Duration::from_millis(300),
+            ..Behaviour::instant()
+        }))
+        .await;
+        let table = users();
+        let describe = Action::DescribeTable {
+            conn,
+            table: table.clone(),
+            refresh: false,
+        };
+        let settled_once = {
+            let table = table.clone();
+            move |s: &Snapshot| {
+                s.definition(conn, &table)
+                    .is_some_and(|d| d.data.error().is_some())
+            }
+        };
+        let _ = settled(&store, describe.clone(), settled_once.clone()).await;
+        let snap = settled(&store, describe, |s| !s.busy.is_empty()).await;
+        assert!(
+            snap.busy
+                .iter()
+                .any(|b| matches!(b.owner, BusyOwner::Definition { .. })),
+            "a failed definition should be asked about again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_takes_its_definitions_with_it() {
+        // Worse than a stale preview: nothing about a definition is re-fetched
+        // by using it, so one left behind shows a dropped column until the
+        // process restarts.
+        let (store, conn) = connected_store().await;
+        let table = users();
+        let _ = settled(
+            &store,
+            Action::DescribeTable {
+                conn,
+                table: table.clone(),
+                refresh: false,
+            },
+            {
+                let table = table.clone();
+                move |s| {
+                    s.definition(conn, &table)
+                        .is_some_and(|d| d.data.ready().is_some())
+                }
+            },
+        )
+        .await;
+        let snap = settled(&store, Action::Disconnect(conn), move |s| {
+            s.connection(conn)
+                .is_some_and(|c| c.status == ConnStatus::Closed)
+        })
+        .await;
+        assert!(snap.definitions.is_empty());
     }
 
     #[tokio::test]

@@ -130,6 +130,11 @@ pub enum Target {
 
     Button(ButtonId),
 
+    /// One line of the definition pane's section list.
+    Section {
+        index: usize,
+    },
+
     /// A transient message. Clicking it dismisses it.
     Toast(ToastId),
 

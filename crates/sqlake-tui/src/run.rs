@@ -454,7 +454,7 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         .as_ref()
         .and_then(|(_, _, content)| match content {
             TabContent::Sql { query, .. } => snapshot.query((*query)?),
-            TabContent::Preview(_) => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } => None,
         })
         .is_some_and(|q| q.data.ready().is_some());
     if let Some((id, _, TabContent::Sql { text, .. })) = &active
@@ -487,6 +487,60 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         datagrid::render_rows(frame, hits, grid, &rows, ui.grid_mut(id), false, None);
         if frames.detail.height > 0 {
             detail = ui.grid_mut(id).detail();
+        }
+    }
+    if let Some((id, conn, TabContent::Definition { table, section })) = &active {
+        let (id, section) = (*id, *section);
+        match snapshot.definition(*conn, table).map(|d| &d.data) {
+            Some(sqlake_app::snapshot::LoadState::Ready(definition)) => {
+                // The list first, because what is left of the pane is what the
+                // grid gets — and working that out twice is how the two come
+                // to disagree.
+                // Clamped here as well as where it is picked: a refresh can
+                // come back with fewer sections than the tab was on, and an
+                // index past the end draws an empty pane with nothing in it
+                // saying why.
+                let section = section.min(definition.titles().len().saturating_sub(1));
+                let body = crate::definition::sections(frame, hits, grid, definition, section);
+                let summary = crate::definition::summary(definition);
+                let rows = definition.rows(section).map(Arc::clone);
+                let body = chrome::caption(frame, body, &summary);
+                ui.set_viewport(PaneId::Grid, datagrid::body_area(body));
+                if let Some(rows) = rows {
+                    // Not sortable: a definition is not paged, so there is no
+                    // second fetch for a header click to ask for.
+                    datagrid::render_rows(frame, hits, body, &rows, ui.grid_mut(id), false, None);
+                    if frames.detail.height > 0 {
+                        detail = ui.grid_mut(id).detail();
+                    }
+                }
+            }
+            Some(sqlake_app::snapshot::LoadState::Failed(why)) => {
+                ui.set_viewport(PaneId::Grid, grid);
+                datagrid::message(frame, grid, why, ratatui::style::Color::Red);
+            }
+            // Nothing held for it can mean two things, and only one of them is
+            // worth a spinner: the store has not seen the fetch yet, or the
+            // connection closed and took the definition with it. Saying
+            // "describing…" for the second is a wait that never ends, because
+            // nothing is going to answer.
+            state => {
+                ui.set_viewport(PaneId::Grid, grid);
+                let live = state.is_some()
+                    || snapshot
+                        .connection(*conn)
+                        .is_some_and(sqlake_app::snapshot::ConnectionView::is_live);
+                if live {
+                    datagrid::message(frame, grid, "describing…", ratatui::style::Color::Yellow);
+                } else {
+                    datagrid::message(
+                        frame,
+                        grid,
+                        "the connection is closed",
+                        ratatui::style::Color::DarkGray,
+                    );
+                }
+            }
         }
     }
     if let Some((id, conn, TabContent::Preview(table))) = active
@@ -611,6 +665,21 @@ mod tests {
 
     fn store() -> Store {
         store_of(Behaviour::instant())
+    }
+
+    /// The same, advertising a capability set of its own.
+    fn store_of_with(
+        behaviour: Behaviour,
+        capabilities: sqlake_core::capability::Capabilities,
+    ) -> Store {
+        Store::spawn(
+            Drivers::new().with(Arc::new(
+                MockDriver::new(behaviour).with_capabilities(capabilities),
+            )),
+            Arc::new(MockProfiles::default()),
+            PageRequest::DEFAULT_LIMIT,
+            None,
+        )
     }
 
     fn store_of(behaviour: Behaviour) -> Store {
@@ -1683,6 +1752,149 @@ mod tests {
         );
 
         insta::assert_snapshot!(screen(&snap, &mut ui, 100, 20));
+    }
+
+    #[tokio::test]
+    async fn screen_with_a_definition_open() {
+        // The whole of T4 on screen: a section list, one section in the grid
+        // the preview uses, and a summary line saying what the relation is.
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenDefinition {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+        store.dispatch(Action::DescribeTable {
+            conn,
+            table: table.clone(),
+            refresh: false,
+        });
+        until(&mut rx, |s| {
+            s.definition(conn, &table)
+                .is_some_and(|d| d.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+
+        insta::assert_snapshot!(screen(&snap, &mut ui, 100, 20));
+    }
+
+    #[tokio::test]
+    async fn a_definition_whose_connection_closed_stops_saying_it_is_loading() {
+        // Disconnecting drops the store's definitions, so the tab is left
+        // holding nothing — which is not the same as waiting for something.
+        let (store, _) = connected().await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenDefinition {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+        store.dispatch(Action::DescribeTable {
+            conn,
+            table: table.clone(),
+            refresh: false,
+        });
+        until(&mut rx, |s| {
+            s.definition(conn, &table)
+                .is_some_and(|d| d.data.ready().is_some())
+        })
+        .await;
+
+        store.dispatch(Action::Disconnect(conn));
+        until(&mut rx, |s| s.definitions.is_empty()).await;
+        let snap = rx.borrow_and_update().clone();
+
+        let screen = screen(&snap, &mut ui, 100, 20);
+        assert!(!screen.contains("describing"), "{screen}");
+        assert!(screen.contains("the connection is closed"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn a_definition_shows_the_section_that_was_picked() {
+        // A driver that has indexes, so the list has more than one line: the
+        // mock's default capability set claims none, and a section list of one
+        // cannot show that picking moves.
+        let (store, _) = connected_to(store_of_with(
+            Behaviour::instant(),
+            sqlake_core::capability::Capabilities {
+                indexes: true,
+                ..sqlake_driver_mock::CAPABILITIES
+            },
+        ))
+        .await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+        let table = TableRef::new(["public", "users"]);
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let _ = ui.apply(
+            crate::intent::ViewCmd::OpenDefinition {
+                conn,
+                table: table.clone(),
+            },
+            &snap,
+        );
+        store.dispatch(Action::DescribeTable {
+            conn,
+            table: table.clone(),
+            refresh: false,
+        });
+        until(&mut rx, |s| {
+            s.definition(conn, &table)
+                .is_some_and(|d| d.data.ready().is_some())
+        })
+        .await;
+        let snap = rx.borrow_and_update().clone();
+        let tab = ui.active_tab.expect("a tab");
+
+        // Columns lead, because that is what somebody opened the pane for.
+        assert_eq!(ui.section_of(tab), Some(0));
+        let rows_now = |ui: &UiState| {
+            let definition = ui.definition(&snap).expect("it arrived");
+            definition
+                .rows(ui.section_of(tab).expect("a definition tab"))
+                .map(|r| r.row_count())
+        };
+        let columns = rows_now(&ui);
+
+        let _ = ui.apply(
+            crate::intent::ViewCmd::SelectSection(crate::intent::SectionPick::By(1)),
+            &snap,
+        );
+        assert_eq!(ui.section_of(tab), Some(1));
+        assert_ne!(
+            rows_now(&ui),
+            columns,
+            "a different section, a different grid"
+        );
+
+        // Clamped rather than wrapped: a list you can see all of does not jump
+        // back to the top when you step off the end.
+        for _ in 0..10 {
+            let _ = ui.apply(
+                crate::intent::ViewCmd::SelectSection(crate::intent::SectionPick::By(1)),
+                &snap,
+            );
+        }
+        let last = ui.definition(&snap).expect("it arrived").titles().len() - 1;
+        assert_eq!(ui.section_of(tab), Some(last));
     }
 
     #[tokio::test]
