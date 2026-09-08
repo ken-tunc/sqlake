@@ -36,7 +36,7 @@ than reuse — which is what the peer relationship in architecture §2 is protec
 Modelled on herdr: a long-lived process holding session state, a socket API against it, and
 thin noun-verb subcommands over that API.
 
-Built, as of A2:
+Built, as of A3:
 
 ```
 sqlake                          launch the TUI (unchanged)

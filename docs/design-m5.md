@@ -14,8 +14,8 @@ driver's answers come from, what to do about DDL, and what the pane looks like.
 
 | | |
 | --- | --- |
-| 1 | A relation's columns, with types, nullability, defaults and comments |
-| 2 | Indexes, triggers, constraints and partitioning — each in the same grid the preview uses |
+| 1 | A relation's columns, with types, nullability and defaults — and comments where the driver has them (§5, Q1) |
+| 2 | Indexes, triggers, constraints, partitioning and clustering — each in the same grid the preview uses |
 | 3 | A driver fills in only what it has, and the pane shows only what was filled |
 | 4 | DDL for both drivers, and never a claim it is what somebody typed |
 | 5 | `sqlake table describe` and an MCP tool for it, from the same `TableDetail` |
@@ -34,11 +34,16 @@ surface and as an MCP tool.
 **Out**, with the milestone that picks it up: editing anything (there is no milestone for it —
 sqlake reads); `pg_dump`-grade DDL (§3, D4); history (M8).
 
-Not in scope because it is already built: the grid renders a `ResultSet` and does not care
-where it came from — `datagrid::render_rows` was split out in M4 for exactly this; the tab bar
-holds more than one kind of tab; `Capabilities` already has `indexes`, `triggers`,
-`constraints` and `partitioning`, which have been claims nothing checked since M0 and become
-promises here.
+Not in scope because it is already built: the grid draws rows and does not care where they came
+from — `datagrid::render_rows` was split out in M4 for exactly this; the tab bar holds more
+than one kind of tab; `Capabilities` already has `indexes`, `triggers`, `constraints` and
+`partitioning`, which have been claims nothing checked since M0 and become promises here.
+
+Two edges of "already built" that are not: `render_rows` takes an `Arc<PagedResult>`, not the
+`ResultSet` a `DetailSection` carries, so T4 wraps each section with `PagedResult::new` in
+`sqlake-app` — the grid keeps its one input type rather than growing a second. And
+`Capabilities` has no `clustering` flag; T3 adds one, because BigQuery's clustering section is
+the one D2 would otherwise be unable to name in advance.
 
 ---
 
@@ -50,16 +55,24 @@ not the same list under different names, and a fixed set of section titles in th
 make BigQuery answer an empty "Triggers" table rather than not having one.
 
 **D2 — `Capabilities` says which sections to expect, and the answer says which arrived.** Both,
-because they answer different questions: the capability is what lets the tab draw its section
-list before the driver has answered, and the answer is what stops it drawing a tab for a
-section the relation happens not to have. A view has no partitioning on a driver that
+because they answer different questions: the capability is what lets the tab say how many
+sections it is waiting on rather than nothing, and the answer is what stops it drawing a tab
+for a section the relation happens not to have. A view has no partitioning on a driver that
 partitions.
 
-**D3 — nullability and defaults come from the catalogue, not from a page.** `preview` builds its
-columns from a statement's result and says so: it marks everything nullable because the wire
-does not carry the answer. `describe` is the call that knows, and it is the only one that
-should be believed — which is why `ColumnDef` is its own type rather than `Column` with more
-fields on it.
+The flags are booleans, not titles, so this does not reintroduce the fixed set D1 rejects: the
+placeholder rows the capability draws are unnamed, and every title on screen came from the
+driver's answer. A capability with no section behind it disappears when the answer lands; a
+section with no capability in front of it still draws.
+
+**D3 — nullability and defaults come from the catalogue, not from a page.** PostgreSQL's
+`preview` builds its columns from a prepared statement and marks everything nullable, because
+the wire protocol does not carry the answer; BigQuery's comes from `tables.get` and is already
+right. `describe` is the call that knows on both, so it is the one the definition is drawn
+from — which is why `ColumnDef` is its own type rather than `Column` with more fields on it.
+Where a driver's page already knows, `describe` must agree with it: the BigQuery preview test
+asserts that `REQUIRED` is reported as `NOT NULL`, and a `describe` that came back with
+anything else would be a contradiction inside one driver.
 
 **D4 — DDL is generated, and labelled as generated.** BigQuery has real DDL in
 `INFORMATION_SCHEMA.TABLES.ddl` and PostgreSQL has nothing: `pg_dump` is a subprocess this
@@ -83,6 +96,13 @@ snapshot beside `PreviewView`, keyed by `(ConnId, TableRef)`, because opening th
 should not ask the server twice — and because the agent surface asking for it must not fetch a
 second copy while a person has it open.
 
+Cached is not permanent. A definition is exactly the thing somebody changes in another window,
+and a cache with no way out of it shows a dropped column until the process restarts. A preview
+gets out of it by accident — every page request goes to the server — and a definition is
+fetched once, so it needs the way out written down: the entry goes when the connection does,
+and re-describing the same relation asks again rather than answering from the snapshot. That
+is a new `Action` and a new binding, which is T4's, not something the cache gives for free.
+
 ---
 
 ## 4. Tasks
@@ -94,12 +114,18 @@ Each is one PR, reviewed before the next starts.
 | T1 | `TableDetail`, `Session::describe`, the mock's answer, the conformance case | The suite holds every driver to describing the relation it previews, and to `Capabilities` |
 | T2 | PostgreSQL: columns, indexes, triggers, constraints, partitioning | Each section matches `psql \d` against the conformance container |
 | T3 | BigQuery: columns, partitioning, clustering, and its own DDL | The fixture answers `tables.get` and `INFORMATION_SCHEMA`, and the driver fills only what it has |
-| T4 | The definition tab: section list, grid, and the tab bar | A definition tab opens from the explorer, closes like a preview, and the grid in it scrolls and copies |
+| T4 | The definition tab: section list, grid, and the tab bar | A definition tab opens from the explorer, closes like a preview, and the grid in it scrolls and copies. The section list is a new mouse target, so it is a new `KEYMAP` entry too — the coverage test in `input.rs` is what says so |
 | T5 | PostgreSQL's generated DDL, and the label on it | A table with a default, a check and two indexes comes back as SQL that recreates it, said to be generated |
 | T6 | `table_describe` on the socket and as an MCP tool | One `TableDetail`, wired through both surfaces from the same answer |
 
 T2 and T3 are independent of each other and both depend on T1. T4 depends on T1 and is worth
 more once T2 has something to draw. T6 depends only on T1.
+
+`Session` is a trait every driver implements, so T1 cannot add `describe` and leave the real
+drivers for later: a method with no default stops `sqlake-driver-postgres` and
+`sqlake-driver-bigquery` compiling, and a default that returns "unsupported" is a capability
+claim made by omission. T1 therefore gives each driver columns and no sections, which is what
+the conformance case can already hold it to; T2 and T3 fill the sections in.
 
 ---
 
@@ -111,9 +137,11 @@ Left open deliberately; the answers belong in the code that settles them.
    `pg_description`, which is another join; BigQuery has one per field for free. Cheap on one
    driver and not the other is the shape that usually ends in a capability flag, and a flag for
    something this small may cost more than it saves.
-2. **What `describe` does with a routine.** `RelationKind::Routine` exists and a function has no
-   columns, so either the sections carry its arguments and body or `describe` refuses it — and
-   refusing something the tree offers is a dead end a user finds by clicking.
+2. **What `describe` does with a routine.** `RelationKind::Routine` exists, but no driver
+   returns it today — only the tree's icon table has a branch for it — so nothing can be
+   clicked into the dead end yet. The question is therefore which comes first: listing routines
+   at all, or the `describe` that would have to answer for one with arguments and a body
+   instead of columns. Adding the listing without the answer is what creates the dead end.
 3. **Whether the DDL belongs in the section list or under the columns.** As a section it is one
    more thing to click for the answer people most often want; under the columns it is a second
    scrolling region in a pane that has one.
