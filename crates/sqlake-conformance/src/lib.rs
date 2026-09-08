@@ -83,6 +83,8 @@ pub async fn run(subject: &Subject) {
     a_row_cap_is_honoured(&*session, subject, kind).await;
     a_statement_the_server_refuses_is_an_error(&*session, subject, kind).await;
     a_connection_answers_again_after_a_query_is_abandoned(&*session, subject, kind).await;
+    a_relation_describes_itself(&*session, subject, capabilities, kind).await;
+    a_relation_that_is_not_there_cannot_be_described(&*session, subject, kind).await;
 
     session.close().await;
 }
@@ -261,6 +263,89 @@ async fn a_connection_answers_again_after_a_query_is_abandoned(
     session.execute(&again).await.unwrap_or_else(|err| {
         panic!("{kind}: the connection did not survive an abandoned query: {err}")
     });
+}
+
+/// A relation says what it is, and agrees with the page about its columns.
+///
+/// The agreement is the case worth having. Both calls answer about the same
+/// relation, and a driver whose definition disagreed with its own preview
+/// would make "is this column nullable" depend on which pane you opened.
+async fn a_relation_describes_itself(
+    session: &dyn Session,
+    subject: &Subject,
+    capabilities: Capabilities,
+    kind: &str,
+) {
+    let detail = session
+        .describe(&subject.relation)
+        .await
+        .unwrap_or_else(|err| panic!("{kind}: describing {}: {err}", subject.relation));
+
+    assert_eq!(
+        detail.table, subject.relation,
+        "{kind}: described another relation"
+    );
+    assert!(
+        !detail.columns.is_empty(),
+        "{kind}: a relation with rows in it has columns"
+    );
+
+    let page = session
+        .preview(&subject.relation, &PageRequest::first())
+        .await
+        .unwrap_or_else(|err| panic!("{kind}: previewing: {err}"));
+    let described: Vec<&str> = detail.columns.iter().map(|c| c.name.as_str()).collect();
+    let previewed: Vec<&str> = page.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        described, previewed,
+        "{kind}: the definition and the page disagree about the columns"
+    );
+
+    // A section is a claim `Capabilities` has to have made. The other
+    // direction is not checked: a capability with no section is a relation
+    // that has none of that thing, which is ordinary — a view has no
+    // partitioning on a driver that partitions.
+    for section in &detail.sections {
+        assert!(
+            !section.title.trim().is_empty(),
+            "{kind}: a section nobody can name"
+        );
+        let promised = match section.title.as_str() {
+            "Indexes" => capabilities.indexes,
+            "Triggers" => capabilities.triggers,
+            "Constraints" => capabilities.constraints,
+            "Partitioning" => capabilities.partitioning,
+            // A driver is free to answer something this suite has no flag
+            // for; what it may not do is answer one it said it had not got.
+            _ => true,
+        };
+        assert!(
+            promised,
+            "{kind}: answered a `{}` section it says it does not have",
+            section.title
+        );
+    }
+}
+
+/// Describing something that is not there is an error, not an empty table.
+///
+/// An empty definition is what a relation with no columns looks like, and a
+/// caller told that about a name it got wrong goes looking for the wrong
+/// thing.
+async fn a_relation_that_is_not_there_cannot_be_described(
+    session: &dyn Session,
+    subject: &Subject,
+    kind: &str,
+) {
+    let err = session
+        .describe(&subject.missing)
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("{kind}: described a relation that is not there"));
+    assert!(
+        !matches!(err, DriverError::Unsupported(_)),
+        "{kind}: reported a missing relation as something it cannot do: {err}"
+    );
 }
 
 /// The tree has exactly as many levels as [`Capabilities::hierarchy`] claims.

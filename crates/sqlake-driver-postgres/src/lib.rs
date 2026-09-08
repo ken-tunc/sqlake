@@ -10,6 +10,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod describe;
 pub mod preview;
 pub mod query;
 pub mod tls;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlake_core::capability::{Capabilities, DriverKind, Escaping, HierarchyLevel, QuoteStyle};
+use sqlake_core::detail::TableDetail;
 use sqlake_core::driver::{Driver, DriverError, DriverResult, Session};
 use sqlake_core::node::{NodeKind, NodeRef, TableRef, TreeNode};
 use sqlake_core::profile::{Params, ResolvedProfile};
@@ -225,6 +227,11 @@ impl Session for PgSession {
     async fn preview(&self, table: &TableRef, req: &PageRequest) -> DriverResult<ResultSet> {
         let _running = self.cancels.lock().await;
         preview::preview(&self.client, &self.database, table, req).await
+    }
+
+    async fn describe(&self, table: &TableRef) -> DriverResult<TableDetail> {
+        let _running = self.cancels.lock().await;
+        describe::describe(&self.client, table).await
     }
 
     async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate> {

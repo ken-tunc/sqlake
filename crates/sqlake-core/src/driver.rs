@@ -1,12 +1,14 @@
 //! The seam between the application and a database.
 //!
-//! `describe` is still missing; M5 adds it. Declaring it now would force stub
-//! types into existence months before anything constructs one.
+//! The seam is complete: connecting, walking, reading, costing, running and
+//! describing are what a driver has to do, and nothing above it needs anything
+//! a driver cannot answer.
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::capability::{Capabilities, DriverKind};
+use crate::detail::TableDetail;
 use crate::node::{NodeRef, TableRef, TreeNode};
 use crate::profile::ResolvedProfile;
 use crate::result::{PageRequest, ResultSet};
@@ -101,6 +103,20 @@ pub trait Session: Send + Sync + std::fmt::Debug {
     ///
     /// [`Capabilities::cost_estimate`]: crate::capability::Capabilities::cost_estimate
     async fn estimate(&self, sql: &ValidatedSql) -> DriverResult<Estimate>;
+
+    /// What this relation is: its columns, and whatever else this driver keeps
+    /// about it.
+    ///
+    /// Every driver answers the same shape and fills in only what it has.
+    /// [`TableDetail::sections`] empty is an ordinary answer — BigQuery has no
+    /// triggers to have — and [`Capabilities`] is what says in advance which
+    /// of them to expect, so a caller is not left inferring absence from
+    /// silence.
+    ///
+    /// This is the call that knows about nullability and defaults.
+    /// [`Session::preview`] builds its columns from a result and cannot always
+    /// know, so a front-end drawing a definition draws it from here.
+    async fn describe(&self, table: &TableRef) -> DriverResult<TableDetail>;
 
     /// Run a query and return its rows.
     ///

@@ -107,7 +107,7 @@ async fn relations(client: &Client, of: &NodeRef) -> DriverResult<Vec<TreeNode>>
 /// Anything unrecognised is a table: a new `relkind` in a future PostgreSQL is
 /// far more likely to be something rows can be read from than not, and the
 /// icon being wrong is a smaller failure than the relation vanishing.
-fn relation_kind(relkind: i8) -> RelationKind {
+pub(crate) fn relation_kind(relkind: i8) -> RelationKind {
     match u8::try_from(relkind).map(char::from) {
         Ok('v') => RelationKind::View,
         Ok('m') => RelationKind::MaterializedView,
