@@ -2628,6 +2628,7 @@ mod tests {
                     .map(|(at, sql)| sqlake_core::library::HistoryEntry {
                         id: sqlake_core::library::RunId::new(at as i64 + 1),
                         connection: "c".to_owned(),
+                        issuer: Some(sqlake_core::library::Issuer::Human),
                         driver: None,
                         sql: (*sql).to_owned(),
                         started_at: time::OffsetDateTime::UNIX_EPOCH,

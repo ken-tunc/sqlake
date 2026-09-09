@@ -59,7 +59,10 @@ impl Service {
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self {
-            store,
+            // Held as an agent, which is what this crate is: what it changes
+            // is one column in the history, so that "was that me?" has an
+            // answer in the same place as the statement.
+            store: store.as_agent(),
             budget: Budget::DEFAULT,
             max_bytes: None,
             timeout: DEFAULT_TIMEOUT,
@@ -932,6 +935,7 @@ mod tests {
                 driver: sqlake_core::capability::DriverKind::Mock,
                 sql: "select * from public.users".to_owned(),
                 started_at: time::OffsetDateTime::UNIX_EPOCH,
+                issuer: sqlake_core::library::Issuer::Agent,
             })
             .expect("it records");
         library
@@ -951,6 +955,7 @@ mod tests {
                 driver: sqlake_core::capability::DriverKind::Mock,
                 sql: "select 1".to_owned(),
                 started_at: time::OffsetDateTime::UNIX_EPOCH,
+                issuer: sqlake_core::library::Issuer::Agent,
             })
             .expect("it records");
         library
@@ -1788,6 +1793,10 @@ mod tests {
             "generated_ddl",
             "hierarchy",
             "id",
+            // Which side of the socket asked for a run. Not who: this client
+            // has no idea who is at the keyboard, and the column says so by
+            // holding one of two words.
+            "issuer",
             "kind",
             "loaded",
             "message",

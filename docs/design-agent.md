@@ -149,14 +149,14 @@ own working memory. So:
 ### 3.4 Audit
 
 Every agent-issued query goes into the same `query_history` table as a human's, with an
-`issuer` column (`human`, or `agent:<name>`). Failures included.
+`issuer` column. Failures included.
 
 One history, one place to look when something unexpected happened to the data.
 
-M8's, not A2's, and that is the honest order rather than a slip: there is no history table
-until M8 builds one, and an `issuer` column on nothing is a column. What A2 owes it is that
-every query already carries a `QueryId` and the connection it ran on, so the row M8 writes has
-something to be about.
+Two words, `human` and `agent`, rather than `agent:<name>`: a name is a thing this client would
+have to be told and could not check, and one that a caller chooses for itself is a label rather
+than a fact. Which side of the socket a request came from is what it actually knows, and it is
+what the question "was that me?" is asking.
 
 ### 3.5 Secrets never cross the socket
 

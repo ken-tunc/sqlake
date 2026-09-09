@@ -19,8 +19,8 @@ use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::library::{
-    HistoryEntry, Library, LibraryError, LibraryResult, RunId, RunOutcome, RunStart, Search,
-    Template,
+    HistoryEntry, Issuer, Library, LibraryError, LibraryResult, RunId, RunOutcome, RunStart,
+    Search, Template,
 };
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
@@ -105,13 +105,22 @@ impl Dispatched {
 #[derive(Debug)]
 struct Queue {
     sent: u64,
-    actions: mpsc::UnboundedSender<Action>,
+    actions: mpsc::UnboundedSender<(Action, Issuer)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Store {
     queue: Arc<std::sync::Mutex<Queue>>,
     snapshots: watch::Receiver<Arc<Snapshot>>,
+    /// Who is holding this handle.
+    ///
+    /// A property of the handle rather than of each action, because that is
+    /// what it is: one store serves a person at the terminal and whatever is
+    /// on the socket at the same time, and which of them dispatched something
+    /// is a fact about the caller. Putting it on `Action` would have been the
+    /// same fact written out at thirty call sites, each of them able to write
+    /// it wrongly.
+    issuer: Issuer,
 }
 
 /// Everything the store is given rather than makes.
@@ -227,10 +236,25 @@ impl Store {
                 actions: action_tx,
             })),
             snapshots: snapshot_rx,
+            issuer: Issuer::Human,
         }
     }
 
     /// Non-blocking on purpose: the render loop must never await.
+    /// The same store, held by something on the socket.
+    ///
+    /// What it changes is one column in the history: a run that came from an
+    /// agent is recorded as one. Nothing else about the two handles differs —
+    /// an agent has no more and no less reach than the person sharing the
+    /// session, which is the point of it being the same store.
+    #[must_use]
+    pub fn as_agent(&self) -> Self {
+        Self {
+            issuer: Issuer::Agent,
+            ..self.clone()
+        }
+    }
+
     pub fn dispatch(&self, action: Action) -> Dispatched {
         let mut queue = self
             .queue
@@ -240,7 +264,7 @@ impl Store {
         // A closed store means the process is shutting down; dropping the
         // action is the correct response. The ordinal is still handed back, and
         // the wait it belongs to ends as `Stopped`.
-        let _ = queue.actions.send(action);
+        let _ = queue.actions.send((action, self.issuer));
         Dispatched(queue.sent)
     }
 
@@ -485,7 +509,7 @@ struct Runtime {
 impl Runtime {
     async fn run(
         mut self,
-        mut actions: mpsc::UnboundedReceiver<Action>,
+        mut actions: mpsc::UnboundedReceiver<(Action, Issuer)>,
         mut events: mpsc::UnboundedReceiver<Event>,
         snapshots: watch::Sender<Arc<Snapshot>>,
     ) {
@@ -496,10 +520,10 @@ impl Runtime {
                     // its own, so the event channel cannot close and the
                     // select would park here for ever, keeping every session
                     // actor — and its database connection — alive.
-                    let Some(action) = action else { break };
+                    let Some((action, issuer)) = action else { break };
                     tracing::debug!(%action, "action");
                     self.applied += 1;
-                    self.apply(action);
+                    self.apply(action, issuer);
                 }
                 Some(event) = events.recv() => self.handle(event),
                 else => break,
@@ -567,7 +591,7 @@ impl Runtime {
 
     // ── actions ────────────────────────────────────────────────────────────
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, action: Action, issuer: Issuer) {
         match action {
             Action::Connect { profile, conn } => self.connect(&profile, conn),
             Action::Disconnect(id) => self.disconnect(id),
@@ -595,9 +619,9 @@ impl Runtime {
                 sql,
                 max_rows,
                 max_bytes,
-            } => self.run_query(conn, query, sql, max_rows, max_bytes),
+            } => self.run_query(conn, query, sql, max_rows, max_bytes, issuer),
             Action::EstimateQuery { conn, query, sql } => self.estimate_query(conn, query, sql),
-            Action::ApproveQuery(query) => self.approve_query(query),
+            Action::ApproveQuery(query) => self.approve_query(query, issuer),
             Action::ForgetQuery(query) => self.forget_query(query),
             Action::LoadTemplates => self.with_library(None, |_| Ok(())),
             Action::SaveTemplate(template) => {
@@ -1069,6 +1093,7 @@ impl Runtime {
         sql: String,
         max_rows: Option<u32>,
         max_bytes: Option<u64>,
+        issuer: Issuer,
     ) {
         let Some(conn) = self.conns.iter().find(|c| c.id == conn_id) else {
             return;
@@ -1097,7 +1122,7 @@ impl Runtime {
             started_at: Instant::now(),
             took: None,
         });
-        self.record_start(id, conn_id, &sql);
+        self.record_start(id, conn_id, &sql, issuer);
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running a query");
         let events = self.events.clone();
@@ -1127,6 +1152,10 @@ impl Runtime {
 
     /// Cost a statement and stop there.
     ///
+    /// Nothing reaches the *history*: it holds what was run, and a row for a
+    /// statement the server was only asked about would be one that never
+    /// settles — a query that looks, for ever, like it is still going.
+    ///
     /// The query is recorded like any other, so the answer arrives where every
     /// other answer does — and `data` stays `Idle`, which is exactly true: no
     /// rows were requested.
@@ -1154,8 +1183,6 @@ impl Runtime {
             started_at: Instant::now(),
             took: None,
         });
-        self.record_start(id, conn_id, &sql);
-
         let busy = self.begin_busy(BusyOwner::Query(id), "estimating a query");
         let events = self.events.clone();
         self.spawn_task(busy, async move {
@@ -1197,7 +1224,7 @@ impl Runtime {
     /// The statement comes out of the `OverBudget` the refusal left behind, so
     /// what runs is what was estimated — not whatever the buffer says now,
     /// which after an `$EDITOR` round trip need not be the same thing.
-    fn approve_query(&mut self, id: QueryId) {
+    fn approve_query(&mut self, id: QueryId, issuer: Issuer) {
         let Some(conn_id) = self.queries.iter().find(|q| q.id == id).map(|q| q.conn) else {
             return;
         };
@@ -1224,7 +1251,7 @@ impl Runtime {
         query.started_at = Instant::now();
         query.took = None;
         let sql = query.sql.clone();
-        self.record_start(id, conn_id, &sql);
+        self.record_start(id, conn_id, &sql, issuer);
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running an approved query");
         let events = self.events.clone();
@@ -1391,7 +1418,7 @@ impl Runtime {
     /// they wait. Nothing here is on the path of the query itself: the write
     /// is a blocking task of its own, and a library that refuses only costs a
     /// line in the log.
-    fn record_start(&mut self, query: QueryId, conn: ConnId, sql: &str) {
+    fn record_start(&mut self, query: QueryId, conn: ConnId, sql: &str, issuer: Issuer) {
         let (Some(library), Some(driver)) = (
             self.library.clone(),
             self.conns.iter().find(|c| c.id == conn).map(|c| c.kind),
@@ -1406,6 +1433,7 @@ impl Runtime {
             driver,
             sql: sql.to_owned(),
             started_at: OffsetDateTime::now_utc(),
+            issuer,
         };
         // Not a `spawn_task`: it has no busy row, because it is not something
         // anybody asked for or would cancel. The query it describes has one.
@@ -2455,6 +2483,7 @@ mod tests {
                     driver: DriverKind::Mock,
                     sql: (*sql).to_owned(),
                     started_at: time::OffsetDateTime::now_utc(),
+                    issuer: sqlake_core::library::Issuer::Human,
                 })
                 .expect("it records");
         }
@@ -2546,6 +2575,72 @@ mod tests {
             searched(&store, "public").await,
             ["select * from public.users"]
         );
+    }
+
+    #[tokio::test]
+    async fn costing_a_statement_leaves_no_run_behind() {
+        // A history holds what was *run*. `query_estimate` never sends the
+        // statement, so a row for it is one that never settles — a query that
+        // looks, for ever, like it is still going.
+        let (store, library) = store_recording();
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        settled(
+            &store,
+            Action::EstimateQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+            },
+            |s| s.query(id).is_some_and(|q| q.estimate.is_some()),
+        )
+        .await;
+
+        // Long enough for a row to have been written if one were going to be.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            library
+                .search(&sqlake_core::library::Search::newest(10))
+                .expect("it reads")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_says_which_side_of_the_socket_asked_for_it() {
+        // One history holds both, so "was that me?" has an answer in the same
+        // place as the statement.
+        let (store, library) = store_recording();
+        let (store, conn) = connected(store).await;
+        let agent = store.as_agent();
+
+        for (store, sql) in [
+            (&store, "select 'by hand'"),
+            (&agent, "select 'by an agent'"),
+        ] {
+            let id = QueryId::new();
+            settled(
+                store,
+                Action::RunQuery {
+                    conn,
+                    query: id,
+                    sql: sql.to_owned(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                |s| s.query(id).is_some_and(QueryView::is_settled),
+            )
+            .await;
+        }
+
+        let held = history(&library, |h| h.len() == 2).await;
+        let by = |sql: &str| {
+            held.iter()
+                .find(|entry| entry.sql == sql)
+                .and_then(|entry| entry.issuer)
+        };
+        assert_eq!(by("select 'by hand'"), Some(Issuer::Human));
+        assert_eq!(by("select 'by an agent'"), Some(Issuer::Agent));
     }
 
     #[tokio::test]

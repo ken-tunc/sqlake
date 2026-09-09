@@ -682,6 +682,10 @@ pub struct RunInfo {
     pub connection: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
+    /// `human` or `agent` — which side of the socket asked for it. Absent on a
+    /// row written before this client kept the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
     pub sql: String,
     /// UTC, RFC 3339. Local time is a rendering decision and is made where
     /// every other one is.
@@ -706,6 +710,7 @@ impl From<&HistoryEntry> for RunInfo {
         Self {
             connection: entry.connection.clone(),
             driver: entry.driver.map(|kind| kind.as_str().to_owned()),
+            issuer: entry.issuer.map(|who| who.as_str().to_owned()),
             sql: entry.sql.clone(),
             started_at: entry
                 .started_at

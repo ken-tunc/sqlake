@@ -71,6 +71,13 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO query_history_fts (rowid, sql) VALUES (new.id, new.sql);
     END;
     ",
+    // v2 — who asked for it. Added rather than cut into v1, because a file
+    // written by a build that shipped with v1 exists on this machine and the
+    // rule above is that a shipped migration is never edited.
+    //
+    // Nullable and not defaulted: a row from before this column knows nothing
+    // about who ran it, and `human` would be a guess written as a fact.
+    "ALTER TABLE query_history ADD COLUMN issuer TEXT;",
 ];
 
 /// What a file this build has finished with says it is.
