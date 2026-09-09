@@ -14,7 +14,8 @@ use serde_json::{Map, Value as Json};
 
 use crate::page::{Budget, Page};
 use crate::snapshot::{
-    ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo, StatementInfo, TemplateInfo,
+    ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, RunInfo, SessionInfo, StatementInfo,
+    TemplateInfo,
 };
 
 /// Which column to sort a preview by.
@@ -160,6 +161,20 @@ pub enum Request {
         limit: Option<usize>,
     },
 
+    /// Look through what this session has run.
+    ///
+    /// The words are read as terms rather than as a query language, the same
+    /// way the pane reads them: all of them have to appear, and the last one
+    /// matches as a prefix. A caller that wants everything sends nothing.
+    HistorySearch {
+        #[serde(default)]
+        terms: String,
+        /// Fewer runs than the server would answer with. Only ever downward,
+        /// for the reason every other limit here is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+
     /// The saved statements, with the placeholders each one needs.
     ///
     /// The placeholders are listed here so that a caller need not parse
@@ -244,6 +259,7 @@ request_kinds! {
     TableList       => "table_list",
     TablePreview    => "table_preview",
     TableDescribe   => "table_describe",
+    HistorySearch   => "history_search",
     TemplateList    => "template_list",
     TemplateApply   => "template_apply",
     QueryEstimate   => "query_estimate",
@@ -272,6 +288,7 @@ impl Request {
             Self::TableList { .. } => RequestKind::TableList,
             Self::TablePreview { .. } => RequestKind::TablePreview,
             Self::TableDescribe { .. } => RequestKind::TableDescribe,
+            Self::HistorySearch { .. } => RequestKind::HistorySearch,
             Self::TemplateList {} => RequestKind::TemplateList,
             Self::TemplateApply { .. } => RequestKind::TemplateApply,
             Self::QueryEstimate { .. } => RequestKind::QueryEstimate,
@@ -381,6 +398,8 @@ pub enum Response {
     /// driver chose.
     Definition(DefinitionInfo),
     Templates(Vec<TemplateInfo>),
+    /// What this session has run, newest first.
+    Runs(Vec<RunInfo>),
     /// A template, filled in. Not a run — see [`Request::TemplateApply`].
     Statement(StatementInfo),
     /// One query, wherever it has got to. The answer to running, waiting,
@@ -415,6 +434,7 @@ kinds!(
     Page,
     Definition,
     Templates,
+    Runs,
     Statement,
     Query,
     Failed,
@@ -450,6 +470,7 @@ impl Response {
             Self::Page(_) => ResponseKind::Page,
             Self::Definition(_) => ResponseKind::Definition,
             Self::Templates(_) => ResponseKind::Templates,
+            Self::Runs(_) => ResponseKind::Runs,
             Self::Statement(_) => ResponseKind::Statement,
             Self::Query(_) => ResponseKind::Query,
             Self::Failed(_) => ResponseKind::Failed,
@@ -558,6 +579,10 @@ mod tests {
                 connection: "c".into(),
                 table: vec!["public".into(), "users".into()],
                 sort: None,
+                limit: None,
+            },
+            Request::HistorySearch {
+                terms: "orders".into(),
                 limit: None,
             },
             Request::TemplateList {},

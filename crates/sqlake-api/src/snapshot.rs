@@ -14,7 +14,7 @@ use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::capability::Capabilities;
 use sqlake_core::detail::{ColumnDef, TableDetail};
 use sqlake_core::id::ConnId;
-use sqlake_core::library::Template;
+use sqlake_core::library::{HistoryEntry, Template};
 use sqlake_core::sql::{Estimate, Position};
 use sqlake_core::template::{Dialect, Kind, Placeholder, placeholders};
 
@@ -668,4 +668,54 @@ pub struct StatementInfo {
     /// The statement, quoted for the connection it was built against. Not run
     /// — `query_run` is what runs one.
     pub sql: String,
+}
+
+/// One run, as the history kept it.
+///
+/// The numbers stay numbers here and become "4m ago" and "12ms" on a screen:
+/// an agent comparing two runs wants to subtract them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct RunInfo {
+    /// The connection it went out on, as that session named it. It means
+    /// nothing on a later run and is what tells two databases apart within one
+    /// history.
+    pub connection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    pub sql: String,
+    /// UTC, RFC 3339. Local time is a rendering decision and is made where
+    /// every other one is.
+    pub started_at: String,
+    /// `ok`, `error`, `cancelled` or `refused` — or absent, which is a run
+    /// that had not ended when this was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_processed: Option<u64>,
+    /// The server's own words, for a run that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl From<&HistoryEntry> for RunInfo {
+    fn from(entry: &HistoryEntry) -> Self {
+        Self {
+            connection: entry.connection.clone(),
+            driver: entry.driver.map(|kind| kind.as_str().to_owned()),
+            sql: entry.sql.clone(),
+            started_at: entry
+                .started_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            status: entry.status.clone(),
+            duration_ms: entry.duration_ms,
+            row_count: entry.row_count,
+            bytes_processed: entry.bytes_processed,
+            error: entry.error.clone(),
+        }
+    }
 }
