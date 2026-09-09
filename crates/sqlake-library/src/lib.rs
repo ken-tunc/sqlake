@@ -66,6 +66,16 @@ impl Sqlite {
         connection
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(translate)?;
+        // WAL lets a second process read while this one writes; it does not
+        // let two of them write at once, and without a timeout the loser is
+        // told "database is locked" straight away. An attached session and a
+        // one-shot command sharing the file is the ordinary case here, so the
+        // one that arrives second waits rather than failing — five seconds is
+        // far longer than the writes this does and short enough that a wedged
+        // lock is still reported rather than hung on.
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(translate)?;
         Self::from(connection)
     }
 
@@ -482,6 +492,38 @@ mod tests {
         };
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&home), 0o700, "the directory it sits in, too");
+    }
+
+    #[test]
+    fn two_processes_can_share_the_file() {
+        // An attached session and a one-shot command are two processes on one
+        // library, which is what WAL and the busy timeout are for.
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("library.db");
+        let one = Sqlite::open(&path).expect("the first opens");
+        let two = Sqlite::open(&path).expect("the second opens");
+
+        one.add(template("from one")).expect("the first writes");
+        two.add(template("from two")).expect("the second writes");
+        assert_eq!(one.templates().expect("listed").len(), 2);
+        assert_eq!(two.templates().expect("listed").len(), 2);
+    }
+
+    #[test]
+    fn a_file_on_disk_is_in_wal_mode() {
+        // `pragma_update` is `execute` underneath, and `journal_mode` answers
+        // with a row — so it is worth checking that the mode was set rather
+        // than that the call did not fail.
+        let dir = tempfile::tempdir().expect("a directory");
+        let library = Sqlite::open(&dir.path().join("library.db")).expect("it opens");
+        let mode: String = library
+            .with(|connection| {
+                connection
+                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .map_err(translate)
+            })
+            .expect("it answers");
+        assert_eq!(mode, "wal");
     }
 
     #[test]
