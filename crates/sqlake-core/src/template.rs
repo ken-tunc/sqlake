@@ -68,9 +68,13 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// `value:` is accepted as well as being the default: somebody who writes
+    /// the kind out in full is saying what they mean, and refusing that would
+    /// teach them the prefix does not exist.
     fn named(prefix: &str) -> Option<Self> {
         match prefix {
             "ident" => Some(Self::Ident),
+            "value" => Some(Self::Value),
             _ => None,
         }
     }
@@ -118,6 +122,15 @@ pub enum TemplateError {
     )]
     InLiteral { name: String },
 
+    /// One name, quoted two ways.
+    ///
+    /// Refused rather than resolved, because there is nothing to resolve it
+    /// to: the pane asks for `col` once, and the statement would then put the
+    /// one answer in as a table name in one place and a string in another.
+    /// Whichever the author meant, one of the two is wrong.
+    #[error("`{name}` is a value in one place and an identifier in another")]
+    TwoKinds { name: String },
+
     #[error("`{name}` has no value")]
     Missing { name: String },
 
@@ -131,9 +144,7 @@ pub enum TemplateError {
 /// Every placeholder in the body, in the order they first appear.
 ///
 /// Deduplicated by name: `{{table}}` twice is one thing to ask for, and asking
-/// twice would let somebody answer differently each time. The same name under
-/// two kinds is not deduplicated — it is [`TemplateError::UnknownKind`]'s
-/// sibling and would be a statement that quotes one of them wrongly.
+/// twice would let somebody answer differently each time.
 pub fn placeholders(body: &str, dialect: Dialect) -> Result<Vec<Placeholder>, TemplateError> {
     let mut found: Vec<Placeholder> = Vec::new();
     for (placeholder, _) in parse(body, dialect)? {
@@ -254,7 +265,17 @@ fn parse(body: &str, dialect: Dialect) -> Result<Vec<Found>, TemplateError> {
             }
             None => {}
         }
-        found.push((placeholder(inner)?, (start, end)));
+        let placeholder = placeholder(inner)?;
+        if let Some((held, _)) = found
+            .iter()
+            .find(|(held, _): &&Found| held.name == placeholder.name)
+            && held.kind != placeholder.kind
+        {
+            return Err(TemplateError::TwoKinds {
+                name: placeholder.name,
+            });
+        }
+        found.push((placeholder, (start, end)));
     }
     Ok(found)
 }
@@ -392,6 +413,25 @@ mod tests {
             bound(body, &[("col", "created_at")], PG),
             r#"select "created_at" from t order by "created_at""#
         );
+    }
+
+    #[test]
+    fn one_name_cannot_be_two_things() {
+        // Asked for once and filled in twice, so one of the two answers would
+        // be quoted the way the other needed.
+        let refused = placeholders("select {{col}} from t order by {{ident:col}}", PG)
+            .expect_err("it should refuse");
+        assert_eq!(
+            refused,
+            TemplateError::TwoKinds {
+                name: "col".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_kind_can_be_written_out_in_full() {
+        assert_eq!(bound("select {{value:a}}", &[("a", "1")], PG), "select '1'");
     }
 
     #[test]
