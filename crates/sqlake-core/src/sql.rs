@@ -11,10 +11,11 @@
 //! cannot name a type from the crate above it. `Ident → QuotedIdent` is here
 //! for the same reason.
 //!
-//! Two stages, not the three design.md §4.1 lists. `PreparedSql` was to carry
-//! bound parameters, and there are none until templates arrive in M7; between
-//! [`ValidatedSql`] and here it would hold nothing, and §15 says to add a stage
-//! only when skipping it would cause a real accident.
+//! Two stages, not the three design.md §4.1 once listed. `PreparedSql` was to
+//! carry bound parameters between [`ValidatedSql`] and here; a template's
+//! placeholders are substituted rather than bound — see
+//! [`template`](crate::template) for why — so there are none, and §15 says to
+//! add a stage only when skipping it would cause a real accident.
 
 use std::fmt;
 
@@ -545,6 +546,9 @@ fn statement_spans(text: &str, escaping: Escaping) -> Result<Vec<(usize, usize)>
             start = at + 1;
         }
         Token::Code | Token::Word { .. } => code = true,
+        // A comment is not code, and a string is — but the `Code` that opened
+        // it has already said so, so both are nothing to do here.
+        Token::Skipped { .. } => {}
     })?;
 
     // A last statement with no semicolon after it.
@@ -557,13 +561,31 @@ fn statement_spans(text: &str, escaping: Escaping) -> Result<Vec<(usize, usize)>
 /// What the scanner reports. Everything a `;` or a keyword could hide in is
 /// skipped rather than reported, which is the whole job.
 #[derive(Debug, Clone, Copy)]
-enum Token<'a> {
+pub(crate) enum Token<'a> {
     /// A statement boundary, at this byte offset.
     Semicolon(usize),
     /// A bare word: an unquoted identifier or a keyword.
     Word { text: &'a str },
     /// Anything else that is not whitespace — punctuation, a number, a string.
     Code,
+    /// A stretch the scanner stepped over, and what it was.
+    ///
+    /// Reported as well as skipped because one caller wants to know *where*
+    /// the text it is looking at sits: a `{{placeholder}}` inside a string
+    /// literal is not one, and telling that apart needs the same walk that
+    /// already knows where the literal ends.
+    Skipped {
+        start: usize,
+        end: usize,
+        what: Skipped,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Skipped {
+    /// A string, a quoted name, or a dollar-quoted body.
+    Quoted,
+    Comment,
 }
 
 /// Walks the text once, skipping strings, quoted names and comments.
@@ -572,7 +594,11 @@ enum Token<'a> {
 /// what the bare words are — because the skipping is the hard part and two
 /// copies of it would drift. A word inside a string is not a keyword and a `;`
 /// inside a comment is not a boundary, and both facts come from the same place.
-fn scan(text: &str, escaping: Escaping, mut on: impl FnMut(Token<'_>)) -> Result<(), InvalidSql> {
+pub(crate) fn scan(
+    text: &str,
+    escaping: Escaping,
+    mut on: impl FnMut(Token<'_>),
+) -> Result<(), InvalidSql> {
     let bytes = text.as_bytes();
     let mut i = 0;
 
@@ -581,6 +607,7 @@ fn scan(text: &str, escaping: Escaping, mut on: impl FnMut(Token<'_>)) -> Result
             b'\'' | b'"' | b'`' => {
                 on(Token::Code);
                 let quote = bytes[i];
+                let opened = i;
                 i += 1;
                 loop {
                     // A backslash takes the next byte with it, so a quote
@@ -615,9 +642,20 @@ fn scan(text: &str, escaping: Escaping, mut on: impl FnMut(Token<'_>)) -> Result
                     i += 1;
                     break;
                 }
+                on(Token::Skipped {
+                    start: opened,
+                    end: i,
+                    what: Skipped::Quoted,
+                });
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                let opened = i;
                 i = memchr(bytes, b'\n', i).map_or(bytes.len(), |at| at + 1);
+                on(Token::Skipped {
+                    start: opened,
+                    end: i,
+                    what: Skipped::Comment,
+                });
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 // Not nested: PostgreSQL nests block comments and BigQuery
@@ -626,15 +664,26 @@ fn scan(text: &str, escaping: Escaping, mut on: impl FnMut(Token<'_>)) -> Result
                 let Some(at) = find(bytes, b"*/", i + 2) else {
                     return Err(InvalidSql::Unterminated("comment"));
                 };
+                on(Token::Skipped {
+                    start: i,
+                    end: at + 2,
+                    what: Skipped::Comment,
+                });
                 i = at + 2;
             }
             b'$' => match dollar_tag(bytes, i) {
                 Some(tag) => {
                     on(Token::Code);
+                    let opened = i;
                     let Some(at) = find(bytes, tag, i + tag.len()) else {
                         return Err(InvalidSql::Unterminated("dollar-quoted string"));
                     };
                     i = at + tag.len();
+                    on(Token::Skipped {
+                        start: opened,
+                        end: i,
+                        what: Skipped::Quoted,
+                    });
                 }
                 // `$1` and a bare `$` are not quoting.
                 None => {

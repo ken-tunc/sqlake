@@ -145,9 +145,11 @@ Left open deliberately; the answers belong in the code that settles them.
    any. `LIMIT 10` and `LIMIT 10` are the same on both, and `array_agg` is not — so the field
    earns its place — but a palette that hides templates when the wrong tab is focused is also
    a palette that appears to have lost them.
-2. **What a placeholder's type looks like in the text.** `{{table}}` says nothing about being
-   an identifier; `{{ident:table}}` says it and is uglier every time somebody writes one.
-   Inference from the name is the third option and the one that fails silently.
+2. ~~**What a placeholder's type looks like in the text.**~~ Answered by T2: `{{name}}` is a
+   value and `{{ident:name}}` an identifier, with an unknown prefix refused rather than read as
+   part of a name. Inference from the name was the third option and the one that fails
+   silently — `{{table}}` in `WHERE table = …` is a value, and no rule about the word can know
+   that. The ugliness is real and is paid by the rarer of the two.
 3. **What the palette does when the buffer is not empty.** Insert at the cursor, replace, or
    open a tab. Replacing loses work; inserting produces two statements where one was meant.
 
