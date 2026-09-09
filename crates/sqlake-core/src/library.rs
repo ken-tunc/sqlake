@@ -210,12 +210,37 @@ pub trait Library: Send + Sync + fmt::Debug {
 
     fn settled(&self, id: RunId, outcome: RunOutcome) -> LibraryResult<()>;
 
-    /// Every recorded run, newest first.
-    ///
-    /// Here rather than waiting for M8's search because a history nothing can
-    /// read is a history nothing can hold to be right: this is what says a run
-    /// left the row it was supposed to.
-    fn history(&self, limit: usize) -> LibraryResult<Vec<HistoryEntry>>;
+    /// Recorded runs, newest first, matching what was asked for.
+    fn search(&self, search: &Search) -> LibraryResult<Vec<HistoryEntry>>;
+}
+
+/// What to look for in the history.
+///
+/// `terms` is what somebody typed, not a query language: the search runs on
+/// every keystroke, and a syntax somebody can get wrong halfway through typing
+/// it is one that turns the pane red on the way to the answer. What the words
+/// mean is the implementation's to decide — [`sqlake-library`] reads them as
+/// "all of these, the last one as a prefix".
+///
+/// [`sqlake-library`]: https://github.com/ken-tunc/sqlake
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    pub terms: String,
+    /// The most rows to answer with. There is no paging: a history is searched
+    /// rather than read through, and a search nobody has narrowed enough to
+    /// fit is one to narrow rather than to page.
+    pub limit: usize,
+}
+
+impl Search {
+    /// Everything, newest first.
+    #[must_use]
+    pub const fn newest(limit: usize) -> Self {
+        Self {
+            terms: String::new(),
+            limit,
+        }
+    }
 }
 
 /// One run, as the file kept it.
