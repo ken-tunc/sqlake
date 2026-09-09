@@ -921,15 +921,15 @@ impl UiState {
     /// is a list and a possible failure, and both are read where the palette
     /// was — a list somebody has to dismiss to see what happened to their save
     /// is a list in the way.
-    fn commit_template(&mut self) -> Option<Action> {
+    fn commit_template(&mut self, snapshot: &Snapshot) -> Option<Action> {
         let open = self.palette.take()?;
         let name = open.filter.trim().to_owned();
         let body = open.saving_body()?.to_owned();
         if name.is_empty() {
             return None;
         }
-        Some(Action::SaveTemplate(sqlake_core::library::NewTemplate {
-            name,
+        let with = sqlake_core::library::NewTemplate {
+            name: name.clone(),
             body,
             // Any driver, and no tags. Both are things to say *about* a
             // template rather than things to ask for while keeping one, and a
@@ -937,7 +937,36 @@ impl UiState {
             // query they are in the middle of.
             driver: None,
             tags: Vec::new(),
-        }))
+        };
+
+        // A name already saved is an edit, and an edit is a thing to be asked
+        // about: the store refuses a duplicate name, so without this the only
+        // way to change a saved statement would be to delete it and write it
+        // again — and the refusal would arrive as a failure for something
+        // somebody meant to do.
+        match snapshot
+            .templates
+            .data
+            .ready()
+            .and_then(|held| held.iter().find(|t| t.name == name))
+        {
+            Some(existing) => {
+                self.modal = Some(crate::overlay::Modal::asking(
+                    format!("Replace `{name}`?"),
+                    "What is saved under that name goes.",
+                    vec![crate::overlay::Choice {
+                        label: "Replace".to_owned(),
+                        intent: Action::ReplaceTemplate {
+                            id: existing.id,
+                            with,
+                        }
+                        .into(),
+                    }],
+                ));
+                None
+            }
+            None => Some(Action::SaveTemplate(with)),
+        }
     }
 
     /// Bind what the form holds and put the result in the buffer.
@@ -1281,7 +1310,7 @@ impl UiState {
                     return Some(Action::LoadTemplates);
                 }
             }
-            ViewCmd::CommitTemplate => return self.commit_template(),
+            ViewCmd::CommitTemplate => return self.commit_template(snapshot),
             ViewCmd::UseTemplate(id) => self.use_template(id, snapshot),
             ViewCmd::SubmitTemplate => self.submit_template(snapshot),
             ViewCmd::ConfirmDeleteTemplate { id, name } => {
@@ -2524,6 +2553,38 @@ mod tests {
         assert_eq!(template.name, "daily");
         assert_eq!(template.body, "select * from users");
         assert!(ui.palette.is_none(), "the answer is read where it was");
+    }
+
+    #[test]
+    fn saving_under_a_name_already_saved_asks_before_replacing_it() {
+        // The store refuses a duplicate name, so without this the only way to
+        // change a saved statement would be to delete it and write it again —
+        // and the refusal would arrive as a failure for something somebody
+        // meant to do.
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[("daily", "select 1")]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::saving("select 2".to_owned()))),
+            &snap,
+        );
+        if let Some(palette) = ui.palette.as_mut() {
+            palette.filter = "daily".to_owned();
+        }
+
+        assert!(
+            ui.apply(ViewCmd::CommitTemplate, &snap).is_none(),
+            "nothing is saved until the question is answered"
+        );
+        let modal = ui.modal.as_ref().expect("a dialog");
+        assert!(modal.title.contains("daily"), "{modal:?}");
+        let Some(crate::intent::Intent::App(Action::ReplaceTemplate { id, with })) =
+            modal.choices.first().map(|c| c.intent.clone())
+        else {
+            panic!("{modal:?}");
+        };
+        assert_eq!(id, template_id(&snap, "daily"));
+        assert_eq!(with.body, "select 2");
     }
 
     #[test]
