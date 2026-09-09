@@ -930,6 +930,17 @@ mod tests {
     }
 
     #[test]
+    fn a_word_that_is_not_ascii_is_a_word() {
+        // FTS5's tokenizer splits on what Unicode calls non-alphanumeric, and
+        // so does the reader above — so a term in another script is one term
+        // rather than an error or a handful of letters.
+        let library = library();
+        recorded(&library, &["select * from 注文", "select * from users"]);
+        assert_eq!(found(&library, "注文"), ["select * from 注文"]);
+        assert!(found(&library, "顧客").is_empty());
+    }
+
+    #[test]
     fn a_word_nothing_ran_finds_nothing() {
         let library = library();
         recorded(&library, &["select 1"]);
