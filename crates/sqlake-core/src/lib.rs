@@ -25,8 +25,8 @@ pub use driver::{Driver, DriverError, DriverResult, Session};
 pub use id::{ConnId, ProfileId, QueryId, TabId};
 pub use ident::{Ident, QuotedIdent};
 pub use library::{
-    Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart, Template,
-    TemplateId,
+    HistoryEntry, Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart,
+    Template, TemplateId,
 };
 pub use literal::{Literal, QuotedLiteral};
 pub use node::{NodeKind, NodeRef, RelationKind, TableRef, TreeNode};

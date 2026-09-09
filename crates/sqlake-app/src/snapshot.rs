@@ -174,6 +174,12 @@ pub struct QueryView {
     /// that fails has nowhere to point, and widening the shared type for one
     /// of them would put an `Option` nobody reads on all of them.
     pub failed_at: Option<Position>,
+    /// When the store sent it. Monotonic, because this is measured with rather
+    /// than displayed: a clock that steps back over a running query would turn
+    /// its duration into a very large number.
+    pub started_at: Instant,
+    /// How long it took, once it is over however it was over.
+    pub took: Option<std::time::Duration>,
 }
 
 impl QueryView {

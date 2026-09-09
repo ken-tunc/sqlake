@@ -130,6 +130,17 @@ pub enum RunOutcome {
     Cancelled {
         duration_ms: u64,
     },
+    /// Costed, refused by the budget, and never sent.
+    ///
+    /// Its own status rather than an error: nothing went wrong and nothing
+    /// ran. It is in the history at all because "the expensive one I decided
+    /// not to run" is a thing somebody goes looking for — and because a
+    /// statement that vanished from the history the moment it was refused
+    /// would look like one that was never typed.
+    Refused {
+        duration_ms: u64,
+        message: String,
+    },
 }
 
 impl RunOutcome {
@@ -140,6 +151,7 @@ impl RunOutcome {
             Self::Ok { .. } => "ok",
             Self::Failed { .. } => "error",
             Self::Cancelled { .. } => "cancelled",
+            Self::Refused { .. } => "refused",
         }
     }
 
@@ -148,6 +160,7 @@ impl RunOutcome {
         match self {
             Self::Ok { duration_ms, .. }
             | Self::Failed { duration_ms, .. }
+            | Self::Refused { duration_ms, .. }
             | Self::Cancelled { duration_ms } => *duration_ms,
         }
     }
@@ -196,4 +209,28 @@ pub trait Library: Send + Sync + fmt::Debug {
     fn started(&self, run: RunStart) -> LibraryResult<RunId>;
 
     fn settled(&self, id: RunId, outcome: RunOutcome) -> LibraryResult<()>;
+
+    /// Every recorded run, newest first.
+    ///
+    /// Here rather than waiting for M8's search because a history nothing can
+    /// read is a history nothing can hold to be right: this is what says a run
+    /// left the row it was supposed to.
+    fn history(&self, limit: usize) -> LibraryResult<Vec<HistoryEntry>>;
+}
+
+/// One run, as the file kept it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub id: RunId,
+    pub connection: String,
+    pub driver: Option<DriverKind>,
+    pub sql: String,
+    pub started_at: OffsetDateTime,
+    /// `None` while it is still running, which is the state a row is written
+    /// in.
+    pub status: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub row_count: Option<u64>,
+    pub bytes_processed: Option<u64>,
+    pub error: Option<String>,
 }

@@ -409,7 +409,7 @@ CREATE TABLE query_history (
   id INTEGER PRIMARY KEY, connection_id TEXT, driver TEXT,
   sql TEXT NOT NULL, started_at INTEGER, duration_ms INTEGER,
   row_count INTEGER, bytes_processed INTEGER,
-  status TEXT,            -- ok | error | cancelled
+  status TEXT,            -- ok | error | cancelled | refused, or NULL while it runs
   error TEXT, pinned INTEGER DEFAULT 0
 );
 CREATE VIRTUAL TABLE query_history_fts USING fts5(sql, content='query_history');
@@ -426,6 +426,9 @@ CREATE TABLE templates (
 - Templates carry `{{param}}` placeholders, staged like §4.1. Placeholders such as `{{table}}`
   are completed from the currently selected tree node.
 - **Failed queries are recorded too** — in a personal tool, the failures are the useful part.
+  So are the ones that were costed and never sent: `refused` is its own status, because
+  "the expensive one I decided against" is a thing people go looking for, and a statement that
+  vanished from the history the moment the budget stopped it would look like one nobody typed.
 
 ---
 

@@ -1682,6 +1682,8 @@ mod tests {
             })),
             data: LoadState::Idle,
             failed_at: None,
+            started_at: std::time::Instant::now(),
+            took: None,
         }
     }
 
@@ -2777,6 +2779,8 @@ mod tests {
             needs_approval: None,
             data: LoadState::Ready(rows(4, 2)),
             failed_at: None,
+            started_at: std::time::Instant::now(),
+            took: None,
         });
         assert_eq!(ui.rows_of(&snap).map(|r| r.row_count()), Some(4));
     }
@@ -2801,6 +2805,8 @@ mod tests {
             needs_approval: None,
             data: LoadState::Failed("no such column: nope".to_owned()),
             failed_at: None,
+            started_at: std::time::Instant::now(),
+            took: None,
         });
 
         ui.raise_query_errors(&snap);
