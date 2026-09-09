@@ -11,11 +11,13 @@ pub mod driver;
 pub mod id;
 pub mod ident;
 pub mod library;
+pub mod literal;
 pub mod node;
 pub mod profile;
 pub mod result;
 pub mod secret;
 pub mod sql;
+pub mod template;
 pub mod value;
 
 pub use capability::{Capabilities, DriverKind, HierarchyLevel, QuoteStyle};
@@ -26,6 +28,7 @@ pub use library::{
     Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart, Template,
     TemplateId,
 };
+pub use literal::{Literal, QuotedLiteral};
 pub use node::{NodeKind, NodeRef, RelationKind, TableRef, TreeNode};
 pub use profile::{
     Params, PostgresParams, ProfileColor, ProfileError, ProfileSummary, Profiles, ResolvedProfile,
@@ -33,4 +36,5 @@ pub use profile::{
 };
 pub use result::{Column, PageRequest, ResultSet, Row, Sort, SortDir};
 pub use secret::Secret;
+pub use template::{BoundTemplate, Dialect, Placeholder, TemplateError};
 pub use value::Value;

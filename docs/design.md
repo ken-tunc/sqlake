@@ -124,21 +124,30 @@ that do not exist to state them.
 | --- | --- | --- |
 | SQL | `RawSql` → `ValidatedSql` → **`ApprovedQuery`** | Built: `sqlake-core` |
 | Connection info | `Profile` → **`ResolvedProfile`** | Built: `sqlake-config`, `sqlake-core` |
-| Templates | `Template` → `BoundTemplate` → **`RawSql`** | M7 |
+| Templates | `Template` → `BoundTemplate` → **`RawSql`** | Built: `sqlake-core` |
 
 A stage goes wherever the type that enforces it lives, which for SQL is `sqlake-core`: the
 guarantee *is* the signature of `Session::execute`, and a trait here cannot name a type from
 the crate above it. `Ident → QuotedIdent` is there for the same reason. The policy over it —
 what the budget is, and who is asked — stays in `sqlake-app` and `sqlake-config`.
 
-`PreparedSql` was to sit between the two, carrying bound parameters. There are none until
-templates arrive in M7, so it would hold nothing, and §15 says to add a stage only when
-skipping it would cause a real accident. M7 puts it back with something in it.
+`PreparedSql` was to sit between the two, carrying bound parameters. M7 was to put it back with
+something in it, and did not: a template's placeholders are **substituted, not bound**, because
+`ApprovedQuery` requires an estimate of the statement that runs and an estimate of
+`WHERE day > ?` is not an estimate of the query with the date in it — BigQuery prices a
+partitioned scan on the value. So there are no bound parameters to carry, `PreparedSql` would
+still hold nothing, and the stage M7 actually needed is `BoundTemplate`, which sits *before*
+`RawSql` rather than after `ValidatedSql`.
+
+What that moves onto the client is the quoting: a value becomes a `QuotedLiteral` and an
+identifier a `QuotedIdent`, by the rules of the connection it is going to, and neither type has
+a public constructor.
 
 The guarantees each stage carries:
 
 | Type | Invariant |
 | --- | --- |
+| `BoundTemplate` | Every placeholder answered, and each one quoted for the driver it is going to |
 | `ValidatedSql` | One statement, and nothing that runs off the end of the text |
 | `ApprovedQuery` | Estimated, and either inside the budget or answered for by a person |
 | `ResolvedProfile` | Secrets resolved from keyring or command; subject to `zeroize` |
