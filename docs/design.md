@@ -422,8 +422,10 @@ CREATE TABLE templates (
 );
 ```
 
-- The history tab searches incrementally through FTS5. Clicking a row writes it to a scratch
-  file; starring it promotes it to a template.
+- The history tab searches incrementally through FTS5. `u` puts the run under the cursor back
+  in a buffer — not a scratch file, which predates the SQL tab, and not a run: `r` runs it,
+  through the same estimate and the same budget it went through the first time. `Ctrl-s` keeps
+  it as a template, through the same dialog that names a buffer.
 - Templates carry `{{param}}` placeholders, staged like §4.1. Placeholders such as `{{table}}`
   are completed from the currently selected tree node.
 - **Failed queries are recorded too** — in a personal tool, the failures are the useful part.

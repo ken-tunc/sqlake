@@ -12,7 +12,7 @@ use sqlake_app::action::Action;
 use sqlake_app::snapshot::{ConnectionView, Snapshot};
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, ProfileId, QueryId, TabId};
-use sqlake_core::library::Template;
+use sqlake_core::library::{HistoryEntry, Template};
 use sqlake_core::node::TableRef;
 
 use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
@@ -340,6 +340,16 @@ pub const KEYMAP: &[KeyBinding] = &[
         keys: &[KeyCombo::new(KeyCode::Enter)],
         context: Context::Explorer,
         kind: IntentKind::PreviewTable,
+    },
+    // `u` for use, in the grid — where it reaches anything only in the
+    // history, the one grid whose rows are statements rather than somebody's
+    // data. Not `Enter`, which is already "look at this one" in every grid and
+    // is worth more here than anywhere: a statement too long for its column is
+    // exactly what the detail pane is for.
+    KeyBinding {
+        keys: &[key('u')],
+        context: Context::Grid,
+        kind: IntentKind::ReuseRun,
     },
     KeyBinding {
         keys: &[key('s')],
@@ -1423,6 +1433,9 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         IntentKind::Quit => vec![Action::Quit.into()],
         IntentKind::Palette => palette(event, ctx),
         IntentKind::UseTemplate => use_template(ctx),
+        IntentKind::ReuseRun => selected_run(ctx)
+            .map(|run| vec![ViewCmd::ReuseRun(run.id).into()])
+            .unwrap_or_default(),
         IntentKind::History => ctx
             .connection
             .map(|conn| vec![ViewCmd::OpenHistoryTab { conn }.into()])
@@ -1515,6 +1528,16 @@ fn use_template(ctx: &InputContext<'_>) -> Vec<Intent> {
 ///
 /// Nothing at all when there is nothing to save: a key that opened an empty
 /// "save as" over an empty buffer would be one that always appears to work.
+/// The run the history's grid has selected, when that is what is in front.
+fn selected_run<'a>(ctx: &InputContext<'a>) -> Option<&'a HistoryEntry> {
+    // Only from the history tab: the same selection on a preview is a cell of
+    // somebody's data, and a key that read it as a statement would be reading
+    // the wrong list.
+    ctx.searching()?;
+    let (row, ..) = ctx.selection?;
+    ctx.snapshot.history.data.ready()?.get(row)
+}
+
 fn save_template(ctx: &InputContext<'_>) -> Vec<Intent> {
     match ctx.palette.and_then(|open| open.saving_body()) {
         Some(body) => {
@@ -1530,14 +1553,18 @@ fn save_template(ctx: &InputContext<'_>) -> Vec<Intent> {
         // Not while the palette is already up for something else: `Ctrl-s`
         // there would replace what is on screen with a different errand.
         None if ctx.palette.is_some() => Vec::new(),
+        // What is in front: a SQL tab's buffer, or the run the history has
+        // selected. One key and one dialog either way — a second way to name a
+        // statement would be a second dialog to keep in step, and the one that
+        // never learns from the other's mistakes.
         None => ctx
             .active_tab
             .and_then(|id| ctx.tabs.iter().find(|t| t.id == id))
             .and_then(|tab| tab.sql())
+            .map(str::to_owned)
+            .or_else(|| selected_run(ctx).map(|run| run.sql.clone()))
             .filter(|sql| !sql.trim().is_empty())
-            .map(|sql| {
-                vec![ViewCmd::Palette(Some(crate::palette::Palette::saving(sql.to_owned()))).into()]
-            })
+            .map(|sql| vec![ViewCmd::Palette(Some(crate::palette::Palette::saving(sql))).into()])
             .unwrap_or_default(),
     }
 }
@@ -1774,6 +1801,20 @@ mod tests {
                 conn,
                 content: TabContent::Preview(TableRef::new(["public", "empty"])),
             },
+            // The history, so the sweep reaches the bindings that only fire
+            // there — and, just as much, so it sees the ones that must not.
+            OpenTab {
+                id: TabId::new(4),
+                conn,
+                content: TabContent::History {
+                    filter: Filter {
+                        text: String::new(),
+                        // Not editing: while it is, every letter is the box's
+                        // and none of the grid's bindings can be reached.
+                        editing: false,
+                    },
+                },
+            },
             // A SQL tab, so the sweep reaches the bindings that only fire on
             // one — and, just as much, so it sees the ones that must *not*
             // fire on one.
@@ -1833,7 +1874,25 @@ mod tests {
             // Something saved, so the palette's own bindings reach a
             // template rather than an empty list — a sweep over an empty
             // palette would report `Enter` dead.
-            history: sqlake_app::snapshot::HistoryView::default(),
+            // A run, so a binding that acts on the selected one reaches
+            // something.
+            history: sqlake_app::snapshot::HistoryView {
+                terms: String::new(),
+                data: sqlake_app::snapshot::LoadState::Ready(Arc::new(vec![
+                    sqlake_core::library::HistoryEntry {
+                        id: sqlake_core::library::RunId::new(1),
+                        connection: conn.to_string(),
+                        driver: Some(DriverKind::Mock),
+                        sql: "select * from public.users".to_owned(),
+                        started_at: time::OffsetDateTime::UNIX_EPOCH,
+                        status: Some("ok".to_owned()),
+                        duration_ms: Some(12),
+                        row_count: Some(3),
+                        bytes_processed: None,
+                        error: None,
+                    },
+                ])),
+            },
             templates: sqlake_app::snapshot::TemplatesView {
                 data: sqlake_app::snapshot::LoadState::Ready(Arc::new(vec![
                     sqlake_core::library::Template {
@@ -2164,6 +2223,50 @@ mod tests {
             on_key(press(KeyCode::Char('o')), &elsewhere).as_slice(),
             [Intent::View(ViewCmd::SetFilter(_))]
         ));
+    }
+
+    #[test]
+    fn a_run_is_put_back_from_the_history_and_from_nowhere_else() {
+        let f = fixture();
+        let mut history = f.ctx(PaneId::Grid);
+        history.active_tab = Some(TabId::new(4));
+        history.selection = Some((0, 0, 0, 0));
+        assert_eq!(
+            on_key(press(KeyCode::Char('u')), &history),
+            [Intent::View(ViewCmd::ReuseRun(
+                sqlake_core::library::RunId::new(1)
+            ))]
+        );
+
+        // The same selection on a preview is a cell of somebody's data, and a
+        // key that read it as a statement would be reading the wrong list.
+        let mut preview = f.ctx(PaneId::Grid);
+        preview.active_tab = Some(TabId::new(1));
+        preview.selection = Some((0, 0, 0, 0));
+        assert!(on_key(press(KeyCode::Char('u')), &preview).is_empty());
+    }
+
+    #[test]
+    fn keeping_a_run_is_the_same_dialog_that_keeps_a_buffer() {
+        // One key and one dialog for both — a second way to name a statement
+        // would be a second dialog to keep in step.
+        let f = fixture();
+        let mut history = f.ctx(PaneId::Grid);
+        history.active_tab = Some(TabId::new(4));
+        history.selection = Some((0, 0, 0, 0));
+
+        let out = on_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &history,
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Intent::View(ViewCmd::Palette(Some(palette)))]
+                    if palette.saving_body() == Some("select * from public.users")
+            ),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -3539,6 +3642,10 @@ mod tests {
                             c.modal_open = modal_open;
                             c.filter = filter;
                             c.active_tab = Some(tab);
+                            // A selected row, because the history's bindings
+                            // act on the run under the cursor and a sweep with
+                            // nothing selected would report them dead.
+                            c.selection = Some((0, 0, 0, 0));
                             out.push(c);
                             // Both stages of the palette: its bindings only
                             // fire while it is up, and its form answers keys

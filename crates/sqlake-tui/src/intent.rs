@@ -12,7 +12,7 @@
 
 use sqlake_app::action::Action;
 use sqlake_core::id::{ConnId, TabId};
-use sqlake_core::library::TemplateId;
+use sqlake_core::library::{RunId, TemplateId};
 use sqlake_core::node::TableRef;
 
 use crate::hit::{PaneId, SplitId, ToastId};
@@ -216,6 +216,12 @@ pub enum ViewCmd {
     /// Answer the form: bind the values and put the result in the buffer.
     SubmitTemplate,
 
+    /// Put a run from the history back where it can be run again.
+    ///
+    /// By id rather than by row: a row is a position in a list that the next
+    /// keystroke re-searches, and the run is what was pointed at.
+    ReuseRun(RunId),
+
     /// Save what the palette is holding, under the name typed into it.
     ///
     /// No payload: the palette has both halves, and passing them through here
@@ -291,6 +297,7 @@ intent_kinds! {
     CloseTab           => "close the tab",
     Palette            => "the saved statements",
     History            => "what this client has run",
+    ReuseRun           => "put a run back in a buffer",
     UseTemplate        => "use a saved statement",
     SaveTemplate       => "save a statement",
     DeleteTemplate     => "delete a saved statement",
@@ -350,6 +357,7 @@ impl IntentKind {
                 ViewCmd::Palette(Some(open)) if open.is_saving() => Self::SaveTemplate,
                 ViewCmd::Palette(_) => Self::Palette,
                 ViewCmd::CommitTemplate => Self::SaveTemplate,
+                ViewCmd::ReuseRun(_) => Self::ReuseRun,
                 // And picking is the other: the palette is open in order to
                 // reach this, and a form is a step on the way to it rather
                 // than a capability of its own.
