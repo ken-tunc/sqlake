@@ -241,6 +241,9 @@ intent_kinds! {
     OpenSqlTab         => "open a SQL tab",
     SelectTab          => "switch tabs",
     CloseTab           => "close the tab",
+    ListTemplates      => "list the saved statements",
+    SaveTemplate       => "save a statement",
+    DeleteTemplate     => "delete a saved statement",
     Cancel             => "stop what is running",
     DismissToast       => "dismiss a message",
     Quit               => "quit",
@@ -317,6 +320,11 @@ impl IntentKind {
                 Action::RunQuery { .. } | Action::EstimateQuery { .. } => Self::RunQuery,
                 Action::ApproveQuery(_) => Self::ApproveQuery,
                 Action::ForgetQuery(_) => Self::CloseTab,
+                Action::LoadTemplates => Self::ListTemplates,
+                // Editing one is saving it: the same capability, and one
+                // gesture in the pane that offers both.
+                Action::SaveTemplate(_) | Action::ReplaceTemplate { .. } => Self::SaveTemplate,
+                Action::DeleteTemplate(_) => Self::DeleteTemplate,
                 Action::Cancel(_) => Self::Cancel,
                 Action::Quit => Self::Quit,
             },

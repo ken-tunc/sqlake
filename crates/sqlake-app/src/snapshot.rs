@@ -10,6 +10,7 @@ use std::time::Instant;
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::detail::TableDetail;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
+use sqlake_core::library::Template;
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
 use sqlake_core::result::Sort;
@@ -21,9 +22,10 @@ use crate::store::Dispatched;
 use crate::tree::{TreeView, VisibleNode};
 
 /// Something that is fetched asynchronously.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LoadState<T> {
     /// Not requested yet.
+    #[default]
     Idle,
     Loading,
     Ready(T),
@@ -199,6 +201,20 @@ pub struct DefinitionView {
     pub data: LoadState<Arc<TableDetail>>,
 }
 
+/// The saved templates, and what the last write made of them.
+///
+/// One view rather than a list and an error beside it: a failed save leaves
+/// the list exactly as it was, and a front-end that has to draw both wants
+/// them from one place or it will draw a stale list under a fresh error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TemplatesView {
+    pub data: LoadState<Arc<Vec<Template>>>,
+    /// Why the last write did not happen. Cleared when the next one starts,
+    /// so it says something about the attempt somebody just made rather than
+    /// about the session.
+    pub failed: Option<String>,
+}
+
 /// What a busy item is waiting for.
 ///
 /// Cancelling abandons a reply that will now never arrive, so something has to
@@ -208,10 +224,24 @@ pub struct DefinitionView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusyOwner {
     Connection(ConnId),
-    Node { conn: ConnId, node: NodeRef },
-    Preview { conn: ConnId, table: TableRef },
-    Definition { conn: ConnId, table: TableRef },
+    Node {
+        conn: ConnId,
+        node: NodeRef,
+    },
+    Preview {
+        conn: ConnId,
+        table: TableRef,
+    },
+    Definition {
+        conn: ConnId,
+        table: TableRef,
+    },
     Query(QueryId),
+    /// Reading or writing the library. One owner for all of it: the file is
+    /// one thing, the answer is always the whole list, and a write that lands
+    /// while a read is in flight would otherwise be two owners disagreeing
+    /// about which list is current.
+    Templates,
 }
 
 /// A running, cancellable operation.
@@ -250,6 +280,7 @@ pub struct Snapshot {
     /// Newest last, the order they were started in.
     pub queries: Vec<QueryView>,
     pub busy: Vec<BusyItem>,
+    pub templates: TemplatesView,
     pub should_quit: bool,
 }
 
@@ -333,6 +364,15 @@ impl Snapshot {
         !self.busy.iter().any(
             |b| matches!(&b.owner, BusyOwner::Preview { conn: c, table: t } if *c == conn && t == table),
         )
+    }
+
+    /// Whether the store has finished reading or writing the library.
+    #[must_use]
+    pub fn templates_settled(&self) -> bool {
+        !self
+            .busy
+            .iter()
+            .any(|b| matches!(b.owner, BusyOwner::Templates))
     }
 
     /// Whether the store has finished describing this relation.

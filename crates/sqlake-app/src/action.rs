@@ -19,6 +19,7 @@
 use std::fmt;
 
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
+use sqlake_core::library::{NewTemplate, TemplateId};
 use sqlake_core::node::{NodeRef, TableRef};
 
 /// Identifies one long-running operation, so it can be shown and cancelled.
@@ -167,6 +168,24 @@ pub enum Action {
     /// Cancel a running operation.
     Cancel(BusyId),
 
+    /// Read the saved templates.
+    ///
+    /// Asked for rather than loaded at startup: a client that never opens the
+    /// palette never needs them, and reading a file on the way to the first
+    /// frame is a file read in front of somebody waiting for a screen.
+    LoadTemplates,
+
+    /// Save a statement under a name.
+    SaveTemplate(NewTemplate),
+
+    /// Overwrite one, keeping when it was written.
+    ReplaceTemplate {
+        id: TemplateId,
+        with: NewTemplate,
+    },
+
+    DeleteTemplate(TemplateId),
+
     Quit,
 }
 
@@ -197,6 +216,10 @@ impl fmt::Display for Action {
             Self::ApproveQuery(id) => write!(f, "approve({})", id.short()),
             Self::ForgetQuery(id) => write!(f, "forget_query({})", id.short()),
             Self::Cancel(id) => write!(f, "cancel({})", id.get()),
+            Self::LoadTemplates => f.write_str("load_templates"),
+            Self::SaveTemplate(template) => write!(f, "save_template({})", template.name),
+            Self::ReplaceTemplate { id, .. } => write!(f, "replace_template({id})"),
+            Self::DeleteTemplate(id) => write!(f, "delete_template({id})"),
             Self::Quit => f.write_str("quit"),
         }
     }

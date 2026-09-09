@@ -16,7 +16,7 @@ use std::time::Instant;
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
-use sqlake_core::library::Library;
+use sqlake_core::library::{Library, LibraryResult, Template};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
@@ -26,11 +26,17 @@ use tokio::task::AbortHandle;
 
 use crate::action::{Action, BusyId};
 use crate::error::{AppError, AppResult};
+
+/// What a session with no library says instead of a list.
+///
+/// A message rather than an empty list: nothing was saved *and* nothing can
+/// be, and the two look identical in a pane that draws no rows.
+const NOTHING_KEPT: &str = "this session is not keeping anything";
 use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
     BusyItem, BusyOwner, ConnStatus, ConnectionView, DefinitionView, LoadState, PreviewView,
-    QueryView, Snapshot,
+    QueryView, Snapshot, TemplatesView,
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
@@ -180,6 +186,7 @@ impl Store {
             page_size: page_size.max(1),
             budget,
             library,
+            templates: TemplatesView::default(),
             events: event_tx,
             conns: Vec::new(),
             previews: Vec::new(),
@@ -265,6 +272,16 @@ enum Event {
         table: TableRef,
         busy: BusyId,
         result: AppResult<sqlake_core::detail::TableDetail>,
+    },
+    /// The library answered, and the answer is always the whole list: a write
+    /// is followed by a read in the same trip to the file, because another
+    /// window may have changed it too and the list is what a pane draws.
+    Library {
+        busy: BusyId,
+        /// `Err` here is the *write* failing. A read that failed leaves the
+        /// list alone and is reported in its place.
+        wrote: Result<(), String>,
+        result: AppResult<Vec<Template>>,
     },
     Previewed {
         conn: ConnId,
@@ -396,11 +413,8 @@ struct Runtime {
     /// Held here rather than reached for at each use so that "nothing is being
     /// kept" is one branch in one place. Every call on it blocks, so every
     /// call on it goes through `spawn_blocking`.
-    #[expect(
-        dead_code,
-        reason = "T3 saves templates through it and T6 records runs; T1 is the wiring"
-    )]
     library: Option<Arc<dyn Library>>,
+    templates: TemplatesView,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     previews: Vec<Preview>,
@@ -539,6 +553,24 @@ impl Runtime {
             Action::EstimateQuery { conn, query, sql } => self.estimate_query(conn, query, sql),
             Action::ApproveQuery(query) => self.approve_query(query),
             Action::ForgetQuery(query) => self.forget_query(query),
+            Action::LoadTemplates => self.with_library(None, |_| Ok(())),
+            Action::SaveTemplate(template) => {
+                let name = template.name.clone();
+                self.with_library(Some(format!("saving {name}")), move |library| {
+                    library.add(template).map(|_| ())
+                });
+            }
+            Action::ReplaceTemplate { id, with } => {
+                let name = with.name.clone();
+                self.with_library(Some(format!("saving {name}")), move |library| {
+                    library.replace(id, with).map(|_| ())
+                });
+            }
+            Action::DeleteTemplate(id) => {
+                self.with_library(Some("deleting a template".to_owned()), move |library| {
+                    library.remove(id)
+                });
+            }
             Action::Cancel(id) => self.cancel(id),
             Action::Quit => self.should_quit = true,
         }
@@ -645,6 +677,10 @@ impl Runtime {
                 BusyOwner::Query(query) => {
                     self.queries.iter().any(|q| q.id == *query && q.conn == id)
                 }
+                // Templates belong to the session, not to a connection: they
+                // are the same file whichever database is open, and closing
+                // one is no reason to abandon a save.
+                BusyOwner::Templates => false,
             })
             .map(|b| (b.id, b.owner.clone()))
             .collect();
@@ -1250,6 +1286,77 @@ impl Runtime {
     /// more, which is what that flag says.
     ///
     /// [`Capabilities::cancel`]: sqlake_core::capability::Capabilities::cancel
+    /// Every library operation is a write, then a read, on one blocking task.
+    ///
+    /// The read happens even when nothing was written, and even when the write
+    /// failed: the file is shared with whatever else is running against it, so
+    /// the list a pane draws has to be the file's rather than this session's
+    /// idea of what it did to it. Doing both inside one `spawn_blocking` is
+    /// what keeps that to one trip.
+    ///
+    /// No use case for these. The layer above exists to make a skipped step a
+    /// compile error — `RawSql` → `ValidatedSql` → `ApprovedQuery` — and there
+    /// is no pipeline here to skip a step of.
+    fn with_library(
+        &mut self,
+        label: Option<String>,
+        write: impl FnOnce(&dyn Library) -> LibraryResult<()> + Send + 'static,
+    ) {
+        let Some(library) = self.library.clone() else {
+            // Said once, in the place the list would be. A session with no
+            // library is one where saving cannot work, and a pane that drew an
+            // empty list would be claiming there is nothing saved.
+            self.templates.data = LoadState::Failed(NOTHING_KEPT.to_owned());
+            return;
+        };
+        self.templates.failed = None;
+        if self.templates.data.ready().is_none() {
+            self.templates.data = LoadState::Loading;
+        }
+
+        let busy = self.begin_busy(
+            BusyOwner::Templates,
+            label.unwrap_or_else(|| "reading templates".to_owned()),
+        );
+        let events = self.events.clone();
+        self.spawn_task(busy, async move {
+            let answer = tokio::task::spawn_blocking(move || {
+                let wrote = write(library.as_ref()).map_err(|why| why.to_string());
+                (wrote, library.templates())
+            })
+            .await;
+            let (wrote, result) = match answer {
+                Ok((wrote, read)) => (wrote, read.map_err(AppError::from)),
+                // The blocking pool dropped the task, which here means the
+                // runtime is going down. Nothing else knows that, so it is
+                // reported rather than left as a spinner.
+                Err(why) => (
+                    Err(why.to_string()),
+                    Err(AppError::Refused(why.to_string())),
+                ),
+            };
+            let _ = events.send(Event::Library {
+                busy,
+                wrote,
+                result,
+            });
+        });
+    }
+
+    fn library_answered(
+        &mut self,
+        busy: BusyId,
+        wrote: Result<(), String>,
+        result: AppResult<Vec<Template>>,
+    ) {
+        self.end_busy(busy);
+        self.templates.failed = wrote.err();
+        self.templates.data = match result {
+            Ok(templates) => LoadState::Ready(Arc::new(templates)),
+            Err(why) => LoadState::Failed(why.user_message()),
+        };
+    }
+
     fn drop_task(&mut self, id: BusyId) {
         if let Some(handle) = self.tasks.remove(&id) {
             handle.abort();
@@ -1287,6 +1394,16 @@ impl Runtime {
                 if let Some(conn) = self.conn_mut(*conn) {
                     conn.tree.finish_load(node, Err(reason.to_owned()));
                     conn.view = Arc::new(conn.tree.flatten(conn.id));
+                }
+            }
+            BusyOwner::Templates => {
+                self.templates.failed = Some(reason.to_owned());
+                // A list that was on screen stays on screen: a cancelled read
+                // did not make it wrong. One that never arrived has to say
+                // something, or the pane spins for an answer nobody is
+                // bringing.
+                if self.templates.data.is_loading() {
+                    self.templates.data = LoadState::Failed(reason.to_owned());
                 }
             }
             BusyOwner::Query(id) => {
@@ -1372,6 +1489,11 @@ impl Runtime {
                 self.end_busy(busy);
                 self.previewed(conn, table, page, result);
             }
+            Event::Library {
+                busy,
+                wrote,
+                result,
+            } => self.library_answered(busy, wrote, result),
         }
     }
 
@@ -1603,6 +1725,7 @@ impl Runtime {
             definitions: self.definitions.clone(),
             queries: self.queries.clone(),
             busy: self.busy.clone(),
+            templates: self.templates.clone(),
             should_quit: self.should_quit,
         }
     }
@@ -1723,6 +1846,123 @@ mod tests {
             .dispatch_and_settle(action, std::time::Duration::from_secs(5), done)
             .await
             .expect("the condition never held")
+    }
+
+    /// A store with a library in memory — the real one, with no file.
+    fn store_keeping() -> Store {
+        Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(MockProfiles::default()),
+            )
+            .library(Arc::new(
+                sqlake_library::Sqlite::in_memory().expect("a library opens"),
+            )),
+        )
+    }
+
+    fn new_template(name: &str) -> sqlake_core::library::NewTemplate {
+        sqlake_core::library::NewTemplate {
+            name: name.to_owned(),
+            body: "select * from {{ident:table}}".to_owned(),
+            driver: None,
+            tags: Vec::new(),
+        }
+    }
+
+    async fn library_settled(store: &Store, action: Action) -> Arc<Snapshot> {
+        settled(store, action, Snapshot::templates_settled).await
+    }
+
+    fn saved(snap: &Snapshot) -> Vec<String> {
+        snap.templates
+            .data
+            .ready()
+            .expect("a list")
+            .iter()
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_saved_template_is_in_the_next_snapshot() {
+        // Saved and listed in one trip to the file: the write is followed by a
+        // read, so a front-end never has to guess what the file now holds.
+        let store = store_keeping();
+        let snap = library_settled(&store, Action::SaveTemplate(new_template("daily"))).await;
+        assert_eq!(saved(&snap), ["daily"]);
+        assert_eq!(snap.templates.failed, None);
+    }
+
+    #[tokio::test]
+    async fn a_name_already_taken_is_reported_without_losing_the_list() {
+        let store = store_keeping();
+        library_settled(&store, Action::SaveTemplate(new_template("daily"))).await;
+        let snap = library_settled(&store, Action::SaveTemplate(new_template("daily"))).await;
+
+        let why = snap.templates.failed.as_deref().expect("a reason");
+        assert!(why.contains("daily"), "{why}");
+        assert_eq!(
+            saved(&snap),
+            ["daily"],
+            "a refused save should not have disturbed what is there"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reason_a_write_failed_does_not_outlive_the_next_one() {
+        // It is about the attempt somebody just made, not about the session.
+        let store = store_keeping();
+        library_settled(&store, Action::SaveTemplate(new_template("daily"))).await;
+        library_settled(&store, Action::SaveTemplate(new_template("daily"))).await;
+        let snap = library_settled(&store, Action::SaveTemplate(new_template("weekly"))).await;
+        assert_eq!(snap.templates.failed, None);
+        assert_eq!(saved(&snap).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn editing_and_deleting_go_through_the_file() {
+        let store = store_keeping();
+        let snap = library_settled(&store, Action::SaveTemplate(new_template("first"))).await;
+        let id = snap.templates.data.ready().expect("a list")[0].id;
+
+        let snap = library_settled(
+            &store,
+            Action::ReplaceTemplate {
+                id,
+                with: new_template("second"),
+            },
+        )
+        .await;
+        assert_eq!(saved(&snap), ["second"]);
+
+        let snap = library_settled(&store, Action::DeleteTemplate(id)).await;
+        assert!(saved(&snap).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_session_keeping_nothing_says_so_rather_than_showing_an_empty_list() {
+        // Nothing was saved *and* nothing can be, which a pane drawing no rows
+        // would report as "you have no templates".
+        let store = store(Behaviour::instant());
+        let snap = library_settled(&store, Action::LoadTemplates).await;
+        assert_eq!(snap.templates.data.error(), Some(NOTHING_KEPT));
+        assert!(snap.templates.data.ready().is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_a_connection_leaves_the_templates_alone() {
+        // They belong to the session and not to a database: the same file
+        // whichever connection is open.
+        let (store, conn) = connected(store_keeping()).await;
+        let snap = library_settled(&store, Action::SaveTemplate(new_template("kept"))).await;
+        assert_eq!(saved(&snap), ["kept"]);
+
+        let snap = settled(&store, Action::Disconnect(conn), |s| {
+            s.connections.iter().all(|c| !c.is_live())
+        })
+        .await;
+        assert_eq!(saved(&snap), ["kept"]);
     }
 
     fn preview_of<'a>(snap: &'a Snapshot, conn: ConnId, table: &TableRef) -> &'a PreviewView {

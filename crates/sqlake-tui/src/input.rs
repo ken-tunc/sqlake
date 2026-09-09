@@ -1290,6 +1290,14 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|t| vec![ViewCmd::DismissToast(t.id).into()])
             .unwrap_or_default(),
         IntentKind::Quit => vec![Action::Quit.into()],
+        // No key yet: the palette these belong to arrives in T4, and a
+        // binding that produced a save with nothing to save it from would be
+        // a key that does nothing. `IntentKind::of` still has to name them,
+        // which is what will make the palette's own bindings a compile-time
+        // question rather than something to remember.
+        IntentKind::ListTemplates | IntentKind::SaveTemplate | IntentKind::DeleteTemplate => {
+            Vec::new()
+        }
     }
 }
 
@@ -1545,6 +1553,7 @@ mod tests {
                 label: "loading".into(),
                 started_at: std::time::Instant::now(),
             }],
+            templates: sqlake_app::snapshot::TemplatesView::default(),
             should_quit: false,
         };
 

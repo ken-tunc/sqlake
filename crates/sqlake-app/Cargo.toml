@@ -22,5 +22,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 sqlake-driver-mock.workspace = true
+# The real library, in memory. A second implementation of `Library` written
+# for tests would be a second set of answers to drift from the file's.
+sqlake-library.workspace = true
 time = { workspace = true, features = ["macros"] }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
