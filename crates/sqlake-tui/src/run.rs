@@ -375,6 +375,7 @@ fn context<'a>(ui: &'a UiState, snapshot: &'a Snapshot) -> InputContext<'a> {
         active_tab: ui.active_tab,
         toasts: &ui.toasts,
         filter: ui.filter.as_ref(),
+        palette: ui.palette.as_ref(),
     }
 }
 
@@ -639,6 +640,22 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
     // Toasts first so a dialog covers them: a message drawn over the thing
     // waiting for an answer hides the answer.
     overlay::toasts(frame, hits, body_of(frames), &ui.toasts);
+    // Above them and below a dialog: the palette is a thing being operated,
+    // and a question that has to be answered belongs on top of it.
+    if let Some(palette) = ui.palette.clone() {
+        crate::palette::render(
+            frame,
+            hits,
+            area,
+            &palette,
+            snapshot
+                .templates
+                .data
+                .ready()
+                .map_or(&[][..], |held| held.as_slice()),
+            snapshot.templates.data.error(),
+        );
+    }
     if let Some(dialog) = ui.modal.clone() {
         overlay::modal(frame, hits, area, &dialog);
     }

@@ -33,6 +33,7 @@ use crate::definition::Laid;
 use sqlake_app::tree::TreeView;
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, QueryId, TabId};
+use sqlake_core::library::TemplateId;
 use sqlake_core::node::TableRef;
 use sqlake_core::result::Sort;
 
@@ -400,6 +401,9 @@ pub struct UiState {
     next_sql: u32,
     pub toasts: Vec<Toast>,
     next_toast: u64,
+    /// The palette, while it is up. It holds the keyboard, so its presence is
+    /// what `Context::Palette` is.
+    pub palette: Option<crate::palette::Palette>,
     /// The last error already raised for each preview, so that a redraw does
     /// not raise it again — only a *new* message does.
     reported_preview_errors: HashMap<(ConnId, TableRef), String>,
@@ -845,6 +849,168 @@ impl UiState {
         }
     }
 
+    /// Put a template in the buffer, or ask for what it needs first.
+    ///
+    /// Which of the two is a fact about the template rather than about the
+    /// gesture, so one command covers both: somebody picking a saved statement
+    /// is aiming at the buffer either way.
+    fn use_template(&mut self, id: TemplateId, snapshot: &Snapshot) {
+        let Some(template) = snapshot
+            .templates
+            .data
+            .ready()
+            .and_then(|held| held.iter().find(|t| t.id == id))
+            .cloned()
+        else {
+            return;
+        };
+        let dialect = self.dialect(snapshot);
+        match sqlake_core::template::placeholders(&template.body, dialect) {
+            Ok(placeholders) if placeholders.is_empty() => {
+                self.palette = None;
+                self.insert(template.body, snapshot);
+            }
+            Ok(placeholders) => {
+                // What the explorer has selected answers `{{ident:table}}`
+                // before anybody types — shown and editable, because a guess
+                // about what somebody meant is only ever a guess.
+                let selected = self.selected_table(snapshot);
+                if let Some(palette) = &mut self.palette {
+                    palette.asking = Some(crate::palette::Form::new(
+                        id,
+                        template.name.clone(),
+                        placeholders,
+                        &|placeholder| {
+                            (placeholder.kind == sqlake_core::template::Kind::Ident
+                                && placeholder.name == "table")
+                                .then(|| selected.clone())
+                                .flatten()
+                        },
+                    ));
+                }
+            }
+            // A template whose body cannot be read at all — an unterminated
+            // string in it, or a `{{` inside one. Said where the palette is
+            // rather than as a toast: it is about the thing under the cursor.
+            Err(why) => {
+                if let Some(palette) = &mut self.palette {
+                    palette.asking = Some(crate::palette::Form {
+                        template: id,
+                        name: template.name.clone(),
+                        fields: Vec::new(),
+                        at: 0,
+                        failed: Some(why.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Bind what the form holds and put the result in the buffer.
+    fn submit_template(&mut self, snapshot: &Snapshot) {
+        let Some(form) = self.palette.as_ref().and_then(|p| p.asking.clone()) else {
+            return;
+        };
+        let Some(body) = snapshot
+            .templates
+            .data
+            .ready()
+            .and_then(|held| held.iter().find(|t| t.id == form.template))
+            .map(|t| t.body.clone())
+        else {
+            return;
+        };
+        let dialect = self.dialect(snapshot);
+        match sqlake_core::template::BoundTemplate::bind(&body, &form.values(), dialect) {
+            Ok(bound) => {
+                self.palette = None;
+                self.insert(bound.text().to_owned(), snapshot);
+            }
+            // Stays open with the reason on it: the answers are still there to
+            // be corrected, which is the whole reason binding happens before
+            // the text reaches the buffer.
+            Err(why) => {
+                if let Some(asking) = self.palette.as_mut().and_then(|p| p.asking.as_mut()) {
+                    asking.failed = Some(why.to_string());
+                }
+            }
+        }
+    }
+
+    /// Put a statement where it can be run.
+    ///
+    /// Into the active SQL tab when it is empty, and into a new one otherwise.
+    /// Never over something already written: there is no editor here and so no
+    /// undo, and a template that replaced a half-written query would be a
+    /// keystroke that destroys work. Appending instead would make two
+    /// statements out of one, which `ValidatedSql` then refuses.
+    fn insert(&mut self, text: String, snapshot: &Snapshot) {
+        let empty = self.active_tab.filter(|id| {
+            self.buffer_of(*id)
+                .is_some_and(|held| held.trim().is_empty())
+        });
+        if let Some(tab) = empty {
+            self.set_buffer(tab, text);
+            return;
+        }
+        let Some(conn) = self.connection_for_a_new_tab(snapshot) else {
+            self.warn("nothing is connected to run a statement on");
+            return;
+        };
+        let _ = self.apply(ViewCmd::OpenSqlTab { conn }, snapshot);
+        if let Some(tab) = self.active_tab {
+            self.set_buffer(tab, text);
+        }
+    }
+
+    /// The connection a new SQL tab would open on: the active tab's, or the
+    /// first live one. A template is about a statement, not about a tab, so
+    /// picking one is better than refusing when there is an obvious answer.
+    fn connection_for_a_new_tab(&self, snapshot: &Snapshot) -> Option<ConnId> {
+        self.active_tab
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+            .map(|t| t.conn)
+            .filter(|conn| {
+                snapshot
+                    .connection(*conn)
+                    .is_some_and(ConnectionView::is_live)
+            })
+            .or_else(|| {
+                snapshot
+                    .connections
+                    .iter()
+                    .find(|c| c.is_live())
+                    .map(|c| c.id)
+            })
+    }
+
+    /// How the connection the statement is going to quotes things.
+    ///
+    /// The active tab's connection, falling back to PostgreSQL's rules. A
+    /// fallback is needed because a palette can be opened with nothing
+    /// connected, and the alternative — refusing to fill in a template until
+    /// something is — would be a rule about quoting standing in the way of
+    /// writing a statement.
+    fn dialect(&self, snapshot: &Snapshot) -> sqlake_core::template::Dialect {
+        self.active_tab
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+            .and_then(|tab| snapshot.connection(tab.conn))
+            .and_then(|c| c.capabilities.as_ref())
+            .map_or(
+                sqlake_core::template::Dialect {
+                    quote_style: sqlake_core::capability::QuoteStyle::DoubleQuote,
+                    escaping: sqlake_core::capability::Escaping::None,
+                },
+                sqlake_core::template::Dialect::from,
+            )
+    }
+
+    /// The relation the explorer has selected, as a dotted name.
+    fn selected_table(&self, snapshot: &Snapshot) -> Option<String> {
+        let row = snapshot.explorer.nodes.get(self.tree.selected?)?;
+        row.node_ref.as_table().map(|table| table.to_string())
+    }
+
     /// A passing notice, for something that went differently rather than
     /// wrongly.
     pub fn warn(&mut self, text: impl Into<String>) {
@@ -1070,6 +1236,9 @@ impl UiState {
                 }
             }
             ViewCmd::DismissToast(id) => self.toasts.retain(|t| t.id != id),
+            ViewCmd::Palette(open) => self.palette = open,
+            ViewCmd::UseTemplate(id) => self.use_template(id, snapshot),
+            ViewCmd::SubmitTemplate => self.submit_template(snapshot),
         }
         None
     }
@@ -2209,6 +2378,197 @@ mod tests {
         );
         // Twenty lines in a pane four tall: sixteen is the last screenful.
         assert_eq!(ui.sql_offset(), 16);
+    }
+
+    fn with_templates(mut snap: Snapshot, bodies: &[(&str, &str)]) -> Snapshot {
+        snap.templates = sqlake_app::snapshot::TemplatesView {
+            data: LoadState::Ready(Arc::new(
+                bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(at, (name, body))| sqlake_core::library::Template {
+                        id: sqlake_core::library::TemplateId::new(at as i64 + 1),
+                        name: (*name).to_owned(),
+                        body: (*body).to_owned(),
+                        driver: None,
+                        tags: Vec::new(),
+                        created_at: time::OffsetDateTime::UNIX_EPOCH,
+                        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                    })
+                    .collect(),
+            )),
+            failed: None,
+        };
+        snap
+    }
+
+    fn template_id(snap: &Snapshot, name: &str) -> sqlake_core::library::TemplateId {
+        snap.templates
+            .data
+            .ready()
+            .expect("a list")
+            .iter()
+            .find(|t| t.name == name)
+            .expect("that template")
+            .id
+    }
+
+    #[test]
+    fn a_template_with_nothing_to_fill_in_goes_straight_to_the_buffer() {
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[("plain", "select 1")]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+
+        let _ = ui.apply(ViewCmd::UseTemplate(template_id(&snap, "plain")), &snap);
+        assert_eq!(ui.active_sql(), Some("select 1"));
+        assert!(ui.palette.is_none(), "it is done, so it closes");
+    }
+
+    #[test]
+    fn a_template_with_placeholders_asks_before_the_buffer_sees_it() {
+        // The whole reason `BoundTemplate` exists: an unanswered `{{table}}`
+        // reaching the buffer is a syntax error against text nobody wrote.
+        let conn = ConnId::new();
+        let snap = with_templates(
+            snapshot(conn, 3, 10, 3),
+            &[("by table", "select * from {{ident:table}} where x = {{x}}")],
+        );
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::UseTemplate(template_id(&snap, "by table")), &snap);
+
+        let form = ui
+            .palette
+            .as_ref()
+            .and_then(|p| p.asking.as_ref())
+            .expect("a form");
+        assert_eq!(
+            form.fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["table", "x"]
+        );
+        assert_eq!(ui.active_sql(), Some(""), "nothing reaches the buffer yet");
+    }
+
+    #[test]
+    fn answering_the_form_quotes_by_what_each_answer_is() {
+        let conn = ConnId::new();
+        let snap = with_templates(
+            snapshot(conn, 3, 10, 3),
+            &[(
+                "by table",
+                "select * from {{ident:table}} where name = {{name}}",
+            )],
+        );
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::UseTemplate(template_id(&snap, "by table")), &snap);
+
+        if let Some(form) = ui.palette.as_mut().and_then(|p| p.asking.as_mut()) {
+            form.fields[0].value = "users".to_owned();
+            form.fields[1].value = "o'brien".to_owned();
+        }
+        let _ = ui.apply(ViewCmd::SubmitTemplate, &snap);
+
+        assert_eq!(
+            ui.active_sql(),
+            Some(r#"select * from "users" where name = 'o''brien'"#)
+        );
+        assert!(ui.palette.is_none());
+    }
+
+    #[test]
+    fn a_template_never_writes_over_what_is_already_in_a_buffer() {
+        // There is no editor here and so no undo: a keystroke that replaced a
+        // half-written query would destroy work with nothing to get it back.
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[("plain", "select 1")]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let started = ui.active_tab.expect("a tab");
+        ui.set_buffer(started, "select mine".to_owned());
+
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::UseTemplate(template_id(&snap, "plain")), &snap);
+
+        assert_eq!(ui.buffer_of(started), Some("select mine"));
+        assert_eq!(ui.active_sql(), Some("select 1"));
+        assert_ne!(ui.active_tab, Some(started), "it opened its own tab");
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_read_says_so_in_the_palette() {
+        // Not a toast: it is about the row under the cursor, and the palette
+        // is where that row is.
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[("broken", "select '{{x}}'")]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::UseTemplate(template_id(&snap, "broken")), &snap);
+
+        let form = ui
+            .palette
+            .as_ref()
+            .and_then(|p| p.asking.as_ref())
+            .expect("a form");
+        assert!(form.failed.is_some(), "{form:?}");
+        assert_eq!(ui.active_sql(), Some(""));
+    }
+
+    #[test]
+    fn the_relation_the_explorer_is_on_answers_the_table_placeholder() {
+        let conn = ConnId::new();
+        let mut snap = with_templates(
+            snapshot(conn, 1, 10, 3),
+            &[("by table", "select * from {{ident:table}}")],
+        );
+        let rows = Arc::get_mut(&mut snap.explorer).expect("sole owner");
+        rows.nodes.push(VisibleNode {
+            conn,
+            depth: 1,
+            label: "users".into(),
+            node_ref: NodeRef::new(NodeKind::Relation, ["public", "users"]),
+            relation_kind: Some(sqlake_core::node::RelationKind::Table),
+            state: NodeState::Leaf,
+        });
+
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(ViewCmd::SelectTreeRow(1), &snap);
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+        let _ = ui.apply(ViewCmd::UseTemplate(template_id(&snap, "by table")), &snap);
+
+        let form = ui
+            .palette
+            .as_ref()
+            .and_then(|p| p.asking.as_ref())
+            .expect("a form");
+        assert_eq!(form.fields[0].value, "public.users");
     }
 
     #[test]
