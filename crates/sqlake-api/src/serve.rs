@@ -28,7 +28,8 @@ use sqlake_core::template::{BoundTemplate, Dialect};
 use crate::page::{Budget, Page};
 use crate::protocol::{Failure, Request, Response, schema};
 use crate::snapshot::{
-    ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo, StatementInfo, TemplateInfo,
+    ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, RunInfo, SessionInfo, StatementInfo,
+    TemplateInfo,
 };
 
 /// How long a request waits for the store before giving up.
@@ -148,6 +149,10 @@ impl Service {
                 .unwrap_or_else(Response::Failed),
             Request::QueryCancel { query } => self
                 .query_cancel(query)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::HistorySearch { terms, limit } => self
+                .history(terms, *limit)
                 .await
                 .unwrap_or_else(Response::Failed),
             Request::TemplateList {} => self.templates().await.unwrap_or_else(Response::Failed),
@@ -560,6 +565,44 @@ impl Service {
         }
     }
 
+    /// What this session has run, newest first.
+    ///
+    /// Through the store, like everything else that touches the library: the
+    /// person with the pane open and the agent asking are looking at one file,
+    /// and a search that ran here would be a second implementation for the
+    /// screen's to disagree with.
+    async fn history(&self, terms: &str, limit: Option<usize>) -> Result<Response, Failure> {
+        let settled = self
+            .dispatch_and_settle(
+                Action::SearchHistory {
+                    terms: terms.to_owned(),
+                },
+                Snapshot::history_settled,
+            )
+            .await?;
+        match &settled.history.data {
+            LoadState::Ready(found) => Ok(Response::Runs(
+                found
+                    .iter()
+                    // Only ever downward: the store's own ceiling is what the
+                    // pane reads, and a request that could raise it would be
+                    // the protection asking permission from the party it
+                    // protects against.
+                    .take(limit.unwrap_or(usize::MAX))
+                    .map(RunInfo::from)
+                    .collect(),
+            )),
+            // Including "this session is not keeping anything", which is the
+            // honest answer and not an empty history.
+            LoadState::Failed(why) => Err(Failure::Unsupported {
+                message: why.clone(),
+            }),
+            _ => Err(Failure::Timeout {
+                waited_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+            }),
+        }
+    }
+
     /// Every saved statement, with what each one asks for.
     ///
     /// Read through the store rather than opening the file here, for the same
@@ -873,6 +916,60 @@ mod tests {
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
         service_of(MockDriver::new(behaviour)).await
+    }
+
+    /// A service whose history holds one finished run.
+    ///
+    /// Seeded rather than run: recording is deliberately off the query's path,
+    /// so a run answered through this service is not a row that exists yet.
+    async fn service_that_ran() -> Service {
+        use sqlake_core::library::Library as _;
+
+        let library = sqlake_library::Sqlite::in_memory().expect("a library opens");
+        let id = library
+            .started(sqlake_core::library::RunStart {
+                connection: ConnId::new(),
+                driver: sqlake_core::capability::DriverKind::Mock,
+                sql: "select * from public.users".to_owned(),
+                started_at: time::OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("it records");
+        library
+            .settled(
+                id,
+                sqlake_core::library::RunOutcome::Failed {
+                    duration_ms: 12,
+                    message: "syntax error".to_owned(),
+                },
+            )
+            .expect("it settles");
+        // And one that worked, because a failure carries neither a row count
+        // nor a byte count and both are fields this surface can send.
+        let id = library
+            .started(sqlake_core::library::RunStart {
+                connection: ConnId::new(),
+                driver: sqlake_core::capability::DriverKind::Mock,
+                sql: "select 1".to_owned(),
+                started_at: time::OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("it records");
+        library
+            .settled(
+                id,
+                sqlake_core::library::RunOutcome::Ok {
+                    duration_ms: 3,
+                    row_count: Some(1),
+                    bytes_processed: Some(4096),
+                },
+            )
+            .expect("it settles");
+        Service::new(Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(MockProfiles::default()),
+            )
+            .library(Arc::new(library)),
+        ))
     }
 
     /// A service whose session keeps these templates.
@@ -1479,6 +1576,18 @@ mod tests {
                 .await,
         );
 
+        // A run that has ended, so `Runs` is written with the fields that are
+        // skipped while one is still going.
+        responses.push(
+            service_that_ran()
+                .await
+                .answer(&Request::HistorySearch {
+                    terms: String::new(),
+                    limit: None,
+                })
+                .await,
+        );
+
         // A template and a statement built from one, which need a session
         // that keeps something.
         let (keeping, _) = service_keeping(&[("daily", "select * from {{ident:table}}")]).await;
@@ -1663,12 +1772,14 @@ mod tests {
             "data",
             "default",
             "driver",
+            "duration_ms",
             "error",
             // A query's own vocabulary. `sql` is the statement the caller
             // sent back to it, and `measured` says which unit an estimate is
             // in — neither is derived from a credential, which is what this
             // list is watching for.
             "estimate",
+            "bytes_processed",
             "free_preview",
             // A definition's own vocabulary. `generated_ddl` is a statement
             // this client built from the catalogue, and `title` is the
@@ -1693,11 +1804,13 @@ mod tests {
             "relation_kind",
             "response",
             "returned",
+            "row_count",
             "rows",
             "sections",
             "sortable_preview",
             "placeholders",
             "sql",
+            "started_at",
             "state",
             "stats",
             "status",
@@ -1908,6 +2021,84 @@ mod tests {
             ["Indexes"]
         );
         assert!(!definition.stats.is_empty(), "{definition:?}");
+    }
+
+    #[tokio::test]
+    async fn the_history_answers_with_what_each_run_cost() {
+        let service = service_that_ran().await;
+        let answer = service
+            .answer(&Request::HistorySearch {
+                terms: String::new(),
+                limit: None,
+            })
+            .await;
+        let Response::Runs(runs) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(runs.len(), 2);
+        // Newest first, and the numbers stay numbers: an agent comparing two
+        // runs wants to subtract them.
+        let failed = runs
+            .iter()
+            .find(|run| run.status.as_deref() == Some("error"))
+            .expect("the one that failed");
+        assert_eq!(failed.duration_ms, Some(12));
+        assert_eq!(failed.error.as_deref(), Some("syntax error"));
+        assert_eq!(failed.row_count, None, "nothing came back from a failure");
+        assert!(failed.started_at.starts_with("1970-01-01T"), "{failed:?}");
+    }
+
+    #[tokio::test]
+    async fn the_words_narrow_the_history_the_same_way_the_pane_does() {
+        async fn found(service: &Service, terms: &str) -> Vec<String> {
+            let answer = service
+                .answer(&Request::HistorySearch {
+                    terms: terms.to_owned(),
+                    limit: None,
+                })
+                .await;
+            let Response::Runs(runs) = answer else {
+                panic!("{answer:?}");
+            };
+            runs.into_iter().map(|run| run.sql).collect()
+        }
+
+        let service = service_that_ran().await;
+        assert_eq!(
+            found(&service, "public").await,
+            ["select * from public.users"]
+        );
+        assert!(found(&service, "elephant").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_caller_can_ask_for_fewer_runs_and_never_more() {
+        let service = service_that_ran().await;
+        let answer = service
+            .answer(&Request::HistorySearch {
+                terms: String::new(),
+                limit: Some(1),
+            })
+            .await;
+        let Response::Runs(runs) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_keeping_nothing_has_no_history_to_answer_with() {
+        let (service, _) = service(Behaviour::instant()).await;
+        let answer = service
+            .answer(&Request::HistorySearch {
+                terms: String::new(),
+                limit: None,
+            })
+            .await;
+        assert!(
+            matches!(answer, Response::Failed(Failure::Unsupported { .. })),
+            "{answer:?}"
+        );
     }
 
     #[tokio::test]

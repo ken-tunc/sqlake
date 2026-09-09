@@ -119,6 +119,11 @@ pub const fn describes(kind: RequestKind) -> &'static str {
         RequestKind::TablePreview => {
             "A page of one relation, read without running a query where the driver allows it."
         }
+        RequestKind::HistorySearch => {
+            "What this session has run — the failures and the cancellations too — with what \
+             each one cost. The words are terms, not a query language: all of them have to \
+             appear."
+        }
         RequestKind::TemplateList => {
             "The statements saved in this session's library, with the placeholders each one \
              asks for."

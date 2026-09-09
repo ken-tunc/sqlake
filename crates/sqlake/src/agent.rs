@@ -48,6 +48,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         what: TableCommand,
     },
+    /// What this session has run.
+    History {
+        #[command(subcommand)]
+        what: HistoryCommand,
+    },
     /// Saved statements.
     Template {
         #[command(subcommand)]
@@ -130,6 +135,21 @@ pub(crate) enum ConnectionCommand {
     /// Which one is chosen the way every other command chooses: the session's
     /// ready connection, narrowed by `--connect`.
     Close,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum HistoryCommand {
+    /// What this session has run, newest first.
+    Search {
+        /// Words that all have to appear. The last one matches as a prefix,
+        /// the same way the pane reads what is typed into it.
+        #[arg(value_name = "TERMS", default_value = "")]
+        terms: String,
+        /// Fewer runs than the session would answer with. It cannot ask for
+        /// more.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -254,6 +274,12 @@ impl Command {
             } => Request::TableList {
                 connection,
                 namespace: path.segments(),
+            },
+            Self::History {
+                what: HistoryCommand::Search { terms, limit },
+            } => Request::HistorySearch {
+                terms: terms.clone(),
+                limit: *limit,
             },
             Self::Template {
                 what: TemplateCommand::List,
@@ -382,6 +408,11 @@ impl Command {
             // one-shot store can open it, answer, and go: nothing here
             // outlives the command.
             Self::Template { .. } => Needs::Connection,
+            // The history is the session's file rather than a database, and a
+            // one-shot store opens the same one — so this needs nothing at
+            // all, and asking for a connection would put a keyring prompt in
+            // front of somebody reading what they ran yesterday.
+            Self::History { .. } => Needs::Nothing,
             // Estimating names a connection and answers a number, which a
             // store that dies afterwards can still do.
             Self::Query {
@@ -1070,6 +1101,30 @@ mod tests {
             parse(&["table", "describe", "public.users", "--refresh"]).request("c".into()),
             Request::TableDescribe { refresh: true, .. }
         ));
+    }
+
+    #[test]
+    fn searching_the_history_needs_nothing_open() {
+        // The history is the session's file rather than a database, and asking
+        // for a connection would put a keyring prompt in front of somebody
+        // reading what they ran yesterday.
+        let command = parse(&["history", "search", "orders"]);
+        assert_eq!(command.needs(), Needs::Nothing);
+        assert_eq!(
+            command.request(String::new()),
+            Request::HistorySearch {
+                terms: "orders".into(),
+                limit: None,
+            }
+        );
+        // And with nothing to search for, everything.
+        assert_eq!(
+            parse(&["history", "search"]).request(String::new()),
+            Request::HistorySearch {
+                terms: String::new(),
+                limit: None,
+            }
+        );
     }
 
     #[test]

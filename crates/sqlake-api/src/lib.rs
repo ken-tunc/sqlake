@@ -21,7 +21,7 @@ pub use protocol::{
 pub use serve::{DEFAULT_TIMEOUT, Service};
 pub use snapshot::{
     ColumnDefInfo, ConnectionInfo, DefinitionInfo, EstimateInfo, NodeInfo, NodeStatus,
-    PositionInfo, ProfileInfo, QueryInfo, QueryState, SectionInfo, SessionInfo, StatInfo,
+    PositionInfo, ProfileInfo, QueryInfo, QueryState, RunInfo, SectionInfo, SessionInfo, StatInfo,
     StatementInfo, Status, TemplateInfo,
 };
 pub use socket::{

@@ -17,6 +17,9 @@ serde_json.workspace = true
 sqlake-app.workspace = true
 sqlake-config.workspace = true
 sqlake-core.workspace = true
+# Only to write a timestamp the way every other one on this surface is
+# written: RFC 3339, UTC.
+time.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 tracing.workspace = true
 
