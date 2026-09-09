@@ -33,6 +33,28 @@ pub struct Palette {
     /// The template that was picked, and its unanswered placeholders. `None`
     /// while the list is still being chosen from.
     pub asking: Option<Form>,
+    pub mode: Mode,
+}
+
+/// What the palette is for this time.
+///
+/// One overlay for both, because saving wants the same list that using does:
+/// what is already saved is what says whether a name is taken, and typing one
+/// over a list of them is how somebody sees that before pressing anything.
+/// The filter box *is* the name box while saving, which is why the two cannot
+/// be open at once and do not need to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// Pick one and put it in the buffer.
+    Use,
+    /// Name what is in the buffer and keep it.
+    Save {
+        /// Carried rather than read again on the way out: the tab it came from
+        /// can be closed while the palette is open, and saving something that
+        /// says "the buffer as it was" is better than saving nothing and not
+        /// saying why.
+        body: String,
+    },
 }
 
 impl Palette {
@@ -43,6 +65,31 @@ impl Palette {
             filter: String::new(),
             selected: 0,
             asking: None,
+            mode: Mode::Use,
+        }
+    }
+
+    /// The same, over a statement waiting for a name.
+    #[must_use]
+    pub fn saving(body: String) -> Self {
+        Self {
+            mode: Mode::Save { body },
+            ..Self::opening()
+        }
+    }
+
+    /// Whether this palette is open in order to keep something.
+    #[must_use]
+    pub const fn is_saving(&self) -> bool {
+        matches!(self.mode, Mode::Save { .. })
+    }
+
+    /// The statement waiting to be named, if that is what this is for.
+    #[must_use]
+    pub fn saving_body(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Save { body } => Some(body),
+            Mode::Use => None,
         }
     }
 
@@ -188,8 +235,9 @@ pub fn render(
     let width = u16::try_from(u32::from(area.width) * WIDTH_PERMILLE / 1000)
         .unwrap_or(area.width)
         .clamp(20, area.width);
-    // The filter line, the rows, and a border.
-    let height = (rows + 4).min(area.height);
+    // The filter line, the rows, a border — and, while saving, a line for the
+    // name that is already taken.
+    let height = (rows + 4 + u16::from(palette.is_saving())).min(area.height);
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 3,
@@ -201,9 +249,13 @@ pub fn render(
     // through the backdrop underneath.
     hits.push(rect, Z_MODAL, Target::Modal);
 
-    let title = match &palette.asking {
-        Some(form) => format!(" {} ", form.name),
-        None => " saved statements ".to_owned(),
+    let title = match (&palette.asking, &palette.mode) {
+        (Some(form), _) => format!(" {} ", form.name),
+        // The key that commits it, said out loud: `Enter` is the palette's own
+        // and picks from the list, so the one gesture that is not where a
+        // person would look for it is the one worth naming.
+        (None, Mode::Save { .. }) => " save as… (Ctrl-s)  ".to_owned(),
+        (None, Mode::Use) => " saved statements ".to_owned(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -272,6 +324,20 @@ fn list(
         return;
     }
 
+    // A name already saved is the one thing worth saying before a key is
+    // pressed: the save is refused for it, and the list underneath is what
+    // somebody is reading to avoid it. On the last line, and drawn after the
+    // rows, so a row cannot be written over half of it.
+    let taken = palette.is_saving() && matches.iter().any(|held| held.name == palette.filter);
+    let body = if taken {
+        Rect {
+            height: body.height.saturating_sub(1),
+            ..body
+        }
+    } else {
+        body
+    };
+
     // The window follows the selection, so a list longer than the palette can
     // still be walked to the end.
     let visible = body.height as usize;
@@ -300,6 +366,20 @@ fn list(
                 style,
             ))),
             line,
+        );
+    }
+
+    if taken {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                fit("that name is taken", body.width),
+                Style::default().fg(Color::Red),
+            ))),
+            Rect {
+                y: body.y + body.height,
+                height: 1,
+                ..body
+            },
         );
     }
 }
@@ -485,6 +565,28 @@ mod tests {
         };
         let screen = drawn(&palette, &[template("one")], None);
         assert!(screen.contains("nothing saved matches"), "{screen}");
+    }
+
+    #[test]
+    fn saving_says_which_key_keeps_it_and_which_names_are_taken() {
+        // `Enter` is the palette's own key and picks from the list, so the one
+        // gesture that is not where somebody would look for it is the one
+        // worth naming — and a name already saved is refused, which is worth
+        // saying before a key is pressed rather than after.
+        let palette = Palette {
+            filter: "daily".to_owned(),
+            ..Palette::saving("select 1".to_owned())
+        };
+        let screen = drawn(&palette, &[template("daily")], None);
+        assert!(screen.contains("Ctrl-s"), "{screen}");
+        assert!(screen.contains("that name is taken"), "{screen}");
+
+        let free = Palette {
+            filter: "weekly".to_owned(),
+            ..Palette::saving("select 1".to_owned())
+        };
+        let screen = drawn(&free, &[template("daily")], None);
+        assert!(!screen.contains("that name is taken"), "{screen}");
     }
 
     #[test]

@@ -202,6 +202,23 @@ pub enum ViewCmd {
 
     /// Answer the form: bind the values and put the result in the buffer.
     SubmitTemplate,
+
+    /// Save what the palette is holding, under the name typed into it.
+    ///
+    /// No payload: the palette has both halves, and passing them through here
+    /// would be the same state written down twice.
+    CommitTemplate,
+
+    /// Ask whether to delete a saved statement.
+    ///
+    /// A view command because the question is a dialog and the dialog is this
+    /// crate's; the answer on it is the store's `DeleteTemplate`. Carrying the
+    /// name as well as the id so the question can say what it is about — a
+    /// dialog asking about a row number is one nobody can answer.
+    ConfirmDeleteTemplate {
+        id: TemplateId,
+        name: String,
+    },
 }
 
 /// Generates the kind enum and its complete list from one place, so the two
@@ -308,14 +325,20 @@ impl IntentKind {
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
                 ViewCmd::DismissToast(_) => Self::DismissToast,
-                // Opening it, typing in it, moving in it and closing it are
-                // one capability: it is a thing on the screen you operate, not
-                // four things.
+                // Opened to save something, it *is* the save: the list under
+                // it is there to show which names are taken. Opened for
+                // anything else, operating it — typing, moving, closing — is
+                // one capability, because it is one thing on the screen.
+                ViewCmd::Palette(Some(open)) if open.is_saving() => Self::SaveTemplate,
                 ViewCmd::Palette(_) => Self::Palette,
+                ViewCmd::CommitTemplate => Self::SaveTemplate,
                 // And picking is the other: the palette is open in order to
                 // reach this, and a form is a step on the way to it rather
                 // than a capability of its own.
                 ViewCmd::UseTemplate(_) | ViewCmd::SubmitTemplate => Self::UseTemplate,
+                // Paired with `Action::DeleteTemplate`: asking and doing are
+                // one capability, and the dialog in between is not a second.
+                ViewCmd::ConfirmDeleteTemplate { .. } => Self::DeleteTemplate,
             },
             Intent::Handover(handover) => match handover {
                 Handover::Edit(_) => Self::EditExternally,
