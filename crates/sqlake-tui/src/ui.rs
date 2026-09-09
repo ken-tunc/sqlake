@@ -112,6 +112,15 @@ impl OpenTab {
         }
     }
 
+    /// The statement in this tab's buffer, or `None` when it is not a SQL tab.
+    #[must_use]
+    pub fn sql(&self) -> Option<&str> {
+        match &self.content {
+            TabContent::Sql { text, .. } => Some(text),
+            TabContent::Preview(_) | TabContent::Definition { .. } => None,
+        }
+    }
+
     /// The relation this tab is a definition of.
     #[must_use]
     pub const fn defines(&self) -> Option<&TableRef> {
@@ -906,6 +915,31 @@ impl UiState {
         }
     }
 
+    /// Keep what the palette is holding, under the name typed into it.
+    ///
+    /// The palette closes here rather than when the answer lands: the answer
+    /// is a list and a possible failure, and both are read where the palette
+    /// was — a list somebody has to dismiss to see what happened to their save
+    /// is a list in the way.
+    fn commit_template(&mut self) -> Option<Action> {
+        let open = self.palette.take()?;
+        let name = open.filter.trim().to_owned();
+        let body = open.saving_body()?.to_owned();
+        if name.is_empty() {
+            return None;
+        }
+        Some(Action::SaveTemplate(sqlake_core::library::NewTemplate {
+            name,
+            body,
+            // Any driver, and no tags. Both are things to say *about* a
+            // template rather than things to ask for while keeping one, and a
+            // dialog with three fields in it is a dialog nobody uses to save a
+            // query they are in the middle of.
+            driver: None,
+            tags: Vec::new(),
+        }))
+    }
+
     /// Bind what the form holds and put the result in the buffer.
     fn submit_template(&mut self, snapshot: &Snapshot) {
         let Some(form) = self.palette.as_ref().and_then(|p| p.asking.clone()) else {
@@ -1236,9 +1270,34 @@ impl UiState {
                 }
             }
             ViewCmd::DismissToast(id) => self.toasts.retain(|t| t.id != id),
-            ViewCmd::Palette(open) => self.palette = open,
+            ViewCmd::Palette(open) => {
+                let asked_for = open.is_some();
+                self.palette = open;
+                // Reading them is what opening it means. Asked for here rather
+                // than by the key, so that every way of opening the palette —
+                // to use one, to save one — reads the list without each of
+                // them having to remember to.
+                if asked_for {
+                    return Some(Action::LoadTemplates);
+                }
+            }
+            ViewCmd::CommitTemplate => return self.commit_template(),
             ViewCmd::UseTemplate(id) => self.use_template(id, snapshot),
             ViewCmd::SubmitTemplate => self.submit_template(snapshot),
+            ViewCmd::ConfirmDeleteTemplate { id, name } => {
+                // The palette goes first: the dialog is drawn over everything,
+                // and a list still underneath it is a list the answer is about
+                // to change.
+                self.palette = None;
+                self.modal = Some(crate::overlay::Modal::asking(
+                    format!("Delete `{name}`?"),
+                    "It is not kept anywhere else.",
+                    vec![crate::overlay::Choice {
+                        label: "Delete".to_owned(),
+                        intent: Action::DeleteTemplate(id).into(),
+                    }],
+                ));
+            }
         }
         None
     }
@@ -2413,6 +2472,99 @@ mod tests {
             .find(|t| t.name == name)
             .expect("that template")
             .id
+    }
+
+    #[test]
+    fn opening_the_palette_is_what_reads_the_templates() {
+        // Every way of opening it, so that neither has to remember to.
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[]);
+        let mut ui = UiState::new();
+        assert!(matches!(
+            ui.apply(
+                ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+                &snap
+            ),
+            Some(Action::LoadTemplates)
+        ));
+        assert!(
+            ui.apply(ViewCmd::Palette(None), &snap).is_none(),
+            "closing it asks for nothing"
+        );
+        assert!(matches!(
+            ui.apply(
+                ViewCmd::Palette(Some(crate::palette::Palette::saving("select 1".to_owned()))),
+                &snap
+            ),
+            Some(Action::LoadTemplates)
+        ));
+    }
+
+    #[test]
+    fn saving_names_what_is_in_the_buffer() {
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::saving(
+                "select * from users".to_owned(),
+            ))),
+            &snap,
+        );
+        if let Some(palette) = ui.palette.as_mut() {
+            palette.filter = "  daily  ".to_owned();
+        }
+
+        let asked = ui.apply(ViewCmd::CommitTemplate, &snap);
+        let Some(Action::SaveTemplate(template)) = asked else {
+            panic!("{asked:?}");
+        };
+        // Trimmed: a name with a space on the end is one nothing will match
+        // when it is typed again.
+        assert_eq!(template.name, "daily");
+        assert_eq!(template.body, "select * from users");
+        assert!(ui.palette.is_none(), "the answer is read where it was");
+    }
+
+    #[test]
+    fn a_save_with_no_name_is_not_a_save() {
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::saving("select 1".to_owned()))),
+            &snap,
+        );
+        assert!(ui.apply(ViewCmd::CommitTemplate, &snap).is_none());
+    }
+
+    #[test]
+    fn deleting_asks_first_and_the_answer_is_the_deletion() {
+        // A saved statement is somebody's own writing and there is no undo, so
+        // the one thing this must not be is a key that quietly loses it.
+        let conn = ConnId::new();
+        let snap = with_templates(snapshot(conn, 3, 10, 3), &[("daily", "select 1")]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())),
+            &snap,
+        );
+        let id = template_id(&snap, "daily");
+        let _ = ui.apply(
+            ViewCmd::ConfirmDeleteTemplate {
+                id,
+                name: "daily".to_owned(),
+            },
+            &snap,
+        );
+
+        assert!(ui.palette.is_none(), "the question is drawn over nothing");
+        let modal = ui.modal.as_ref().expect("a dialog");
+        assert!(modal.title.contains("daily"), "{modal:?}");
+        assert_eq!(
+            modal.choices.first().map(|c| c.intent.clone()),
+            Some(Action::DeleteTemplate(id).into())
+        );
     }
 
     #[test]

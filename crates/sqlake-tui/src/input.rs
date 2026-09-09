@@ -168,6 +168,26 @@ pub const KEYMAP: &[KeyBinding] = &[
         context: Context::Palette,
         kind: IntentKind::UseTemplate,
     },
+    // `Ctrl-s` names the statement in the buffer, and `Ctrl-s` again saves it.
+    // The same key for both halves because it is one errand, and not `Enter`
+    // for the second: `Enter` is the palette's own key and picks from the
+    // list, which is what somebody typing a *name* over that list is not
+    // doing.
+    KeyBinding {
+        keys: &[KeyCombo::ctrl(KeyCode::Char('s'))],
+        context: Context::Global,
+        kind: IntentKind::SaveTemplate,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::ctrl(KeyCode::Char('s'))],
+        context: Context::Palette,
+        kind: IntentKind::SaveTemplate,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::ctrl(KeyCode::Char('d'))],
+        context: Context::Palette,
+        kind: IntentKind::DeleteTemplate,
+    },
     KeyBinding {
         keys: &[
             key('j'),
@@ -1372,10 +1392,8 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         IntentKind::Quit => vec![Action::Quit.into()],
         IntentKind::Palette => palette(event, ctx),
         IntentKind::UseTemplate => use_template(ctx),
-        // No key yet: saving a statement and deleting a saved one are the
-        // gestures the pane does not have, and a binding that produced a save
-        // with nothing to name it would be a key that does nothing.
-        IntentKind::SaveTemplate | IntentKind::DeleteTemplate => Vec::new(),
+        IntentKind::SaveTemplate => save_template(ctx),
+        IntentKind::DeleteTemplate => delete_template(ctx),
     }
 }
 
@@ -1386,12 +1404,10 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
 /// the only thing that knows what it did.
 fn palette(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
     let Some(open) = ctx.palette else {
-        // Opening it is also what reads the templates: nothing on screen has
-        // them until something asks.
-        return vec![
-            ViewCmd::Palette(Some(crate::palette::Palette::opening())).into(),
-            Action::LoadTemplates.into(),
-        ];
+        // Just the view command: opening the palette is what reads the
+        // templates, and the view says so on its way out — the same way a
+        // scroll asks for the next page.
+        return vec![ViewCmd::Palette(Some(crate::palette::Palette::opening())).into()];
     };
     let mut next = open.clone();
 
@@ -1457,6 +1473,62 @@ fn use_template(ctx: &InputContext<'_>) -> Vec<Intent> {
     };
     open.picked(held)
         .map(|template| vec![ViewCmd::UseTemplate(template.id).into()])
+        .unwrap_or_default()
+}
+
+/// Name the statement in the buffer, or save it under the name that is typed.
+///
+/// Nothing at all when there is nothing to save: a key that opened an empty
+/// "save as" over an empty buffer would be one that always appears to work.
+fn save_template(ctx: &InputContext<'_>) -> Vec<Intent> {
+    match ctx.palette.and_then(|open| open.saving_body()) {
+        Some(body) => {
+            let name = ctx.palette.map(|open| open.filter.trim()).unwrap_or("");
+            if name.is_empty() {
+                return Vec::new();
+            }
+            // The view holds the name and the body already, so it does the
+            // building — and closes itself, which is a view's own business.
+            let _ = body;
+            vec![ViewCmd::CommitTemplate.into()]
+        }
+        // Not while the palette is already up for something else: `Ctrl-s`
+        // there would replace what is on screen with a different errand.
+        None if ctx.palette.is_some() => Vec::new(),
+        None => ctx
+            .active_tab
+            .and_then(|id| ctx.tabs.iter().find(|t| t.id == id))
+            .and_then(|tab| tab.sql())
+            .filter(|sql| !sql.trim().is_empty())
+            .map(|sql| {
+                vec![ViewCmd::Palette(Some(crate::palette::Palette::saving(sql.to_owned()))).into()]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Ask before deleting the selected template.
+///
+/// Through a dialog rather than straight away: a saved statement is somebody's
+/// own writing and there is no undo here, so the one thing this must not be is
+/// a key that quietly loses it.
+fn delete_template(ctx: &InputContext<'_>) -> Vec<Intent> {
+    let (Some(open), Some(held)) = (ctx.palette, templates(ctx)) else {
+        return Vec::new();
+    };
+    if open.asking.is_some() || open.saving_body().is_some() {
+        return Vec::new();
+    }
+    open.picked(held)
+        .map(|template| {
+            vec![
+                ViewCmd::ConfirmDeleteTemplate {
+                    id: template.id,
+                    name: template.name.clone(),
+                }
+                .into(),
+            ]
+        })
         .unwrap_or_default()
 }
 
@@ -2020,6 +2092,48 @@ mod tests {
             on_mouse(Target::Backdrop, Gesture::Click, &f.ctx(PaneId::Grid)),
             [Intent::View(ViewCmd::DismissModal)]
         );
+    }
+
+    #[test]
+    fn saving_needs_something_to_save() {
+        // A key that opened an empty "save as" over an empty buffer would be
+        // one that always looks like it worked.
+        let f = fixture();
+        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        let mut on_a_preview = f.ctx(PaneId::Grid);
+        on_a_preview.active_tab = Some(TabId::new(1));
+        assert!(on_key(save, &on_a_preview).is_empty());
+
+        let mut on_sql = f.ctx(PaneId::Grid);
+        on_sql.active_tab = Some(TabId::new(3));
+        let opened = on_key(save, &on_sql);
+        assert!(
+            matches!(
+                opened.as_slice(),
+                [Intent::View(ViewCmd::Palette(Some(palette)))] if palette.saving_body() == Some("select 1")
+            ),
+            "{opened:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_is_only_offered_where_there_is_something_to_delete() {
+        let f = fixture();
+        let delete = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        let mut listing = f.ctx(PaneId::Grid);
+        listing.palette = Some(&f.palettes[0]);
+        assert!(matches!(
+            on_key(delete, &listing).as_slice(),
+            [Intent::View(ViewCmd::ConfirmDeleteTemplate { .. })]
+        ));
+
+        // Not while a form is up: the row under the cursor is not what is on
+        // screen any more.
+        let mut asking = f.ctx(PaneId::Grid);
+        asking.palette = Some(&f.palettes[1]);
+        assert!(on_key(delete, &asking).is_empty());
     }
 
     #[test]

@@ -129,6 +129,7 @@ Each is one PR, reviewed before the next starts.
 | ~~T5~~ | Folded into T4 | A palette that inserted a template *without* filling it in would put `{{table}}` in the buffer, which is the one thing D6 exists to prevent — so the two could not ship apart |
 | T6 | Recording a run: timings on `QueryView`, a row per run | A run, a failure and a cancellation each leave one row saying which they were |
 | T7 | `template_list` and `template_apply` on the socket and as MCP tools | An agent renders a template with its parameters and gets SQL back — not a run |
+| T8 | Saving from a SQL tab and deleting from the palette | `Ctrl-s` names what is in the buffer and keeps it; `Ctrl-d` asks before losing one. T3 built the store side of both and T4 the pane they live in, so this is the gesture and nothing else |
 
 T2 depends on nothing and can go first if T1 stalls. T4 depends on T3. T6 depends only on T1,
 and is the one M8 builds on. T7 answers text and never runs it: an agent that wants
