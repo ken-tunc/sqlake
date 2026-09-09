@@ -46,8 +46,15 @@ impl Sqlite {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|why| LibraryError::Failed(format!("{}: {why}", parent.display())))?;
+            restrict(parent)?;
         }
         let connection = Connection::open(path).map_err(translate)?;
+        // Owner-only, because everything typed into a SQL buffer ends up here
+        // and some of it is `CREATE ROLE … PASSWORD`. Set after opening rather
+        // than before: SQLite creates the file, so there is nothing to set the
+        // mode of until it has. The `-wal` and `-shm` files SQLite makes take
+        // their mode from this one.
+        restrict(path)?;
         // WAL because a second sqlake — an attached session and a one-shot
         // command are two processes — should not have to wait behind a reader
         // to write a history row. `NORMAL` is WAL's own recommendation: the
@@ -285,6 +292,25 @@ impl Library for Sqlite {
     }
 }
 
+/// Owner-only, on the file and on the directory holding it.
+///
+/// Not on Windows, which has no mode to set: the equivalent there is an ACL,
+/// and writing one badly would be worse than the default a home directory
+/// already carries.
+#[cfg(unix)]
+fn restrict(path: &Path) -> LibraryResult<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = if path.is_dir() { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|why| LibraryError::Failed(format!("{}: {why}", path.display())))
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path) -> LibraryResult<()> {
+    Ok(())
+}
+
 /// Now, at the precision the file keeps.
 ///
 /// Truncated here rather than on the way in, so that what a caller is handed
@@ -432,6 +458,30 @@ mod tests {
 
         let again = Sqlite::open(&path).expect("a newer file still opens");
         assert_eq!(again.version().expect("a version"), 999);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_the_owners_alone() {
+        // Everything typed into a SQL buffer ends up in the history, and some
+        // of it is a password. This is the whole of what protects it.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let home = dir.path().join("state");
+        let path = home.join("library.db");
+        let library = Sqlite::open(&path).expect("it opens");
+        library.add(template("secret")).expect("it saves");
+
+        let mode = |at: &Path| {
+            std::fs::metadata(at)
+                .expect("it is there")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&home), 0o700, "the directory it sits in, too");
     }
 
     #[test]
