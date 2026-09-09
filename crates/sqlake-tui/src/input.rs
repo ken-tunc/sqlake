@@ -12,6 +12,7 @@ use sqlake_app::action::Action;
 use sqlake_app::snapshot::{ConnectionView, Snapshot};
 use sqlake_app::tree::VisibleNode;
 use sqlake_core::id::{ConnId, ProfileId, QueryId, TabId};
+use sqlake_core::library::Template;
 use sqlake_core::node::TableRef;
 
 use crate::hit::{ButtonId, PaneId, ScrollPart, SplitId, Target};
@@ -138,6 +139,34 @@ pub const KEYMAP: &[KeyBinding] = &[
         ],
         context: Context::Filter,
         kind: IntentKind::Filter,
+    },
+    // `Ctrl-p`, which design.md §6 has reserved for this since before there
+    // was anything to put in it. A chord rather than a letter because it has
+    // to work while a SQL tab has the keyboard, which is where somebody wants
+    // a saved statement.
+    KeyBinding {
+        keys: &[KeyCombo::ctrl(KeyCode::Char('p'))],
+        context: Context::Global,
+        kind: IntentKind::Palette,
+    },
+    // Inside it every character is the filter's or the field's, the way the
+    // search box works — these are the keys that are not text.
+    KeyBinding {
+        keys: &[
+            KeyCombo::new(KeyCode::Backspace),
+            KeyCombo::new(KeyCode::Esc),
+            KeyCombo::new(KeyCode::Up),
+            KeyCombo::new(KeyCode::Down),
+            KeyCombo::new(KeyCode::Tab),
+            KeyCombo::new(KeyCode::BackTab),
+        ],
+        context: Context::Palette,
+        kind: IntentKind::Palette,
+    },
+    KeyBinding {
+        keys: &[KeyCombo::new(KeyCode::Enter)],
+        context: Context::Palette,
+        kind: IntentKind::UseTemplate,
     },
     KeyBinding {
         keys: &[
@@ -417,6 +446,10 @@ pub struct InputContext<'a> {
     /// The explorer's search, or `None` when there is not one. It redirects
     /// the keyboard into itself only while it is being edited.
     pub filter: Option<&'a Filter>,
+    /// The open palette, which holds the keyboard while it is up — and which
+    /// a key has to be able to read in order to change it: the whole state
+    /// travels on the command that changes it.
+    pub palette: Option<&'a crate::palette::Palette>,
 }
 
 impl InputContext<'_> {
@@ -555,6 +588,11 @@ impl InputContext<'_> {
     fn key_context(&self) -> Context {
         if self.modal_open {
             Context::Modal
+        } else if self.palette.is_some() {
+            // Above the search box and below a dialog: the palette is opened
+            // deliberately and typed into, and a dialog on top of it is
+            // something that has to be answered first.
+            Context::Palette
         } else if self.filter.is_some_and(|f| f.editing) {
             Context::Filter
         } else {
@@ -801,6 +839,28 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
                 ]
             })
             .unwrap_or_default(),
+        // One click both selects and uses: the palette is open in order to
+        // pick something, and a click that only highlighted a row would leave
+        // the pointer needing the keyboard to finish.
+        (Target::PaletteRow { index }, Gesture::Click) => {
+            let Some(open) = ctx.palette else {
+                return Vec::new();
+            };
+            let mut next = open.clone();
+            next.selected = index;
+            let Some(held) = templates(ctx) else {
+                return Vec::new();
+            };
+            next.picked(held)
+                .map(|template| template.id)
+                .map(|id| {
+                    vec![
+                        ViewCmd::Palette(Some(next.clone())).into(),
+                        ViewCmd::UseTemplate(id).into(),
+                    ]
+                })
+                .unwrap_or_default()
+        }
         (Target::Section { index }, Gesture::Click) => {
             vec![ViewCmd::SelectSection(crate::intent::SectionPick::At(index)).into()]
         }
@@ -843,7 +903,17 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
             vec![ViewCmd::DismissModal.into()]
         }
         (Target::Toast(id), Gesture::Click) => vec![ViewCmd::DismissToast(id).into()],
-        (Target::Backdrop, Gesture::Click) => vec![ViewCmd::DismissModal.into()],
+        // Whichever overlay the backdrop is behind. A dialog wins when both
+        // are up, because it is the one on top and the one that has to be
+        // answered — and because closing the palette underneath it would
+        // leave the click having done something invisible.
+        (Target::Backdrop, Gesture::Click) => {
+            if ctx.palette.is_some() && !ctx.modal_open {
+                vec![ViewCmd::Palette(None).into()]
+            } else {
+                vec![ViewCmd::DismissModal.into()]
+            }
+        }
 
         // Presses, releases and hover carry no action of their own; they exist
         // so the view can show feedback.
@@ -1028,7 +1098,7 @@ pub fn on_key(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
         // "discard these changes?" dialog must not quit instead of answering
         // it, and a `q` typed into the search box must reach the box.
         Context::Modal => None,
-        Context::Filter if !chord => None,
+        Context::Filter | Context::Palette if !chord => None,
         _ => matching(Context::Global),
     });
 
@@ -1043,6 +1113,16 @@ pub fn on_key(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
         && matches!(event.code, KeyCode::Char(_))
     {
         return materialise(IntentKind::Filter, event, ctx);
+    }
+    // The same for the palette: its filter and its fields are text boxes, and
+    // enumerating the printable characters in `KEYMAP` would be a hundred
+    // bindings the coverage test then has to skip.
+    if context == Context::Palette
+        && bound.is_none()
+        && !chord
+        && matches!(event.code, KeyCode::Char(_))
+    {
+        return materialise(IntentKind::Palette, event, ctx);
     }
 
     let Some(binding) = bound else {
@@ -1290,15 +1370,102 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|t| vec![ViewCmd::DismissToast(t.id).into()])
             .unwrap_or_default(),
         IntentKind::Quit => vec![Action::Quit.into()],
-        // No key yet: the palette these belong to arrives in T4, and a
-        // binding that produced a save with nothing to save it from would be
-        // a key that does nothing. `IntentKind::of` still has to name them,
-        // which is what will make the palette's own bindings a compile-time
-        // question rather than something to remember.
-        IntentKind::ListTemplates | IntentKind::SaveTemplate | IntentKind::DeleteTemplate => {
-            Vec::new()
-        }
+        IntentKind::Palette => palette(event, ctx),
+        IntentKind::UseTemplate => use_template(ctx),
+        // No key yet: saving a statement and deleting a saved one are the
+        // gestures the pane does not have, and a binding that produced a save
+        // with nothing to name it would be a key that does nothing.
+        IntentKind::SaveTemplate | IntentKind::DeleteTemplate => Vec::new(),
     }
+}
+
+/// Open the palette, or change the one that is open.
+///
+/// Every one of these produces the whole new state, which is what makes the
+/// view's job an assignment rather than an edit: the key that was pressed is
+/// the only thing that knows what it did.
+fn palette(event: KeyEvent, ctx: &InputContext<'_>) -> Vec<Intent> {
+    let Some(open) = ctx.palette else {
+        // Opening it is also what reads the templates: nothing on screen has
+        // them until something asks.
+        return vec![
+            ViewCmd::Palette(Some(crate::palette::Palette::opening())).into(),
+            Action::LoadTemplates.into(),
+        ];
+    };
+    let mut next = open.clone();
+
+    if let Some(form) = &mut next.asking {
+        match event.code {
+            // Back to the list rather than out altogether: filling in the
+            // wrong template is a thing that happens, and one `Esc` should
+            // undo one step.
+            KeyCode::Esc => next.asking = None,
+            KeyCode::Down | KeyCode::Tab => form.move_to(1),
+            KeyCode::Up | KeyCode::BackTab => form.move_to(-1),
+            KeyCode::Backspace => {
+                let mut value = form
+                    .fields
+                    .get(form.at)
+                    .map_or_else(String::new, |f| f.value.clone());
+                value.pop();
+                form.edit(value);
+            }
+            KeyCode::Char(c) => {
+                let mut value = form
+                    .fields
+                    .get(form.at)
+                    .map_or_else(String::new, |f| f.value.clone());
+                value.push(c);
+                form.edit(value);
+            }
+            _ => return Vec::new(),
+        }
+        return vec![ViewCmd::Palette(Some(next)).into()];
+    }
+
+    let matches = templates(ctx).map_or(0, |held| next.matching(held).len());
+    match event.code {
+        KeyCode::Esc => return vec![ViewCmd::Palette(None).into()],
+        KeyCode::Down | KeyCode::Tab => next.move_selection(1, matches),
+        KeyCode::Up | KeyCode::BackTab => next.move_selection(-1, matches),
+        KeyCode::Backspace => {
+            next.filter.pop();
+            // The list under it just changed, and a selection counted over the
+            // old one points at a different template — or at nothing.
+            next.selected = 0;
+        }
+        KeyCode::Char(c) => {
+            next.filter.push(c);
+            next.selected = 0;
+        }
+        _ => return Vec::new(),
+    }
+    vec![ViewCmd::Palette(Some(next)).into()]
+}
+
+/// Pick what the palette has selected, or answer the form it turned into.
+fn use_template(ctx: &InputContext<'_>) -> Vec<Intent> {
+    let Some(open) = ctx.palette else {
+        return Vec::new();
+    };
+    if open.asking.is_some() {
+        return vec![ViewCmd::SubmitTemplate.into()];
+    }
+    let Some(held) = templates(ctx) else {
+        return Vec::new();
+    };
+    open.picked(held)
+        .map(|template| vec![ViewCmd::UseTemplate(template.id).into()])
+        .unwrap_or_default()
+}
+
+fn templates<'a>(ctx: &InputContext<'a>) -> Option<&'a [Template]> {
+    ctx.snapshot
+        .templates
+        .data
+        .ready()
+        .map(|held| held.as_slice())
 }
 
 /// What the filter box holds after this key.
@@ -1403,6 +1570,8 @@ mod tests {
         /// The two states a search can be in, held here so that a context
         /// borrowing one lives as long as the fixture does.
         searches: [Filter; 2],
+        /// And the two the palette can be in — a list, and a form over it.
+        palettes: [crate::palette::Palette; 2],
     }
 
     impl Fixture {
@@ -1426,6 +1595,7 @@ mod tests {
         /// to cover.
         fn ctx_no_active_tab(&self, focus: PaneId) -> InputContext<'_> {
             InputContext {
+                palette: None,
                 snapshot: &self.snapshot,
                 focus,
                 modal_open: false,
@@ -1553,7 +1723,23 @@ mod tests {
                 label: "loading".into(),
                 started_at: std::time::Instant::now(),
             }],
-            templates: sqlake_app::snapshot::TemplatesView::default(),
+            // Something saved, so the palette's own bindings reach a
+            // template rather than an empty list — a sweep over an empty
+            // palette would report `Enter` dead.
+            templates: sqlake_app::snapshot::TemplatesView {
+                data: sqlake_app::snapshot::LoadState::Ready(Arc::new(vec![
+                    sqlake_core::library::Template {
+                        id: sqlake_core::library::TemplateId::new(1),
+                        name: "daily".to_owned(),
+                        body: "select * from {{ident:table}}".to_owned(),
+                        driver: None,
+                        tags: Vec::new(),
+                        created_at: time::OffsetDateTime::UNIX_EPOCH,
+                        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                    },
+                ])),
+                failed: None,
+            },
             should_quit: false,
         };
 
@@ -1578,6 +1764,21 @@ mod tests {
             tabs,
             toasts,
             searches: [editing(""), made("public")],
+            palettes: [
+                crate::palette::Palette::opening(),
+                crate::palette::Palette {
+                    asking: Some(crate::palette::Form::new(
+                        sqlake_core::library::TemplateId::new(1),
+                        "daily".to_owned(),
+                        vec![sqlake_core::template::Placeholder {
+                            name: "table".to_owned(),
+                            kind: sqlake_core::template::Kind::Ident,
+                        }],
+                        &|_| None,
+                    )),
+                    ..crate::palette::Palette::opening()
+                },
+            ],
         }
     }
 
@@ -1817,6 +2018,28 @@ mod tests {
         let f = fixture();
         assert_eq!(
             on_mouse(Target::Backdrop, Gesture::Click, &f.ctx(PaneId::Grid)),
+            [Intent::View(ViewCmd::DismissModal)]
+        );
+    }
+
+    #[test]
+    fn clicking_outside_the_palette_closes_it() {
+        // It draws a backdrop, so a click outside has to mean something. It
+        // meant `DismissModal`, which closes a dialog that is not there and
+        // leaves the palette exactly where it was.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.palette = Some(&f.palettes[0]);
+        assert_eq!(
+            on_mouse(Target::Backdrop, Gesture::Click, &c),
+            [Intent::View(ViewCmd::Palette(None))]
+        );
+
+        // And a dialog over it still wins: it is on top, and it is the one
+        // that has to be answered.
+        c.modal_open = true;
+        assert_eq!(
+            on_mouse(Target::Backdrop, Gesture::Click, &c),
             [Intent::View(ViewCmd::DismissModal)]
         );
     }
@@ -2666,6 +2889,7 @@ mod tests {
     fn an_action_with_nothing_to_act_on_produces_nothing() {
         let empty = Snapshot::default();
         let c = InputContext {
+            palette: None,
             snapshot: &empty,
             focus: PaneId::Grid,
             modal_open: false,
@@ -2803,6 +3027,7 @@ mod tests {
             Target::Button(ButtonId::ModalChoice { index: 0 }),
         ],
         Target::Section { .. } => [Target::Section { index: 0 }],
+        Target::PaletteRow { .. } => [Target::PaletteRow { index: 0 }],
         Target::Toast(_) => [Target::Toast(ToastId::new(1))],
         Target::MenuItem { .. } => [Target::MenuItem { index: 0 }],
         Target::Menu => [Target::Menu],
@@ -3098,6 +3323,14 @@ mod tests {
                             c.filter = filter;
                             c.active_tab = Some(tab);
                             out.push(c);
+                            // Both stages of the palette: its bindings only
+                            // fire while it is up, and its form answers keys
+                            // the list does not.
+                            for palette in &f.palettes {
+                                let mut open = c;
+                                open.palette = Some(palette);
+                                out.push(open);
+                            }
                             // And with a dialog that has something to answer.
                             // A sweep that only ever opened one which tells
                             // would report every binding on a question dead.

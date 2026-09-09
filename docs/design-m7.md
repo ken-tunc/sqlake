@@ -125,13 +125,13 @@ Each is one PR, reviewed before the next starts.
 | T1 | `Library` in `sqlake-core`, `sqlake-library` over `rusqlite`, the in-memory one for tests, injected into `Store::spawn` | Both tables exist at v1, a v1 file opens on a later build, and the whole suite still runs with no file on disk |
 | T2 | `Template → BoundTemplate → RawSql` in `sqlake-core`, with typed placeholders | An unfilled placeholder cannot become a `RawSql`; an identifier is quoted by the driver's rules and a value escaped by them |
 | T3 | Saving, editing and deleting a template, through the store | A statement in a SQL tab is saved, comes back after a restart, and the snapshot carries the list |
-| T4 | The palette: `Ctrl-p`, filtering, and insertion into the buffer | A template picked in the palette is in the buffer, and `input.rs` has the binding its rows demand |
-| T5 | Parameter entry, and `{{table}}` from the selected node | A template with two placeholders asks for both, and the one named `table` offers what the explorer has selected |
+| T4 | The palette: `Ctrl-p`, filtering, insertion, **and the parameter form** | A template picked in the palette is in the buffer, and `input.rs` has the binding its rows demand |
+| ~~T5~~ | Folded into T4 | A palette that inserted a template *without* filling it in would put `{{table}}` in the buffer, which is the one thing D6 exists to prevent — so the two could not ship apart |
 | T6 | Recording a run: timings on `QueryView`, a row per run | A run, a failure and a cancellation each leave one row saying which they were |
 | T7 | `template_list` and `template_apply` on the socket and as MCP tools | An agent renders a template with its parameters and gets SQL back — not a run |
 
-T2 depends on nothing and can go first if T1 stalls. T4 and T5 both depend on T3. T6 depends
-only on T1, and is the one M8 builds on. T7 answers text and never runs it: an agent that wants
+T2 depends on nothing and can go first if T1 stalls. T4 depends on T3. T6 depends only on T1,
+and is the one M8 builds on. T7 answers text and never runs it: an agent that wants
 the statement executed already has `query_run`, and a template tool that ran things would be a
 second, quieter path to the same gate.
 
@@ -150,8 +150,10 @@ Left open deliberately; the answers belong in the code that settles them.
    part of a name. Inference from the name was the third option and the one that fails
    silently — `{{table}}` in `WHERE table = …` is a value, and no rule about the word can know
    that. The ugliness is real and is paid by the rarer of the two.
-3. **What the palette does when the buffer is not empty.** Insert at the cursor, replace, or
-   open a tab. Replacing loses work; inserting produces two statements where one was meant.
+3. ~~**What the palette does when the buffer is not empty.**~~ Answered by T4: it opens its own
+   SQL tab. Replacing destroys work in a client with no undo, appending makes two statements
+   out of one — which `ValidatedSql` then refuses — and "at the cursor" is not available at all,
+   because there is no cursor: editing is `$EDITOR`'s job (design.md §7).
 
 ---
 

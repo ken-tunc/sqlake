@@ -12,6 +12,7 @@
 
 use sqlake_app::action::Action;
 use sqlake_core::id::{ConnId, TabId};
+use sqlake_core::library::TemplateId;
 use sqlake_core::node::TableRef;
 
 use crate::hit::{PaneId, SplitId, ToastId};
@@ -184,6 +185,23 @@ pub enum ViewCmd {
     CloseTab(TabId),
 
     DismissToast(ToastId),
+
+    /// The palette, or `None` to close it.
+    ///
+    /// The whole state each time, for the reason [`ViewCmd::SetFilter`] is:
+    /// the key that changed it is the only thing that knows what it did.
+    Palette(Option<crate::palette::Palette>),
+
+    /// Put the selected template in the buffer — or, when it has placeholders,
+    /// turn the palette into the form that asks for them.
+    ///
+    /// One command for both because a person picking a template is aiming at
+    /// the buffer either way; which of the two happens is a fact about the
+    /// template, not about the gesture.
+    UseTemplate(TemplateId),
+
+    /// Answer the form: bind the values and put the result in the buffer.
+    SubmitTemplate,
 }
 
 /// Generates the kind enum and its complete list from one place, so the two
@@ -241,7 +259,8 @@ intent_kinds! {
     OpenSqlTab         => "open a SQL tab",
     SelectTab          => "switch tabs",
     CloseTab           => "close the tab",
-    ListTemplates      => "list the saved statements",
+    Palette            => "the saved statements",
+    UseTemplate        => "use a saved statement",
     SaveTemplate       => "save a statement",
     DeleteTemplate     => "delete a saved statement",
     Cancel             => "stop what is running",
@@ -289,6 +308,14 @@ impl IntentKind {
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
                 ViewCmd::DismissToast(_) => Self::DismissToast,
+                // Opening it, typing in it, moving in it and closing it are
+                // one capability: it is a thing on the screen you operate, not
+                // four things.
+                ViewCmd::Palette(_) => Self::Palette,
+                // And picking is the other: the palette is open in order to
+                // reach this, and a form is a step on the way to it rather
+                // than a capability of its own.
+                ViewCmd::UseTemplate(_) | ViewCmd::SubmitTemplate => Self::UseTemplate,
             },
             Intent::Handover(handover) => match handover {
                 Handover::Edit(_) => Self::EditExternally,
@@ -320,7 +347,10 @@ impl IntentKind {
                 Action::RunQuery { .. } | Action::EstimateQuery { .. } => Self::RunQuery,
                 Action::ApproveQuery(_) => Self::ApproveQuery,
                 Action::ForgetQuery(_) => Self::CloseTab,
-                Action::LoadTemplates => Self::ListTemplates,
+                // Paired with `ViewCmd::Palette`: opening it is what reads
+                // them, and there is no gesture that does one without the
+                // other.
+                Action::LoadTemplates => Self::Palette,
                 // Editing one is saving it: the same capability, and one
                 // gesture in the pane that offers both.
                 Action::SaveTemplate(_) | Action::ReplaceTemplate { .. } => Self::SaveTemplate,
@@ -344,6 +374,9 @@ pub enum Context {
     /// The explorer's filter box has the keyboard. Like `Modal`, it takes it
     /// over entirely: a search for a table called `q` must not quit.
     Filter,
+    /// The palette has it, for the same reason: a saved statement called
+    /// `quarterly` is typed one letter at a time.
+    Palette,
 }
 
 impl Context {
@@ -354,7 +387,7 @@ impl Context {
         match self {
             Self::Explorer => Some(PaneId::Explorer),
             Self::Grid => Some(PaneId::Grid),
-            Self::Global | Self::Modal | Self::Filter => None,
+            Self::Global | Self::Modal | Self::Filter | Self::Palette => None,
         }
     }
 }

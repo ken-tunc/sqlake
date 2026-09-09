@@ -135,6 +135,11 @@ pub enum Target {
         index: usize,
     },
 
+    /// One row of the palette's list of saved statements.
+    PaletteRow {
+        index: usize,
+    },
+
     /// A transient message. Clicking it dismisses it.
     Toast(ToastId),
 
