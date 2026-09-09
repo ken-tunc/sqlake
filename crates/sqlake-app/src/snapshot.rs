@@ -10,7 +10,7 @@ use std::time::Instant;
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::detail::TableDetail;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
-use sqlake_core::library::Template;
+use sqlake_core::library::{HistoryEntry, Template};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileColor, ProfileSummary};
 use sqlake_core::result::Sort;
@@ -221,6 +221,17 @@ pub struct TemplatesView {
     pub failed: Option<String>,
 }
 
+/// What the last search through the history found.
+///
+/// The terms travel with the answer so a front-end can tell a list that is
+/// about what is in its box from one that is still about the words before the
+/// last keystroke.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryView {
+    pub terms: String,
+    pub data: LoadState<Arc<Vec<HistoryEntry>>>,
+}
+
 /// What a busy item is waiting for.
 ///
 /// Cancelling abandons a reply that will now never arrive, so something has to
@@ -243,6 +254,11 @@ pub enum BusyOwner {
         table: TableRef,
     },
     Query(QueryId),
+    /// Searching the history. Its own owner rather than sharing
+    /// [`BusyOwner::Templates`]: they are two questions of one file, and a
+    /// search that cancelled a save because both were "the library" would be
+    /// one gesture stopping another.
+    History,
     /// Reading or writing the library. One owner for all of it: the file is
     /// one thing, the answer is always the whole list, and a write that lands
     /// while a read is in flight would otherwise be two owners disagreeing
@@ -287,6 +303,7 @@ pub struct Snapshot {
     pub queries: Vec<QueryView>,
     pub busy: Vec<BusyItem>,
     pub templates: TemplatesView,
+    pub history: HistoryView,
     pub should_quit: bool,
 }
 
@@ -370,6 +387,15 @@ impl Snapshot {
         !self.busy.iter().any(
             |b| matches!(&b.owner, BusyOwner::Preview { conn: c, table: t } if *c == conn && t == table),
         )
+    }
+
+    /// Whether the store has finished the last search through the history.
+    #[must_use]
+    pub fn history_settled(&self) -> bool {
+        !self
+            .busy
+            .iter()
+            .any(|b| matches!(b.owner, BusyOwner::History))
     }
 
     /// Whether the store has finished reading or writing the library.

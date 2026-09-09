@@ -277,6 +277,7 @@ intent_kinds! {
     SelectTab          => "switch tabs",
     CloseTab           => "close the tab",
     Palette            => "the saved statements",
+    History            => "what this client has run",
     UseTemplate        => "use a saved statement",
     SaveTemplate       => "save a statement",
     DeleteTemplate     => "delete a saved statement",
@@ -378,6 +379,10 @@ impl IntentKind {
                 // gesture in the pane that offers both.
                 Action::SaveTemplate(_) | Action::ReplaceTemplate { .. } => Self::SaveTemplate,
                 Action::DeleteTemplate(_) => Self::DeleteTemplate,
+                // Paired with the history pane T2 opens: searching is what
+                // being in it means, and there is no gesture that does one
+                // without the other.
+                Action::SearchHistory { .. } => Self::History,
                 Action::Cancel(_) => Self::Cancel,
                 Action::Quit => Self::Quit,
             },

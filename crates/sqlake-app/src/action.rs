@@ -186,6 +186,15 @@ pub enum Action {
 
     DeleteTemplate(TemplateId),
 
+    /// Look through what this client has run.
+    ///
+    /// The whole search each time rather than an edit to the one before: the
+    /// key that changed the words is the only thing that knows what it did,
+    /// which is the same reason the explorer's filter travels whole.
+    SearchHistory {
+        terms: String,
+    },
+
     Quit,
 }
 
@@ -220,6 +229,7 @@ impl fmt::Display for Action {
             Self::SaveTemplate(template) => write!(f, "save_template({})", template.name),
             Self::ReplaceTemplate { id, .. } => write!(f, "replace_template({id})"),
             Self::DeleteTemplate(id) => write!(f, "delete_template({id})"),
+            Self::SearchHistory { terms } => write!(f, "search_history({terms:?})"),
             Self::Quit => f.write_str("quit"),
         }
     }

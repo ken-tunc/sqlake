@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use sqlake_core::capability::DriverKind;
 use sqlake_core::library::{
     HistoryEntry, Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart,
-    Template, TemplateId,
+    Search, Template, TemplateId,
 };
 
 use crate::error::{taken, translate};
@@ -263,17 +263,37 @@ impl Library for Sqlite {
         })
     }
 
-    fn history(&self, limit: usize) -> LibraryResult<Vec<HistoryEntry>> {
+    fn search(&self, search: &Search) -> LibraryResult<Vec<HistoryEntry>> {
+        let wanted = match_expression(&search.terms);
         self.with(|connection| {
-            let mut statement = connection
-                .prepare(
+            // Two statements rather than one with an `OR` in the `WHERE`: the
+            // unfiltered one is an index scan over `started_at`, and folding
+            // the match into it would make every listing an FTS lookup that
+            // matches everything.
+            let (sql, matching): (&str, &[&dyn rusqlite::ToSql]) = match &wanted {
+                Some(expression) => (
+                    "SELECT h.id, h.connection_id, h.driver, h.sql, h.started_at, h.status, \
+                     h.duration_ms, h.row_count, h.bytes_processed, h.error \
+                     FROM query_history h \
+                     JOIN query_history_fts f ON f.rowid = h.id \
+                     WHERE query_history_fts MATCH ?2 \
+                     ORDER BY h.started_at DESC, h.id DESC LIMIT ?1",
+                    &[expression],
+                ),
+                None => (
                     "SELECT id, connection_id, driver, sql, started_at, status, duration_ms, \
                      row_count, bytes_processed, error FROM query_history \
                      ORDER BY started_at DESC, id DESC LIMIT ?1",
-                )
-                .map_err(translate)?;
+                    &[],
+                ),
+            };
+            let limit = count(search.limit as u64);
+            let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&limit];
+            bound.extend_from_slice(matching);
+
+            let mut statement = connection.prepare(sql).map_err(translate)?;
             let rows = statement
-                .query_map([count(limit as u64)], |row| {
+                .query_map(bound.as_slice(), |row| {
                     Ok(HistoryEntry {
                         id: RunId::new(row.get(0)?),
                         connection: row.get(1)?,
@@ -350,6 +370,46 @@ fn restrict(path: &Path) -> LibraryResult<()> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path) -> LibraryResult<()> {
     Ok(())
+}
+
+/// What somebody typed, as something FTS5 will accept.
+///
+/// Every run of letters and digits is a term, quoted so that a word FTS5 reads
+/// as an operator — `AND`, `NEAR`, `OR` — is read as a word instead; joined
+/// with `AND`, because narrowing is what typing another word means; and the
+/// last one made a prefix, because it is the one still being typed.
+///
+/// The alternative was to pass the text through as FTS5's own syntax, and it
+/// is wrong for one reason: this runs on every keystroke, and `"` on its own
+/// is a syntax error. Half of a carefully typed query would turn the pane red
+/// on the way to the answer.
+///
+/// `None` when nothing was typed, which is not the same as a search for
+/// nothing: it is the whole history, newest first.
+fn match_expression(terms: &str) -> Option<String> {
+    let words: Vec<String> = terms
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        // A quote inside a term cannot happen — the split above keeps only
+        // letters, digits and `_` — so this doubles nothing today and is the
+        // one line that keeps it true if that ever changes.
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect();
+    let last = words.len().checked_sub(1)?;
+    Some(
+        words
+            .iter()
+            .enumerate()
+            .map(|(at, word)| {
+                if at == last {
+                    format!("{word}*")
+                } else {
+                    word.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
 }
 
 /// Back from the only integer SQLite has. A negative one is a file somebody
@@ -742,7 +802,7 @@ mod tests {
             )
             .expect("it settles");
 
-        let held = library.history(10).expect("it reads");
+        let held = library.search(&Search::newest(10)).expect("it reads");
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].id, id);
         assert_eq!(held[0].sql, "select 1");
@@ -757,7 +817,7 @@ mod tests {
     fn a_running_query_is_in_the_history_with_no_end_on_it() {
         let library = library();
         library.started(run()).expect("it records");
-        let held = library.history(10).expect("it reads");
+        let held = library.search(&Search::newest(10)).expect("it reads");
         assert_eq!(held[0].status, None);
         assert_eq!(held[0].duration_ms, None);
     }
@@ -773,12 +833,139 @@ mod tests {
                 })
                 .expect("it records");
         }
-        let held = library.history(10).expect("it reads");
+        let held = library.search(&Search::newest(10)).expect("it reads");
         // Same millisecond, so the id is what breaks the tie — and it has to,
         // or two runs a second apart from each other read back in either
         // order.
         assert_eq!(held[0].sql, "second");
         assert_eq!(held[1].sql, "first");
+    }
+
+    fn found(library: &Sqlite, terms: &str) -> Vec<String> {
+        library
+            .search(&Search {
+                terms: terms.to_owned(),
+                limit: 10,
+            })
+            .expect("it searches")
+            .into_iter()
+            .map(|entry| entry.sql)
+            .collect()
+    }
+
+    fn recorded(library: &Sqlite, statements: &[&str]) {
+        for sql in statements {
+            library
+                .started(RunStart {
+                    sql: (*sql).to_owned(),
+                    ..run()
+                })
+                .expect("it records");
+        }
+    }
+
+    #[test]
+    fn a_word_in_a_statement_finds_it() {
+        let library = library();
+        recorded(&library, &["select * from orders", "select * from users"]);
+        assert_eq!(found(&library, "orders"), ["select * from orders"]);
+    }
+
+    #[test]
+    fn a_second_word_narrows_rather_than_widens() {
+        // What typing another word means to somebody reading the list.
+        let library = library();
+        recorded(
+            &library,
+            &["select price from orders", "select name from users"],
+        );
+        assert_eq!(found(&library, "select").len(), 2);
+        assert_eq!(
+            found(&library, "select price"),
+            ["select price from orders"]
+        );
+    }
+
+    #[test]
+    fn the_word_still_being_typed_matches_as_a_prefix() {
+        // Otherwise the list is empty for every keystroke but the last, which
+        // is the one search anybody would call broken.
+        let library = library();
+        recorded(&library, &["select * from orders"]);
+        for typed in ["o", "ord", "order", "orders"] {
+            assert_eq!(found(&library, typed).len(), 1, "after typing `{typed}`");
+        }
+    }
+
+    #[test]
+    fn a_half_typed_query_is_never_a_syntax_error() {
+        // Every prefix of something somebody might type, including the ones
+        // that are FTS5 operators and the ones that are punctuation on their
+        // own. A search that fails on the way to an answer is the reason the
+        // text is read as terms rather than as a query language.
+        let library = library();
+        recorded(&library, &["select * from orders where id = 1"]);
+        let typed = r#"select * from "orders" where id = 1 AND (x OR y) NEAR ^ "#;
+        for at in 0..typed.len() {
+            let so_far = &typed[..at];
+            assert!(
+                library
+                    .search(&Search {
+                        terms: so_far.to_owned(),
+                        limit: 10,
+                    })
+                    .is_ok(),
+                "`{so_far}` should not have failed"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_typed_is_the_whole_history() {
+        // Not a search for nothing: the pane opens on what was run last.
+        let library = library();
+        recorded(&library, &["select 1", "select 2"]);
+        assert_eq!(found(&library, "   ").len(), 2);
+        assert_eq!(found(&library, "").len(), 2);
+    }
+
+    #[test]
+    fn a_word_nothing_ran_finds_nothing() {
+        let library = library();
+        recorded(&library, &["select 1"]);
+        assert!(found(&library, "elephant").is_empty());
+    }
+
+    #[test]
+    fn the_limit_is_the_newest_that_many() {
+        let library = library();
+        recorded(&library, &["first", "second", "third"]);
+        let held = library
+            .search(&Search {
+                terms: String::new(),
+                limit: 2,
+            })
+            .expect("it searches");
+        assert_eq!(
+            held.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(),
+            ["third", "second"]
+        );
+    }
+
+    #[test]
+    fn a_deleted_run_is_not_found_afterwards() {
+        // The triggers are what keep the index and the rows in step, and this
+        // is the search that would otherwise answer for something gone.
+        let library = library();
+        recorded(&library, &["select * from orders"]);
+        library
+            .with(|connection| {
+                connection
+                    .execute("DELETE FROM query_history", [])
+                    .map_err(translate)
+            })
+            .expect("it is deleted");
+        assert!(found(&library, "orders").is_empty());
     }
 
     #[test]
