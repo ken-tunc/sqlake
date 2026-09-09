@@ -16,13 +16,20 @@ use sqlake_app::snapshot::{BusyOwner, LoadState, QueryView, Snapshot};
 use sqlake_app::store::Store;
 use sqlake_app::tree::NodeState;
 use sqlake_app::wait::WaitError;
+use std::collections::BTreeMap;
+
+use sqlake_core::capability::{Escaping, QuoteStyle};
 use sqlake_core::id::{ConnId, QueryId};
+use sqlake_core::library::Template;
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::result::{Sort, SortDir};
+use sqlake_core::template::{BoundTemplate, Dialect};
 
 use crate::page::{Budget, Page};
 use crate::protocol::{Failure, Request, Response, schema};
-use crate::snapshot::{ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo};
+use crate::snapshot::{
+    ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo, StatementInfo, TemplateInfo,
+};
 
 /// How long a request waits for the store before giving up.
 ///
@@ -141,6 +148,15 @@ impl Service {
                 .unwrap_or_else(Response::Failed),
             Request::QueryCancel { query } => self
                 .query_cancel(query)
+                .await
+                .unwrap_or_else(Response::Failed),
+            Request::TemplateList {} => self.templates().await.unwrap_or_else(Response::Failed),
+            Request::TemplateApply {
+                template,
+                values,
+                connection,
+            } => self
+                .apply_template(template, values, connection.as_deref())
                 .await
                 .unwrap_or_else(Response::Failed),
             Request::TableDescribe {
@@ -544,6 +560,107 @@ impl Service {
         }
     }
 
+    /// Every saved statement, with what each one asks for.
+    ///
+    /// Read through the store rather than opening the file here, for the same
+    /// reason a preview is: a person may have the palette open on the same
+    /// list, and two readers of one file is one more than there needs to be.
+    async fn templates(&self) -> Result<Response, Failure> {
+        let settled = self
+            .dispatch_and_settle(Action::LoadTemplates, Snapshot::templates_settled)
+            .await?;
+        let held = self.listed(&settled)?;
+        // The standard's quoting, because a listing is not against a
+        // connection: what a template *asks for* does not depend on where it
+        // is going, only on how the answers will be quoted when it does.
+        let dialect = Dialect {
+            quote_style: QuoteStyle::DoubleQuote,
+            escaping: Escaping::None,
+        };
+        Ok(Response::Templates(
+            held.iter()
+                .map(|template| TemplateInfo::of(template, dialect))
+                .collect(),
+        ))
+    }
+
+    /// Fill one in and answer with the statement.
+    async fn apply_template(
+        &self,
+        name: &str,
+        values: &BTreeMap<String, String>,
+        connection: Option<&str>,
+    ) -> Result<Response, Failure> {
+        let settled = self
+            .dispatch_and_settle(Action::LoadTemplates, Snapshot::templates_settled)
+            .await?;
+        let body = self
+            .listed(&settled)?
+            .iter()
+            .find(|template| template.name == name)
+            .map(|template| template.body.clone())
+            .ok_or_else(|| Failure::NoSuchTemplate {
+                name: name.to_owned(),
+            })?;
+
+        let dialect = self.dialect(connection).await?;
+        match BoundTemplate::bind(&body, values, dialect) {
+            Ok(bound) => Ok(Response::Statement(StatementInfo {
+                template: name.to_owned(),
+                sql: bound.text().to_owned(),
+            })),
+            // The caller's arguments, and every one of these says which one to
+            // fix: a value missing, a name that is not in the body, a body
+            // that cannot be read at all.
+            Err(why) => Err(Failure::Template {
+                message: why.to_string(),
+            }),
+        }
+    }
+
+    fn listed<'a>(&self, settled: &'a Snapshot) -> Result<&'a [Template], Failure> {
+        match &settled.templates.data {
+            LoadState::Ready(held) => Ok(held.as_slice()),
+            // Including "this session is not keeping anything", which is the
+            // honest answer to both of these and not an empty list.
+            LoadState::Failed(why) => Err(Failure::Unsupported {
+                message: why.clone(),
+            }),
+            _ => Err(Failure::Timeout {
+                waited_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+            }),
+        }
+    }
+
+    /// Whose quoting rules to fill a template in with.
+    ///
+    /// The named connection, or the session's one, or — with none open — the
+    /// standard's. Refusing to fill in a template because nothing is connected
+    /// would make quoting a reason somebody cannot write a statement.
+    async fn dialect(&self, connection: Option<&str>) -> Result<Dialect, Failure> {
+        let standard = Dialect {
+            quote_style: QuoteStyle::DoubleQuote,
+            escaping: Escaping::None,
+        };
+        let Some(named) = connection else {
+            return Ok(self
+                .store
+                .snapshot()
+                .connections
+                .iter()
+                .find(|c| c.is_ready())
+                .and_then(|c| c.capabilities.as_ref().map(Dialect::from))
+                .unwrap_or(standard));
+        };
+        let conn = self.connection(named).await?;
+        Ok(self
+            .store
+            .snapshot()
+            .connection(conn)
+            .and_then(|c| c.capabilities.as_ref().map(Dialect::from))
+            .unwrap_or(standard))
+    }
+
     async fn describe(
         &self,
         connection: &str,
@@ -752,6 +869,43 @@ mod tests {
 
     async fn service(behaviour: Behaviour) -> (Service, String) {
         service_of(MockDriver::new(behaviour)).await
+    }
+
+    /// A service whose session keeps these templates.
+    async fn service_keeping(templates: &[(&str, &str)]) -> (Service, String) {
+        use sqlake_core::library::Library as _;
+
+        let library = sqlake_library::Sqlite::in_memory().expect("a library opens");
+        for (name, body) in templates {
+            library
+                .add(sqlake_core::library::NewTemplate {
+                    name: (*name).to_owned(),
+                    body: (*body).to_owned(),
+                    driver: None,
+                    tags: Vec::new(),
+                })
+                .expect("it saves");
+        }
+        let store = Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(MockProfiles::default()),
+            )
+            .library(Arc::new(library)),
+        );
+        let conn = ConnId::new();
+        store
+            .dispatch_and_settle(
+                Action::Connect {
+                    profile: ProfileId::parse("mock").expect("a usable id"),
+                    conn,
+                },
+                DEFAULT_TIMEOUT,
+                |s| s.connection_settled(conn),
+            )
+            .await
+            .expect("the connection settles");
+        (Service::new(store), conn.to_string())
     }
 
     async fn service_of(driver: MockDriver) -> (Service, String) {
@@ -1321,6 +1475,22 @@ mod tests {
                 .await,
         );
 
+        // A template and a statement built from one, which need a session
+        // that keeps something.
+        let (keeping, _) = service_keeping(&[("daily", "select * from {{ident:table}}")]).await;
+        responses.push(keeping.answer(&Request::TemplateList {}).await);
+        responses.push(
+            keeping
+                .answer(&Request::TemplateApply {
+                    template: "daily".into(),
+                    values: [("table".to_owned(), "users".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    connection: None,
+                })
+                .await,
+        );
+
         // A definition, under the narrow budget so that `omitted_columns` is
         // written here too — and against a driver that has indexes, because a
         // `sections` list is empty on the default mock and an empty one is
@@ -1406,6 +1576,12 @@ mod tests {
                 profile: "prod".into(),
             },
             Failure::NoSuchQuery { query: "q".into() },
+            Failure::NoSuchTemplate {
+                name: "daily".into(),
+            },
+            Failure::Template {
+                message: "`table` has no value".into(),
+            },
             Failure::NotFound {
                 path: vec!["public".into()],
             },
@@ -1472,6 +1648,7 @@ mod tests {
         }
 
         let expected: BTreeSet<String> = [
+            "body",
             "cancel",
             "capabilities",
             "columns",
@@ -1496,6 +1673,7 @@ mod tests {
             "generated_ddl",
             "hierarchy",
             "id",
+            "kind",
             "loaded",
             "message",
             "name",
@@ -1514,11 +1692,13 @@ mod tests {
             "rows",
             "sections",
             "sortable_preview",
+            "placeholders",
             "sql",
             "state",
             "stats",
             "status",
             "table",
+            "template",
             "title",
             "total",
             "truncated",
@@ -1724,6 +1904,119 @@ mod tests {
             ["Indexes"]
         );
         assert!(!definition.stats.is_empty(), "{definition:?}");
+    }
+
+    #[tokio::test]
+    async fn a_template_is_listed_with_what_it_asks_for() {
+        // So a caller need not find `{{…}}` in the body itself: a second
+        // parser is a second answer to what a template needs.
+        let (service, _) =
+            service_keeping(&[("daily", "select * from {{ident:table}} where d = {{day}}")]).await;
+        let answer = service.answer(&Request::TemplateList {}).await;
+        let Response::Templates(held) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].name, "daily");
+        assert_eq!(
+            held[0]
+                .placeholders
+                .iter()
+                .map(|p| (p.name.as_str(), p.kind.as_str()))
+                .collect::<Vec<_>>(),
+            [("table", "ident"), ("day", "value")]
+        );
+        assert_eq!(held[0].unreadable, None);
+    }
+
+    #[tokio::test]
+    async fn a_template_that_cannot_be_read_is_still_listed_and_says_why() {
+        // Dropping it would leave a saved statement that is invisible; saying
+        // it has no placeholders would send a caller on to apply it and be
+        // refused for a reason it could have had here.
+        let (service, _) = service_keeping(&[("broken", "select '{{x}}'")]).await;
+        let answer = service.answer(&Request::TemplateList {}).await;
+        let Response::Templates(held) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert!(held[0].placeholders.is_empty());
+        assert!(held[0].unreadable.is_some(), "{held:?}");
+    }
+
+    #[tokio::test]
+    async fn applying_a_template_answers_sql_and_runs_nothing() {
+        let (service, _) =
+            service_keeping(&[("daily", "select * from {{ident:table}} where n = {{name}}")]).await;
+        let answer = service
+            .answer(&Request::TemplateApply {
+                template: "daily".into(),
+                values: [
+                    ("table".to_owned(), "users".to_owned()),
+                    ("name".to_owned(), "o'brien".to_owned()),
+                ]
+                .into_iter()
+                .collect(),
+                connection: None,
+            })
+            .await;
+        let Response::Statement(statement) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert_eq!(
+            statement.sql,
+            r#"select * from "users" where n = 'o''brien'"#
+        );
+        assert_eq!(statement.template, "daily");
+        // And nothing ran: no query exists to have run.
+        assert!(service.store().snapshot().queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_value_left_out_says_which_one() {
+        let (service, _) = service_keeping(&[("daily", "select {{a}}, {{b}}")]).await;
+        let answer = service
+            .answer(&Request::TemplateApply {
+                template: "daily".into(),
+                values: [("a".to_owned(), "1".to_owned())].into_iter().collect(),
+                connection: None,
+            })
+            .await;
+        let Response::Failed(Failure::Template { message }) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert!(message.contains('b'), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_template_nobody_saved_is_named_as_a_template() {
+        // Rather than as a path that was not found: a caller that used the
+        // wrong name needs to be told which kind of thing it got wrong.
+        let (service, _) = service_keeping(&[]).await;
+        let answer = service
+            .answer(&Request::TemplateApply {
+                template: "nope".into(),
+                values: std::collections::BTreeMap::new(),
+                connection: None,
+            })
+            .await;
+        assert_eq!(
+            answer,
+            Response::Failed(Failure::NoSuchTemplate {
+                name: "nope".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_keeping_nothing_says_so_rather_than_listing_none() {
+        // An empty list would say "you have no saved statements", which is a
+        // different thing from "this session cannot keep any".
+        let (service, _) = service(Behaviour::instant()).await;
+        let answer = service.answer(&Request::TemplateList {}).await;
+        let Response::Failed(Failure::Unsupported { message }) = &answer else {
+            panic!("{answer:?}");
+        };
+        assert!(message.contains("keeping"), "{message}");
     }
 
     #[tokio::test]

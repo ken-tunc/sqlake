@@ -78,6 +78,10 @@ pub const fn takes_a_connection(kind: RequestKind) -> bool {
             | RequestKind::TableList
             | RequestKind::TablePreview
             | RequestKind::TableDescribe
+            // Optional here, unlike everywhere else: filling a template in
+            // needs quoting rules rather than a database, and there is a
+            // sensible answer with nothing open at all.
+            | RequestKind::TemplateApply
             | RequestKind::ConnectionClose
             | RequestKind::QueryEstimate
             | RequestKind::QueryRun
@@ -103,6 +107,14 @@ pub const fn describes(kind: RequestKind) -> &'static str {
         RequestKind::TableList => "The relations in one namespace.",
         RequestKind::TablePreview => {
             "A page of one relation, read without running a query where the driver allows it."
+        }
+        RequestKind::TemplateList => {
+            "The statements saved in this session's library, with the placeholders each one \
+             asks for."
+        }
+        RequestKind::TemplateApply => {
+            "Fill a saved statement's placeholders in and get the SQL back. It is not run: \
+             pass the answer to query_run when you want that."
         }
         RequestKind::TableDescribe => {
             "What a relation is rather than what is in it: columns, indexes, and a CREATE \

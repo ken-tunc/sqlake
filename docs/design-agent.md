@@ -49,6 +49,7 @@ sqlake connection list
 sqlake connection open|close    against a session that outlives the command
 sqlake schema list              namespaces in a connection
 sqlake table list|preview|describe
+sqlake template list|apply    saved statements; `apply` answers SQL and runs nothing
 sqlake query estimate|run|status|wait|cancel
 sqlake mcp                      speak MCP on stdio
 ```

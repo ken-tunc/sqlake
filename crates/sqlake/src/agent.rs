@@ -8,6 +8,7 @@
 //! JSON goes to stdout and nothing else does. Diagnostics go to stderr, so a
 //! caller can pipe stdout into a parser without filtering prose out of it.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,6 +47,11 @@ pub(crate) enum Command {
     Table {
         #[command(subcommand)]
         what: TableCommand,
+    },
+    /// Saved statements.
+    Template {
+        #[command(subcommand)]
+        what: TemplateCommand,
     },
     /// Statements, and what running them produced.
     Query {
@@ -124,6 +130,33 @@ pub(crate) enum ConnectionCommand {
     /// Which one is chosen the way every other command chooses: the session's
     /// ready connection, narrowed by `--connect`.
     Close,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum TemplateCommand {
+    /// The saved statements, with the placeholders each one asks for.
+    List,
+    /// Fill a saved statement in and print the SQL. It is not run.
+    Apply {
+        /// The template's name, as `template list` prints it.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// One `placeholder=value`. Repeat it for each one the template asks
+        /// for; a missing one is refused rather than left empty.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+    },
+}
+
+impl TemplateCommand {
+    /// `name=value` pairs, split at the first `=` only: a value with an `=` in
+    /// it is a real thing, and a name with one is not.
+    fn values(set: &[String]) -> BTreeMap<String, String> {
+        set.iter()
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +254,19 @@ impl Command {
             } => Request::TableList {
                 connection,
                 namespace: path.segments(),
+            },
+            Self::Template {
+                what: TemplateCommand::List,
+            } => Request::TemplateList {},
+            Self::Template {
+                what: TemplateCommand::Apply { name, set },
+            } => Request::TemplateApply {
+                template: name.clone(),
+                values: TemplateCommand::values(set),
+                // The session's own, which is what `--connect` narrowed. A
+                // template applied against nothing still has an answer, so
+                // this is a preference rather than a requirement.
+                connection: Some(connection),
             },
             Self::Query {
                 what: QueryCommand::Estimate { sql },
@@ -332,6 +378,10 @@ impl Command {
                 what: ConnectionCommand::Close,
             } => Needs::LiveConnection,
             Self::Schema { .. } | Self::Table { .. } => Needs::Connection,
+            // A connection, because the quoting rules come from one — but a
+            // one-shot store can open it, answer, and go: nothing here
+            // outlives the command.
+            Self::Template { .. } => Needs::Connection,
             // Estimating names a connection and answers a number, which a
             // store that dies afterwards can still do.
             Self::Query {
@@ -718,6 +768,10 @@ fn diagnostic(failure: &Failure) -> String {
         Failure::NoSuchQuery { query } => {
             format!("this session started no query called `{query}`")
         }
+        Failure::NoSuchTemplate { name } => {
+            format!("no template called `{name}` is saved. `sqlake template list` prints them")
+        }
+        Failure::Template { message } => message.clone(),
         Failure::NoSuchProfile { profile } => {
             format!("no profile called `{profile}` is configured in connections.toml")
         }
@@ -1016,6 +1070,31 @@ mod tests {
             parse(&["table", "describe", "public.users", "--refresh"]).request("c".into()),
             Request::TableDescribe { refresh: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_value_with_an_equals_sign_in_it_survives() {
+        // Split at the first `=` only: a value containing one is a real thing
+        // — a `where` clause fragment, a date range — and a placeholder name
+        // containing one is not.
+        let command = parse(&[
+            "template",
+            "apply",
+            "daily",
+            "--set",
+            "table=users",
+            "--set",
+            "filter=a=b",
+        ]);
+        let Request::TemplateApply {
+            template, values, ..
+        } = command.request("c".into())
+        else {
+            panic!("that is not a template apply");
+        };
+        assert_eq!(template, "daily");
+        assert_eq!(values["table"], "users");
+        assert_eq!(values["filter"], "a=b");
     }
 
     #[test]
