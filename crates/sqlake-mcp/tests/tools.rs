@@ -38,6 +38,29 @@ async fn server() -> Server {
     Server::new(Backend::Local(Box::new(Service::new(store))), None)
 }
 
+/// A session with a template saved and nothing connected.
+async fn server_with_a_template() -> Server {
+    use sqlake_core::library::{Library as _, NewTemplate};
+
+    let library = sqlake_library::Sqlite::in_memory().expect("a library opens");
+    library
+        .add(NewTemplate {
+            name: "daily".to_owned(),
+            body: "select * from {{ident:table}}".to_owned(),
+            driver: None,
+            tags: Vec::new(),
+        })
+        .expect("it saves");
+    let store = Store::spawn(
+        Wiring::new(
+            Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+            Arc::new(MockProfiles::default()),
+        )
+        .library(Arc::new(library)),
+    );
+    Server::new(Backend::Local(Box::new(Service::new(store))), None)
+}
+
 fn call(name: &str, arguments: Json) -> CallToolRequestParams {
     let Json::Object(arguments) = arguments else {
         panic!("arguments are an object");
@@ -180,4 +203,31 @@ async fn every_tool_the_list_offers_can_be_called() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_template_applies_with_nothing_connected() {
+    // The server fills a connection in wherever it can, and this is the one
+    // tool that has an answer when it cannot: filling a template in needs
+    // quoting rules, not a database. Refusing here made this wrapper stricter
+    // than the protocol it wraps.
+    let server = server_with_a_template().await;
+    let answer = server
+        .answer(call(
+            "template_apply",
+            json!({"template": "daily", "values": {"table": "users"}}),
+        ))
+        .await;
+    let Response::Statement(statement) = answer else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(statement.sql, r#"select * from "users""#);
+}
+
+#[tokio::test]
+async fn a_tool_that_needs_a_connection_still_says_when_there_is_none() {
+    // The other half: only the optional ones carry on without one.
+    let server = server_with_a_template().await;
+    let answer = server.answer(call("namespace_list", json!({}))).await;
+    assert!(matches!(answer, Response::Failed(_)), "{answer:?}");
 }

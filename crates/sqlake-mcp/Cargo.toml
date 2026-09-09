@@ -21,3 +21,4 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 sqlake-app.workspace = true
 sqlake-core.workspace = true
 sqlake-driver-mock.workspace = true
+sqlake-library.workspace = true

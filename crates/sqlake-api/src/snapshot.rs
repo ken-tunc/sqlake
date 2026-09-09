@@ -14,7 +14,9 @@ use sqlake_app::tree::{NodeState, VisibleNode};
 use sqlake_core::capability::Capabilities;
 use sqlake_core::detail::{ColumnDef, TableDetail};
 use sqlake_core::id::ConnId;
+use sqlake_core::library::Template;
 use sqlake_core::sql::{Estimate, Position};
+use sqlake_core::template::{Dialect, Kind, Placeholder, placeholders};
 
 use crate::page::{Budget, Page};
 
@@ -586,4 +588,84 @@ impl DefinitionInfo {
                 .collect(),
         }
     }
+}
+
+/// One placeholder a template asks for.
+///
+/// Listed with the template so a caller need not find `{{…}}` in the body
+/// itself: two readers of one template disagreeing about what it asks for is
+/// exactly what a second parser produces.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct PlaceholderInfo {
+    pub name: String,
+    /// `value` or `ident`. It decides how the answer is quoted, and therefore
+    /// what kind of thing to send: a name here, a value there.
+    pub kind: String,
+}
+
+impl From<&Placeholder> for PlaceholderInfo {
+    fn from(placeholder: &Placeholder) -> Self {
+        Self {
+            name: placeholder.name.clone(),
+            kind: match placeholder.kind {
+                Kind::Value => "value",
+                Kind::Ident => "ident",
+            }
+            .to_owned(),
+        }
+    }
+}
+
+/// A saved statement.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct TemplateInfo {
+    /// What `template_apply` names it by. Unique, which is what makes it the
+    /// name rather than the row id.
+    pub name: String,
+    pub body: String,
+    /// The driver it is written for, or absent for one that works on any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placeholders: Vec<PlaceholderInfo>,
+    /// Why the body could not be read, when it could not.
+    ///
+    /// Said rather than dropped: a template with an unterminated string in it
+    /// is still saved and still shown, and a caller told only that it has no
+    /// placeholders would go on to apply it and be refused for a reason it
+    /// could have been given here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+}
+
+impl TemplateInfo {
+    /// The wire form, with the placeholders worked out under `dialect`.
+    #[must_use]
+    pub fn of(template: &Template, dialect: Dialect) -> Self {
+        let (placeholders, unreadable) = match placeholders(&template.body, dialect) {
+            Ok(found) => (found.iter().map(PlaceholderInfo::from).collect(), None),
+            Err(why) => (Vec::new(), Some(why.to_string())),
+        };
+        Self {
+            name: template.name.clone(),
+            body: template.body.clone(),
+            driver: template.driver.map(|kind| kind.as_str().to_owned()),
+            tags: template.tags.clone(),
+            placeholders,
+            unreadable,
+        }
+    }
+}
+
+/// A template with its placeholders filled in.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct StatementInfo {
+    /// Which template it came from, so an answer can be read next to the
+    /// thing that produced it.
+    pub template: String,
+    /// The statement, quoted for the connection it was built against. Not run
+    /// — `query_run` is what runs one.
+    pub sql: String,
 }

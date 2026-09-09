@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
 use crate::page::{Budget, Page};
-use crate::snapshot::{ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo};
+use crate::snapshot::{
+    ConnectionInfo, DefinitionInfo, NodeInfo, QueryInfo, SessionInfo, StatementInfo, TemplateInfo,
+};
 
 /// Which column to sort a preview by.
 ///
@@ -158,6 +160,37 @@ pub enum Request {
         limit: Option<usize>,
     },
 
+    /// The saved statements, with the placeholders each one needs.
+    ///
+    /// The placeholders are listed here so that a caller need not parse
+    /// `{{…}}` out of the body itself — and so that two readers of the same
+    /// template cannot disagree about what it asks for.
+    TemplateList {},
+
+    /// Fill a template in and answer with the statement, without running it.
+    ///
+    /// Answering text rather than running it is the whole shape of this: an
+    /// agent that wants it run already has `query_run`, and a template tool
+    /// that ran things would be a second, quieter way to the gate that
+    /// `query_estimate` and the budget exist to be.
+    TemplateApply {
+        /// The template's name, which is what a person and an agent both call
+        /// it. Ids here are rows in a file, and a caller that had to look one
+        /// up first would be making two calls to answer one question.
+        template: String,
+        /// One entry per placeholder. A missing one is refused rather than
+        /// left empty: a statement with a hole in it is a syntax error
+        /// reported against text nobody wrote.
+        #[serde(default)]
+        values: std::collections::BTreeMap<String, String>,
+        /// Whose quoting rules to use. Omitted, the session picks a connection
+        /// the way every other request does — and with none open at all, the
+        /// standard's: double quotes, and a backslash that is an ordinary
+        /// character.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>,
+    },
+
     /// What a relation is, as opposed to what is in it: its columns, its
     /// indexes, and a `CREATE` statement built from the catalogue.
     ///
@@ -211,6 +244,8 @@ request_kinds! {
     TableList       => "table_list",
     TablePreview    => "table_preview",
     TableDescribe   => "table_describe",
+    TemplateList    => "template_list",
+    TemplateApply   => "template_apply",
     QueryEstimate   => "query_estimate",
     QueryRun        => "query_run",
     QueryStatus     => "query_status",
@@ -237,6 +272,8 @@ impl Request {
             Self::TableList { .. } => RequestKind::TableList,
             Self::TablePreview { .. } => RequestKind::TablePreview,
             Self::TableDescribe { .. } => RequestKind::TableDescribe,
+            Self::TemplateList {} => RequestKind::TemplateList,
+            Self::TemplateApply { .. } => RequestKind::TemplateApply,
             Self::QueryEstimate { .. } => RequestKind::QueryEstimate,
             Self::QueryRun { .. } => RequestKind::QueryRun,
             Self::QueryStatus { .. } => RequestKind::QueryStatus,
@@ -283,6 +320,18 @@ pub enum Failure {
     /// query id is not a path through anything, and a caller that lost one
     /// needs to be told which kind of thing it lost.
     NoSuchQuery { query: String },
+    /// No template is saved under this name.
+    ///
+    /// Its own failure for the same reason [`Failure::NoSuchQuery`] is: a
+    /// template name is not a path through anything, and a caller that used
+    /// the wrong one needs to be told which kind of thing it got wrong.
+    NoSuchTemplate { name: String },
+    /// The template could not be filled in with what was sent — a value
+    /// missing, a name that is not in it, a body that cannot be read.
+    ///
+    /// Apart from [`Failure::NoSuchTemplate`] because the two are fixed
+    /// differently: one is the wrong arguments, the other the wrong template.
+    Template { message: String },
     /// No profile with this id is configured. Distinct from
     /// [`Failure::NoSuchConnection`] because the two are fixed in different
     /// files: one is a typo in the request, the other in `connections.toml`.
@@ -331,6 +380,9 @@ pub enum Response {
     /// definition is not rows, and the half that is comes under titles the
     /// driver chose.
     Definition(DefinitionInfo),
+    Templates(Vec<TemplateInfo>),
+    /// A template, filled in. Not a run — see [`Request::TemplateApply`].
+    Statement(StatementInfo),
     /// One query, wherever it has got to. The answer to running, waiting,
     /// asking and cancelling alike: all four are questions about one thing,
     /// and giving each its own shape would make a caller parse four.
@@ -362,6 +414,8 @@ kinds!(
     Nodes,
     Page,
     Definition,
+    Templates,
+    Statement,
     Query,
     Failed,
 );
@@ -373,6 +427,8 @@ kinds!(
     FailureKind: NoSuchConnection,
     NoSuchProfile,
     NoSuchQuery,
+    NoSuchTemplate,
+    Template,
     NotFound,
     Driver,
     Timeout,
@@ -393,6 +449,8 @@ impl Response {
             Self::Nodes(_) => ResponseKind::Nodes,
             Self::Page(_) => ResponseKind::Page,
             Self::Definition(_) => ResponseKind::Definition,
+            Self::Templates(_) => ResponseKind::Templates,
+            Self::Statement(_) => ResponseKind::Statement,
             Self::Query(_) => ResponseKind::Query,
             Self::Failed(_) => ResponseKind::Failed,
         }
@@ -408,6 +466,8 @@ impl Failure {
         match self {
             Self::NoSuchConnection { .. } => FailureKind::NoSuchConnection,
             Self::NoSuchProfile { .. } => FailureKind::NoSuchProfile,
+            Self::NoSuchTemplate { .. } => FailureKind::NoSuchTemplate,
+            Self::Template { .. } => FailureKind::Template,
             Self::NoSuchQuery { .. } => FailureKind::NoSuchQuery,
             Self::NotFound { .. } => FailureKind::NotFound,
             Self::Driver { .. } => FailureKind::Driver,
@@ -499,6 +559,12 @@ mod tests {
                 table: vec!["public".into(), "users".into()],
                 sort: None,
                 limit: None,
+            },
+            Request::TemplateList {},
+            Request::TemplateApply {
+                template: "daily".into(),
+                values: std::collections::BTreeMap::new(),
+                connection: None,
             },
             Request::TableDescribe {
                 connection: "c".into(),
