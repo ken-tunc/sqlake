@@ -4050,6 +4050,7 @@ dependencies = [
  "serde_json",
  "sqlake-core",
  "sqlake-driver-mock",
+ "sqlake-library",
  "thiserror 2.0.20",
  "time",
  "tokio",

@@ -10,6 +10,12 @@ pub enum AppError {
     #[error(transparent)]
     Driver(#[from] DriverError),
 
+    /// The file holding templates and history said no. Its own variant rather
+    /// than `Refused`, because where to go looking is different again: not the
+    /// server's log and not this client's rules, but a file on this disk.
+    #[error(transparent)]
+    Library(#[from] sqlake_core::library::LibraryError),
+
     /// The session actor is gone, so the connection is effectively closed.
     #[error("connection is closed")]
     SessionClosed,

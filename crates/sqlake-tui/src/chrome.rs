@@ -509,6 +509,7 @@ mod tests {
                     started_at: Instant::now(),
                 })
                 .collect(),
+            templates: sqlake_app::snapshot::TemplatesView::default(),
             should_quit: false,
         }
     }

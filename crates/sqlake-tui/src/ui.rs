@@ -1568,6 +1568,7 @@ mod tests {
             }],
             queries: Vec::new(),
             busy: Vec::new(),
+            templates: sqlake_app::snapshot::TemplatesView::default(),
             should_quit: false,
         }
     }
