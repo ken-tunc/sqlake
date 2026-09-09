@@ -510,6 +510,7 @@ mod tests {
                 })
                 .collect(),
             templates: sqlake_app::snapshot::TemplatesView::default(),
+            history: sqlake_app::snapshot::HistoryView::default(),
             should_quit: false,
         }
     }

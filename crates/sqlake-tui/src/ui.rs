@@ -1828,6 +1828,7 @@ mod tests {
             queries: Vec::new(),
             busy: Vec::new(),
             templates: sqlake_app::snapshot::TemplatesView::default(),
+            history: sqlake_app::snapshot::HistoryView::default(),
             should_quit: false,
         }
     }

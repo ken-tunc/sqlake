@@ -19,7 +19,8 @@ use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
 use sqlake_core::library::{
-    Library, LibraryError, LibraryResult, RunId, RunOutcome, RunStart, Template,
+    HistoryEntry, Library, LibraryError, LibraryResult, RunId, RunOutcome, RunStart, Search,
+    Template,
 };
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
@@ -36,11 +37,18 @@ use crate::error::{AppError, AppResult};
 /// A message rather than an empty list: nothing was saved *and* nothing can
 /// be, and the two look identical in a pane that draws no rows.
 const NOTHING_KEPT: &str = "this session is not keeping anything";
+
+/// The most history rows one search answers with.
+///
+/// There is no paging: a history is searched rather than read through, and a
+/// search too wide to fit is one to narrow rather than to page. Two hundred is
+/// more than a screen and less than a wait.
+const HISTORY_LIMIT: usize = 200;
 use crate::pages::PagedResult;
 use crate::session::SessionHandle;
 use crate::snapshot::{
-    BusyItem, BusyOwner, ConnStatus, ConnectionView, DefinitionView, LoadState, PreviewView,
-    QueryView, Snapshot, TemplatesView,
+    BusyItem, BusyOwner, ConnStatus, ConnectionView, DefinitionView, HistoryView, LoadState,
+    PreviewView, QueryView, Snapshot, TemplatesView,
 };
 use crate::tree::{NodeState, Toggle, TreeState, TreeView, VisibleNode};
 use crate::usecase::{
@@ -191,6 +199,7 @@ impl Store {
             budget,
             library,
             templates: TemplatesView::default(),
+            history: HistoryView::default(),
             runs: HashMap::new(),
             events: event_tx,
             conns: Vec::new(),
@@ -300,6 +309,13 @@ enum Event {
     /// The library answered, and the answer is always the whole list: a write
     /// is followed by a read in the same trip to the file, because another
     /// window may have changed it too and the list is what a pane draws.
+    /// A search through the history came back, with the words it was for: a
+    /// slower search must not overwrite the answer to a later one.
+    Searched {
+        busy: BusyId,
+        terms: String,
+        result: AppResult<Vec<HistoryEntry>>,
+    },
     Library {
         busy: BusyId,
         /// `Err` here is the *write* failing. A read that failed leaves the
@@ -444,6 +460,7 @@ struct Runtime {
     /// Not in the snapshot: a `RunId` is bookkeeping between this store and a
     /// file, and no front-end has anything to do with one.
     runs: HashMap<QueryId, Recording>,
+    history: HistoryView,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     previews: Vec<Preview>,
@@ -600,6 +617,7 @@ impl Runtime {
                     library.remove(id)
                 });
             }
+            Action::SearchHistory { terms } => self.search_history(terms),
             Action::Cancel(id) => self.cancel(id),
             Action::Quit => self.should_quit = true,
         }
@@ -706,10 +724,10 @@ impl Runtime {
                 BusyOwner::Query(query) => {
                     self.queries.iter().any(|q| q.id == *query && q.conn == id)
                 }
-                // Templates belong to the session, not to a connection: they
-                // are the same file whichever database is open, and closing
-                // one is no reason to abandon a save.
-                BusyOwner::Templates => false,
+                // The library belongs to the session, not to a connection: it
+                // is the same file whichever database is open, and closing one
+                // is no reason to abandon a save or a search.
+                BusyOwner::Templates | BusyOwner::History => false,
             })
             .map(|b| (b.id, b.owner.clone()))
             .collect();
@@ -1458,6 +1476,69 @@ impl Runtime {
         })
     }
 
+    /// Look through the history for what somebody typed.
+    ///
+    /// A search in flight is dropped rather than waited for: the words have
+    /// changed, so its answer is about a box that no longer says that — and
+    /// leaving it running is how a slow one lands on top of a fast one.
+    fn search_history(&mut self, terms: String) {
+        let Some(library) = self.library.clone() else {
+            self.history = HistoryView {
+                terms,
+                data: LoadState::Failed(NOTHING_KEPT.to_owned()),
+            };
+            return;
+        };
+        let superseded: Vec<BusyId> = self
+            .busy
+            .iter()
+            .filter(|b| matches!(b.owner, BusyOwner::History))
+            .map(|b| b.id)
+            .collect();
+        for busy in superseded {
+            self.drop_task(busy);
+        }
+
+        // The rows already on screen stay while the next answer is on its way:
+        // a list that empties on every keystroke is one nobody can read while
+        // typing.
+        if self.history.data.ready().is_none() {
+            self.history.data = LoadState::Loading;
+        }
+        self.history.terms.clone_from(&terms);
+
+        let busy = self.begin_busy(BusyOwner::History, "searching the history");
+        let events = self.events.clone();
+        let search = Search {
+            terms: terms.clone(),
+            limit: HISTORY_LIMIT,
+        };
+        self.spawn_task(busy, async move {
+            let answer = tokio::task::spawn_blocking(move || library.search(&search)).await;
+            let result = match answer {
+                Ok(found) => found.map_err(AppError::from),
+                Err(why) => Err(AppError::Refused(why.to_string())),
+            };
+            let _ = events.send(Event::Searched {
+                busy,
+                terms,
+                result,
+            });
+        });
+    }
+
+    fn searched(&mut self, terms: String, result: AppResult<Vec<HistoryEntry>>) {
+        // An answer to words the box no longer holds is an answer to a
+        // question nobody is asking any more.
+        if self.history.terms != terms {
+            return;
+        }
+        self.history.data = match result {
+            Ok(found) => LoadState::Ready(Arc::new(found)),
+            Err(why) => LoadState::Failed(why.user_message()),
+        };
+    }
+
     /// Every library operation is a write, then a read, on one blocking task.
     ///
     /// The read happens even when nothing was written, and even when the write
@@ -1579,6 +1660,15 @@ impl Runtime {
                     conn.view = Arc::new(conn.tree.flatten(conn.id));
                 }
             }
+            BusyOwner::History => {
+                // The rows on screen are still the answer to the words that
+                // found them. Only a search that never landed has to say
+                // something, or the pane spins for an answer nobody is
+                // bringing.
+                if self.history.data.is_loading() {
+                    self.history.data = LoadState::Failed(reason.to_owned());
+                }
+            }
             BusyOwner::Templates => {
                 self.templates.failed = Some(reason.to_owned());
                 // A list that was on screen stays on screen: a cancelled read
@@ -1694,6 +1784,14 @@ impl Runtime {
                 result,
             } => self.library_answered(busy, wrote, result),
             Event::Recorded { query, result } => self.recorded(query, result),
+            Event::Searched {
+                busy,
+                terms,
+                result,
+            } => {
+                self.end_busy(busy);
+                self.searched(terms, result);
+            }
         }
     }
 
@@ -1926,6 +2024,7 @@ impl Runtime {
             queries: self.queries.clone(),
             busy: self.busy.clone(),
             templates: self.templates.clone(),
+            history: self.history.clone(),
             should_quit: self.should_quit,
         }
     }
@@ -2198,7 +2297,9 @@ mod tests {
         done: impl Fn(&[sqlake_core::library::HistoryEntry]) -> bool,
     ) -> Vec<sqlake_core::library::HistoryEntry> {
         for _ in 0..200 {
-            let held = library.history(10).expect("it reads");
+            let held = library
+                .search(&sqlake_core::library::Search::newest(10))
+                .expect("it reads");
             if done(&held) {
                 return held;
             }
@@ -2324,6 +2425,127 @@ mod tests {
         let both = history(&library, |h| h.len() == 2 && h[0].status.is_some()).await;
         assert_eq!(both[0].status.as_deref(), Some("ok"));
         assert_eq!(both[1].status.as_deref(), Some("refused"));
+    }
+
+    async fn searched(store: &Store, terms: &str) -> Vec<String> {
+        let snap = settled(
+            store,
+            Action::SearchHistory {
+                terms: terms.to_owned(),
+            },
+            Snapshot::history_settled,
+        )
+        .await;
+        snap.history
+            .data
+            .ready()
+            .expect("a list")
+            .iter()
+            .map(|entry| entry.sql.clone())
+            .collect()
+    }
+
+    /// A store whose history already holds these statements.
+    async fn store_with_history(statements: &[&str]) -> Store {
+        let library = sqlake_library::Sqlite::in_memory().expect("a library opens");
+        for sql in statements {
+            library
+                .started(sqlake_core::library::RunStart {
+                    connection: ConnId::new(),
+                    driver: DriverKind::Mock,
+                    sql: (*sql).to_owned(),
+                    started_at: time::OffsetDateTime::now_utc(),
+                })
+                .expect("it records");
+        }
+        Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(MockProfiles::default()),
+            )
+            .library(Arc::new(library)),
+        )
+    }
+
+    #[tokio::test]
+    async fn searching_the_history_publishes_what_it_found() {
+        let store = store_with_history(&["select * from orders", "select * from users"]).await;
+        assert_eq!(searched(&store, "orders").await, ["select * from orders"]);
+        assert_eq!(searched(&store, "").await.len(), 2, "nothing typed is all");
+    }
+
+    #[tokio::test]
+    async fn the_words_travel_with_the_answer() {
+        // So a front-end can tell a list that is about what is in its box from
+        // one that is still about the keystroke before.
+        let store = store_with_history(&["select 1"]).await;
+        let snap = settled(
+            &store,
+            Action::SearchHistory {
+                terms: "select".to_owned(),
+            },
+            Snapshot::history_settled,
+        )
+        .await;
+        assert_eq!(snap.history.terms, "select");
+    }
+
+    #[tokio::test]
+    async fn the_rows_on_screen_survive_the_next_keystroke() {
+        // A list that empties while somebody types is one they cannot read
+        // while typing, which is the whole of what an incremental search is
+        // for.
+        let store = store_with_history(&["select * from orders"]).await;
+        searched(&store, "orders").await;
+
+        store.dispatch(Action::SearchHistory {
+            terms: "order".to_owned(),
+        });
+        let during = until(&store, |s| !s.history_settled()).await;
+        assert!(
+            during.history.data.ready().is_some(),
+            "the rows went while the next answer was on its way"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_keeping_nothing_says_so_where_the_history_would_be() {
+        let store = store(Behaviour::instant());
+        let snap = settled(
+            &store,
+            Action::SearchHistory {
+                terms: String::new(),
+            },
+            Snapshot::history_settled,
+        )
+        .await;
+        assert_eq!(snap.history.data.error(), Some(NOTHING_KEPT));
+    }
+
+    #[tokio::test]
+    async fn a_run_is_findable_by_a_word_in_it() {
+        // End to end: the row M7 writes is the row M8 finds.
+        let (store, library) = store_recording();
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+                max_bytes: None,
+            },
+            |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        history(&library, |h| h.first().is_some_and(|e| e.status.is_some())).await;
+
+        assert_eq!(
+            searched(&store, "public").await,
+            ["select * from public.users"]
+        );
     }
 
     #[tokio::test]

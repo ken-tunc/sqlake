@@ -1392,6 +1392,12 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         IntentKind::Quit => vec![Action::Quit.into()],
         IntentKind::Palette => palette(event, ctx),
         IntentKind::UseTemplate => use_template(ctx),
+        // No key yet: the pane it belongs to is T2's, and a key that searched
+        // a history nothing draws would be one that does nothing visible.
+        // `IntentKind::of` still has to name it, which is what makes that
+        // pane's bindings a compile-time question rather than something to
+        // remember.
+        IntentKind::History => Vec::new(),
         IntentKind::SaveTemplate => save_template(ctx),
         IntentKind::DeleteTemplate => delete_template(ctx),
     }
@@ -1798,6 +1804,7 @@ mod tests {
             // Something saved, so the palette's own bindings reach a
             // template rather than an empty list — a sweep over an empty
             // palette would report `Enter` dead.
+            history: sqlake_app::snapshot::HistoryView::default(),
             templates: sqlake_app::snapshot::TemplatesView {
                 data: sqlake_app::snapshot::LoadState::Ready(Arc::new(vec![
                     sqlake_core::library::Template {
