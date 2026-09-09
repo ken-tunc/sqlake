@@ -1307,6 +1307,12 @@ impl Runtime {
             // library is one where saving cannot work, and a pane that drew an
             // empty list would be claiming there is nothing saved.
             self.templates.data = LoadState::Failed(NOTHING_KEPT.to_owned());
+            // And said again against the attempt, when there was one: somebody
+            // who pressed save is owed an answer about the thing they pressed,
+            // not only a note in the list they were not looking at.
+            if label.is_some() {
+                self.templates.failed = Some(NOTHING_KEPT.to_owned());
+            }
             return;
         };
         self.templates.failed = None;
@@ -1319,6 +1325,11 @@ impl Runtime {
             label.unwrap_or_else(|| "reading templates".to_owned()),
         );
         let events = self.events.clone();
+        // Cancelling this aborts the wait, not the write: a blocking task runs
+        // to completion whatever happens to the future holding it, so a save
+        // that was cancelled may still have landed. Which is why every
+        // operation re-reads — the next one puts the list back in step with
+        // the file, and the file is the one that was right all along.
         self.spawn_task(busy, async move {
             let answer = tokio::task::spawn_blocking(move || {
                 let wrote = write(library.as_ref()).map_err(|why| why.to_string());
@@ -1948,6 +1959,16 @@ mod tests {
         let snap = library_settled(&store, Action::LoadTemplates).await;
         assert_eq!(snap.templates.data.error(), Some(NOTHING_KEPT));
         assert!(snap.templates.data.ready().is_none());
+    }
+
+    #[tokio::test]
+    async fn saving_with_nothing_to_save_into_answers_the_attempt() {
+        // Not only the list: somebody who pressed save is owed an answer about
+        // what they pressed.
+        let store = store(Behaviour::instant());
+        let snap = library_settled(&store, Action::SaveTemplate(new_template("nowhere"))).await;
+        assert_eq!(snap.templates.failed.as_deref(), Some(NOTHING_KEPT));
+        assert_eq!(snap.templates.data.error(), Some(NOTHING_KEPT));
     }
 
     #[tokio::test]
