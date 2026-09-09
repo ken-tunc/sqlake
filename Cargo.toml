@@ -19,6 +19,7 @@ sqlake-core = { path = "crates/sqlake-core" }
 sqlake-driver-bigquery = { path = "crates/sqlake-driver-bigquery" }
 sqlake-driver-mock = { path = "crates/sqlake-driver-mock" }
 sqlake-driver-postgres = { path = "crates/sqlake-driver-postgres" }
+sqlake-library = { path = "crates/sqlake-library" }
 sqlake-mcp = { path = "crates/sqlake-mcp" }
 sqlake-tui = { path = "crates/sqlake-tui" }
 
@@ -45,6 +46,11 @@ insta = "1"
 keyring = "4"
 postgres-protocol = "0.6"
 ratatui = "0.30"
+# `bundled` so that what sqlake writes does not depend on which SQLite the
+# machine happens to have: the file is the user's saved work, and an FTS5
+# build that is missing on one machine and present on another would make it
+# openable in one place and not the other.
+rusqlite = { version = "0.40", features = ["bundled"] }
 rust_decimal = { version = "1", features = ["db-postgres"] }
 rustls-native-certs = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

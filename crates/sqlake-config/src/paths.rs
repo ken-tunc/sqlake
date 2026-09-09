@@ -53,6 +53,16 @@ pub fn scratch_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("scratch")
 }
 
+/// Templates and query history.
+///
+/// One file for both: they are one feature seen from two sides — a statement
+/// worth keeping and a statement that was run — and M8 promotes a history row
+/// to a template without crossing a file boundary to do it.
+#[must_use]
+pub fn library_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("library.db")
+}
+
 /// Settings that are not about a particular connection.
 #[must_use]
 pub fn settings_file(config_dir: &Path) -> PathBuf {

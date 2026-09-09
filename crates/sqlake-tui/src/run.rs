@@ -691,10 +691,9 @@ mod tests {
     use ratatui::layout::Position;
     use sqlake_app::action::Action;
     use sqlake_app::snapshot::{ConnStatus, ConnectionView};
-    use sqlake_app::store::Drivers;
+    use sqlake_app::store::{Drivers, Wiring};
     use sqlake_core::id::ConnId;
     use sqlake_core::node::{NodeRef, TableRef};
-    use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles, mock_summary};
 
     use super::*;
@@ -708,23 +707,19 @@ mod tests {
         behaviour: Behaviour,
         capabilities: sqlake_core::capability::Capabilities,
     ) -> Store {
-        Store::spawn(
+        Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(
                 MockDriver::new(behaviour).with_capabilities(capabilities),
             )),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        )
+        ))
     }
 
     fn store_of(behaviour: Behaviour) -> Store {
-        Store::spawn(
+        Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        )
+        ))
     }
 
     async fn connected() -> (Store, Arc<Snapshot>) {
@@ -2041,15 +2036,13 @@ mod tests {
     async fn a_failed_connection_shows_on_its_row_and_says_why_in_a_dialog() {
         // The row is the state and stays; the dialog is the reason, which does
         // not fit in a pane twenty-six columns wide.
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
                 connect_fails: true,
                 ..Behaviour::instant()
             }))),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let mut rx = store.subscribe();
         store.dispatch(Action::Connect {
             profile: mock_summary("mock").id,

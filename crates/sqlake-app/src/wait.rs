@@ -108,23 +108,20 @@ mod tests {
 
     use sqlake_core::id::{ConnId, ProfileId};
     use sqlake_core::node::{NodeKind, NodeRef, TableRef};
-    use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
     use super::*;
-    use crate::store::Drivers;
+    use crate::store::{Drivers, Wiring};
 
     const LIMIT: Duration = Duration::from_secs(5);
     /// Long enough to be sure nothing lands, short enough to be free.
     const BRIEF: Duration = Duration::from_millis(200);
 
     fn store_of(behaviour: Behaviour) -> Store {
-        Store::spawn(
+        Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(behaviour))),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        )
+        ))
     }
 
     fn mock() -> ProfileId {

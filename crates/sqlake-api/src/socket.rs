@@ -347,9 +347,8 @@ mod tests {
     use std::sync::Arc;
 
     use sqlake_app::action::Action;
-    use sqlake_app::store::{Drivers, Store};
+    use sqlake_app::store::{Drivers, Store, Wiring};
     use sqlake_core::id::{ConnId, ProfileId};
-    use sqlake_core::result::PageRequest;
     use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
     use super::*;
@@ -449,12 +448,10 @@ mod tests {
     /// A session listening on a socket, with one connection already open —
     /// which is the situation attaching exists for.
     async fn session(dir: &tempfile::TempDir) -> (PathBuf, String) {
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let conn = ConnId::new();
         store
             .dispatch_and_settle(

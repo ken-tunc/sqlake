@@ -10,21 +10,18 @@ use std::time::Duration;
 use serde_json::{Value as Json, json};
 use sqlake_api::{Budget, Page, SessionInfo};
 use sqlake_app::action::Action;
-use sqlake_app::store::{Drivers, Store};
+use sqlake_app::store::{Drivers, Store, Wiring};
 use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::node::TableRef;
-use sqlake_core::result::PageRequest;
 use sqlake_driver_mock::{Behaviour, MockDriver, MockProfiles};
 
 const LIMIT: Duration = Duration::from_secs(5);
 
 fn store() -> Store {
-    Store::spawn(
+    Store::spawn(Wiring::new(
         Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
         Arc::new(MockProfiles::default()),
-        PageRequest::DEFAULT_LIMIT,
-        None,
-    )
+    ))
 }
 
 async fn previewed(store: &Store, conn: ConnId, table: &TableRef) -> Arc<sqlake_app::Snapshot> {

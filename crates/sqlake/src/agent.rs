@@ -15,7 +15,7 @@ use anyhow::{Context as _, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use sqlake_api::{Failure, QueryState, Request, Response, Service, Status};
 use sqlake_app::action::Action;
-use sqlake_app::store::{Drivers, Store};
+use sqlake_app::store::{Drivers, Store, Wiring};
 use sqlake_config::Settings;
 use sqlake_core::id::{ConnId, ProfileId};
 use sqlake_core::profile::{ProfileError, ProfileSummary, Profiles, ResolvedProfile};
@@ -484,10 +484,10 @@ async fn serve_mcp(
 ) -> Result<std::process::ExitCode> {
     let backend = sqlake_api::Backend::attach_or_start(session.as_deref(), || {
         Service::new(Store::spawn(
-            drivers,
-            profiles,
-            settings.page_size,
-            settings.max_bytes_billed,
+            Wiring::new(drivers, profiles)
+                .page_size(settings.page_size)
+                .budget(settings.max_bytes_billed)
+                .library(crate::library()),
         ))
         .with_max_bytes(settings.agent_max_bytes_billed)
     })
@@ -599,10 +599,10 @@ async fn one_shot(
     // the session's and the service applies the agent's on top, so a one-shot
     // run refuses exactly what the same command would be refused over a socket.
     let service = Service::new(Store::spawn(
-        drivers,
-        profiles,
-        settings.page_size,
-        settings.max_bytes_billed,
+        Wiring::new(drivers, profiles)
+            .page_size(settings.page_size)
+            .budget(settings.max_bytes_billed)
+            .library(crate::library()),
     ))
     .with_max_bytes(settings.agent_max_bytes_billed);
     let connection = if command.needs() == Needs::Nothing {

@@ -42,17 +42,15 @@ sqlake/
     ├── sqlake-mcp/               # MCP stdio server over sqlake-api
     ├── sqlake-conformance/       # one suite every driver has to pass, run per driver
     ├── sqlake-config/            # profile and settings persistence, secret resolution
+    ├── sqlake-library/           # SQLite: the templates and history that outlive a session
     ├── sqlake-driver-postgres/
     ├── sqlake-driver-bigquery/
     └── sqlake-driver-mock/       # for UI development and tests. Every screen works with no DB
-
-    # not yet, with the milestone that makes one:
-    #   sqlake-store/             # SQLite: history, templates, session restore (M7, M8)
 ```
 
-`crates/` is the list of what exists; the rest are created by the milestone that first needs
-one. An empty placeholder crate is dead weight and hides which parts are real, so the unbuilt
-ones sit below the tree as comments instead of in it.
+`crates/` is the list of what exists. A crate is created by the milestone that first needs one,
+and one that a milestone has not reached yet is written below the tree as a comment rather than
+committed empty: a placeholder crate is dead weight and hides which parts are real.
 
 That much is checked: `the_workspace_layout_lists_the_crates_that_exist` reads this tree and
 compares it with `crates/`, and fails in both directions. A list nothing checks is one that
@@ -61,17 +59,19 @@ drifts — this one already had, which is what the test is for.
 Dependencies flow one way:
 
 ```
-              ┌ sqlake-tui ┐
-sqlake(bin) ──┤            ├──→ sqlake-app ──→ sqlake-core ←── sqlake-driver-*
-              └ sqlake-api ┘ ↘ sqlake-config
+              ┌ sqlake-tui ┐                                  ┌ sqlake-driver-*
+sqlake(bin) ──┤            ├──→ sqlake-app ──→ sqlake-core ←──┤
+              └ sqlake-api ┘ ↘ sqlake-config                  └ sqlake-library
                     ↑
               sqlake-mcp
 ```
 
 `sqlake-config` is reached by the bin and by `sqlake-api`, not by `sqlake-app`: resolving a
-profile happens before the app layer, which is handed the result. `sqlake-mcp` (A3) and
-`sqlake-store` (M7, M8) are in the diagram as the shape they will take, not as crates that
-exist; the store will hang off `sqlake-app`.
+profile happens before the app layer, which is handed the result.
+
+`sqlake-library` sits where a driver sits, for the same reason: it is an implementation of a
+trait in `sqlake-core`, handed to the store by the bin. The store holding a `dyn Library` and
+not a SQLite connection is what lets the whole suite run with no file on disk.
 
 `sqlake-tui` and `sqlake-api` are **peers**: two front-ends over the same application layer,
 neither depending on the other (§8). Neither does the TUI start the listener — the bin does,

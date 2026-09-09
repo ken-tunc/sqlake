@@ -16,6 +16,7 @@ use std::time::Instant;
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
+use sqlake_core::library::Library;
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
@@ -95,22 +96,78 @@ pub struct Store {
     snapshots: watch::Receiver<Arc<Snapshot>>,
 }
 
-impl Store {
-    /// `page_size` comes from the configuration rather than from a constant
-    /// here: how many rows are worth waiting for depends on the database and
-    /// the link to it, which is something only the person using it knows.
+/// Everything the store is given rather than makes.
+///
+/// A struct because there are five of them now and the two at the end were
+/// already unreadable at the call site: `PageRequest::DEFAULT_LIMIT, None`
+/// says nothing about which is the page size and which the budget. The
+/// defaults are what a test wants, so a test names only what it is about.
+#[derive(Debug)]
+pub struct Wiring {
+    pub drivers: Drivers,
+    pub profiles: Arc<dyn Profiles>,
+    /// From the configuration rather than a constant here: how many rows are
+    /// worth waiting for depends on the database and the link to it, which is
+    /// something only the person using it knows.
     ///
     /// Zero is taken as one. `sqlake-config` refuses it, but that validation is
     /// a crate away and not on the path a second front-end takes: a page of no
     /// rows leaves an offset that `next_page` never advances, so the relation
     /// could never be read and nothing on screen would say why.
+    pub page_size: u32,
+    pub budget: Option<u64>,
+    /// Where templates and history are kept, when anything is.
+    ///
+    /// `None` is a session that keeps nothing — a test, or a client whose
+    /// state directory could not be opened. Optional rather than a do-nothing
+    /// implementation living here: a second implementation of a trait whose
+    /// first one is a schema would be a second set of answers to drift apart,
+    /// and "nothing is being saved" is worth saying out loud rather than
+    /// imitating.
+    pub library: Option<Arc<dyn Library>>,
+}
+
+impl Wiring {
     #[must_use]
-    pub fn spawn(
-        drivers: Drivers,
-        profiles: Arc<dyn Profiles>,
-        page_size: u32,
-        budget: Option<u64>,
-    ) -> Self {
+    pub fn new(drivers: Drivers, profiles: Arc<dyn Profiles>) -> Self {
+        Self {
+            drivers,
+            profiles,
+            page_size: PageRequest::DEFAULT_LIMIT,
+            budget: None,
+            library: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn page_size(mut self, rows: u32) -> Self {
+        self.page_size = rows;
+        self
+    }
+
+    #[must_use]
+    pub const fn budget(mut self, bytes: Option<u64>) -> Self {
+        self.budget = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn library(mut self, library: Arc<dyn Library>) -> Self {
+        self.library = Some(library);
+        self
+    }
+}
+
+impl Store {
+    #[must_use]
+    pub fn spawn(wiring: Wiring) -> Self {
+        let Wiring {
+            drivers,
+            profiles,
+            page_size,
+            budget,
+            library,
+        } = wiring;
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let mut runtime = Runtime {
@@ -122,6 +179,7 @@ impl Store {
             profiles,
             page_size: page_size.max(1),
             budget,
+            library,
             events: event_tx,
             conns: Vec::new(),
             previews: Vec::new(),
@@ -333,6 +391,16 @@ struct Runtime {
     /// Here rather than on the action, so raising it is a config change rather
     /// than something a caller can do per request.
     budget: Option<u64>,
+    /// Templates and history, when this session keeps any.
+    ///
+    /// Held here rather than reached for at each use so that "nothing is being
+    /// kept" is one branch in one place. Every call on it blocks, so every
+    /// call on it goes through `spawn_blocking`.
+    #[expect(
+        dead_code,
+        reason = "T3 saves templates through it and T6 records runs; T1 is the wiring"
+    )]
+    library: Option<Arc<dyn Library>>,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     previews: Vec<Preview>,
@@ -1564,21 +1632,23 @@ mod tests {
     /// compare against it.
     fn store_with_budget(behaviour: Behaviour, budget: Option<u64>) -> Store {
         Store::spawn(
-            Drivers::new().with(Arc::new(
-                MockDriver::new(behaviour).with_capabilities(sqlake_driver_mock::ESTIMATES),
-            )),
-            Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            budget,
+            Wiring::new(
+                Drivers::new().with(Arc::new(
+                    MockDriver::new(behaviour).with_capabilities(sqlake_driver_mock::ESTIMATES),
+                )),
+                Arc::new(MockProfiles::default()),
+            )
+            .budget(budget),
         )
     }
 
     fn store_of(driver: MockDriver, page_size: u32) -> Store {
         Store::spawn(
-            Drivers::new().with(Arc::new(driver)),
-            Arc::new(MockProfiles::default()),
-            page_size,
-            None,
+            Wiring::new(
+                Drivers::new().with(Arc::new(driver)),
+                Arc::new(MockProfiles::default()),
+            )
+            .page_size(page_size),
         )
     }
 
@@ -1669,12 +1739,10 @@ mod tests {
             query_latency: Duration::from_secs(30),
             ..Behaviour::instant()
         }));
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::clone(&driver) as Arc<dyn Driver>),
             Arc::new(MockProfiles::default()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let (store, conn) = connected(store).await;
 
         let id = QueryId::new();
@@ -1761,12 +1829,10 @@ mod tests {
         // BigQuery has no `default_transaction_read_only`, so for it this is
         // the only defence there is — which is why it lives here rather than
         // being left to the server.
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::read_only()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let (store, conn) = connected(store).await;
         let id = QueryId::new();
         let snap = settled(
@@ -1792,12 +1858,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_only_connection_still_reads() {
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::read_only()),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let (store, conn) = connected(store).await;
         let id = QueryId::new();
         let snap = settled(
@@ -2288,12 +2352,10 @@ mod tests {
         // both now, and what tells the connections apart is the profile each
         // was opened from — including their trees, which are per connection
         // and not per driver.
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::new(["replica", "staging"])),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         store.dispatch(Action::Connect {
             profile: pid("replica"),
             conn: ConnId::new(),
@@ -2336,12 +2398,10 @@ mod tests {
         // The thing the UI could not show before: with one flat list per
         // connection it drew the first and nothing else, so a second
         // connection was open and unreachable.
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
             Arc::new(MockProfiles::new(["replica", "staging"])),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         store.dispatch(Action::Connect {
             profile: pid("replica"),
             conn: ConnId::new(),
@@ -2444,12 +2504,10 @@ mod tests {
         // The caller is waiting on the id it chose. A failure row under some
         // other id would leave that wait to time out, reporting a hang for
         // something that failed immediately.
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new(),
             Arc::new(UnservedProfile(DriverKind::Postgres)),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         let conn = ConnId::new();
         let snap = settled(
             &store,
@@ -2515,12 +2573,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_profile_naming_an_unbuilt_driver_fails_as_a_connection() {
-        let store = Store::spawn(
+        let store = Store::spawn(Wiring::new(
             Drivers::new(),
             Arc::new(UnservedProfile(DriverKind::Postgres)),
-            PageRequest::DEFAULT_LIMIT,
-            None,
-        );
+        ));
         store.dispatch(Action::Connect {
             profile: pid("unserved"),
             conn: ConnId::new(),
