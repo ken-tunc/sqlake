@@ -17,7 +17,9 @@
 
 use std::io;
 use std::sync::Arc;
+
 use std::time::Instant;
+use time::OffsetDateTime;
 
 use futures::{FutureExt as _, StreamExt as _};
 use ratatui::Frame;
@@ -455,7 +457,9 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         .as_ref()
         .and_then(|(_, _, content)| match content {
             TabContent::Sql { query, .. } => snapshot.query((*query)?),
-            TabContent::Preview(_) | TabContent::Definition { .. } => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } | TabContent::History { .. } => {
+                None
+            }
         })
         .is_some_and(|q| q.data.ready().is_some());
     if let Some((id, _, TabContent::Sql { text, .. })) = &active
@@ -488,6 +492,44 @@ fn draw(frame: &mut Frame<'_>, ui: &mut UiState, snapshot: &Snapshot, hits: &mut
         datagrid::render_rows(frame, hits, grid, &rows, ui.grid_mut(id), false, None);
         if frames.detail.height > 0 {
             detail = ui.grid_mut(id).detail();
+        }
+    }
+    if let Some((id, _, TabContent::History { filter })) = &active {
+        let id = *id;
+        let held = snapshot.history.data.ready();
+        let body =
+            crate::history::search_box(frame, grid, filter, held.map_or(0, |found| found.len()));
+        match (&snapshot.history.data, held) {
+            (_, Some(found)) if !found.is_empty() => {
+                let rows = Arc::new(crate::history::rows(found, OffsetDateTime::now_utc()));
+                ui.set_viewport(PaneId::Grid, datagrid::body_area(body));
+                // Not sortable: the history is newest first and the words in
+                // the box are how it is narrowed, so a header click has no
+                // second question to ask.
+                datagrid::render_rows(frame, hits, body, &rows, ui.grid_mut(id), false, None);
+                if frames.detail.height > 0 {
+                    detail = ui.grid_mut(id).detail();
+                }
+            }
+            (sqlake_app::snapshot::LoadState::Failed(why), _) => {
+                ui.set_viewport(PaneId::Grid, body);
+                datagrid::message(frame, body, why, ratatui::style::Color::Red);
+            }
+            (sqlake_app::snapshot::LoadState::Loading, _) => {
+                ui.set_viewport(PaneId::Grid, body);
+                datagrid::message(frame, body, "searching…", ratatui::style::Color::DarkGray);
+            }
+            _ => {
+                ui.set_viewport(PaneId::Grid, body);
+                // Two different nothings, and the difference is what to do
+                // about it: narrow the words, or run something.
+                let nothing = if filter.text.trim().is_empty() {
+                    "nothing has been run yet"
+                } else {
+                    "nothing run matches"
+                };
+                datagrid::message(frame, body, nothing, ratatui::style::Color::DarkGray);
+            }
         }
     }
     if let Some((id, conn, TabContent::Definition { table, section })) = &active {
@@ -1947,6 +1989,127 @@ mod tests {
             .len()
             - 1;
         assert_eq!(ui.section_of(tab), Some(last));
+    }
+
+    #[tokio::test]
+    async fn screen_with_the_history() {
+        // The columns a person reads a history by, and the box that narrows
+        // it. The rows are written straight into the library with a fixed
+        // time: what a *run* leaves behind is `sqlake-app`'s to prove, and a
+        // row from a moment ago would draw `0s ago` or `1s ago` depending on
+        // how busy the machine was.
+        let library = sqlake_library::Sqlite::in_memory().expect("a library opens");
+        let started = OffsetDateTime::UNIX_EPOCH + time::Duration::days(9_000);
+        for (sql, ago) in [
+            ("select * from public.users", time::Duration::minutes(4)),
+            (
+                "select count(*)\n  from analytics.events",
+                time::Duration::hours(3),
+            ),
+        ] {
+            let run = sqlake_core::library::RunStart {
+                connection: ConnId::new(),
+                driver: sqlake_core::capability::DriverKind::Mock,
+                sql: sql.to_owned(),
+                started_at: started - ago,
+            };
+            let id = sqlake_core::library::Library::started(&library, run).expect("it records");
+            sqlake_core::library::Library::settled(
+                &library,
+                id,
+                sqlake_core::library::RunOutcome::Ok {
+                    duration_ms: 12,
+                    row_count: Some(50),
+                    bytes_processed: None,
+                },
+            )
+            .expect("it settles");
+        }
+
+        let store = Store::spawn(
+            sqlake_app::store::Wiring::new(
+                sqlake_app::store::Drivers::new()
+                    .with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            )
+            .library(Arc::new(library)),
+        );
+        let (store, _) = connected_to(store).await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let asked = ui.apply(crate::intent::ViewCmd::OpenHistoryTab { conn }, &snap);
+        store.dispatch(asked.expect("opening it searches"));
+        until(&mut rx, |s| {
+            s.history.data.ready().is_some_and(|found| found.len() == 2)
+        })
+        .await;
+        let mut snap = Snapshot::clone(&rx.borrow_and_update());
+        // `ago` counts from now, so the rows are moved to keep the distance
+        // the fixture chose. Without this the screen says how old the epoch
+        // is.
+        let now = OffsetDateTime::now_utc();
+        let moved: Vec<_> = snap
+            .history
+            .data
+            .ready()
+            .expect("a list")
+            .iter()
+            .map(|entry| sqlake_core::library::HistoryEntry {
+                started_at: now - (started - entry.started_at),
+                ..entry.clone()
+            })
+            .collect();
+        snap.history.data = sqlake_app::snapshot::LoadState::Ready(Arc::new(moved));
+
+        insta::assert_snapshot!(screen(&Arc::new(snap), &mut ui, 100, 20));
+    }
+
+    #[tokio::test]
+    async fn the_history_says_which_kind_of_empty_it_is() {
+        // Two different nothings, and the difference is what to do about it:
+        // narrow the words, or run something.
+        let store = Store::spawn(
+            sqlake_app::store::Wiring::new(
+                sqlake_app::store::Drivers::new()
+                    .with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(sqlake_driver_mock::MockProfiles::default()),
+            )
+            .library(Arc::new(
+                sqlake_library::Sqlite::in_memory().expect("a library opens"),
+            )),
+        );
+        let (store, _) = connected_to(store).await;
+        let mut rx = store.subscribe();
+        let conn = rx.borrow_and_update().connections[0].id;
+
+        let mut ui = UiState::new();
+        let snap = rx.borrow_and_update().clone();
+        let asked = ui.apply(crate::intent::ViewCmd::OpenHistoryTab { conn }, &snap);
+        store.dispatch(asked.expect("opening it searches"));
+        until(&mut rx, |s| s.history.data.ready().is_some()).await;
+        let snap = rx.borrow_and_update().clone();
+        assert!(
+            screen(&snap, &mut ui, 80, 20).contains("nothing has been run yet"),
+            "an empty history is not a search that found nothing"
+        );
+
+        let asked = ui.apply(
+            crate::intent::ViewCmd::SetHistoryTerms(Some(crate::ui::Filter {
+                text: "orders".to_owned(),
+                editing: true,
+            })),
+            &snap,
+        );
+        store.dispatch(asked.expect("typing searches"));
+        until(&mut rx, |s| s.history.terms == "orders").await;
+        let snap = rx.borrow_and_update().clone();
+        assert!(
+            screen(&snap, &mut ui, 80, 20).contains("nothing run matches"),
+            "a search that found nothing is not an empty history"
+        );
     }
 
     #[tokio::test]

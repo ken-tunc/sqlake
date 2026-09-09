@@ -65,6 +65,19 @@ pub enum TabContent {
         text: String,
         query: Option<QueryId>,
     },
+    /// What this client has run.
+    ///
+    /// `conn` on the tab is where a statement picked out of it would go —
+    /// a history is the session's rather than a connection's, and the tab
+    /// carries one because every tab does and because putting a run back in a
+    /// buffer needs somewhere to put it.
+    ///
+    /// The search box is this screen's, like a SQL buffer: what is being typed
+    /// is half a word until it is not, and what crosses into `sqlake-app` is
+    /// the search it turned into.
+    History {
+        filter: Filter,
+    },
     /// What a relation is, rather than what is in it.
     ///
     /// Its own kind rather than a mode on `Preview`: a relation can have both
@@ -108,7 +121,9 @@ impl OpenTab {
             // wants the relation a *preview* is of — sorting it, paging it,
             // forgetting the store's copy of it — and a definition shares none
             // of that: it is fetched once, never paged and never sorted.
-            TabContent::Sql { .. } | TabContent::Definition { .. } => None,
+            TabContent::Sql { .. } | TabContent::Definition { .. } | TabContent::History { .. } => {
+                None
+            }
         }
     }
 
@@ -117,7 +132,18 @@ impl OpenTab {
     pub fn sql(&self) -> Option<&str> {
         match &self.content {
             TabContent::Sql { text, .. } => Some(text),
-            TabContent::Preview(_) | TabContent::Definition { .. } => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } | TabContent::History { .. } => {
+                None
+            }
+        }
+    }
+
+    /// The search box of this tab, when it is the history.
+    #[must_use]
+    pub const fn searching(&self) -> Option<&Filter> {
+        match &self.content {
+            TabContent::History { filter } => Some(filter),
+            TabContent::Preview(_) | TabContent::Sql { .. } | TabContent::Definition { .. } => None,
         }
     }
 
@@ -126,7 +152,7 @@ impl OpenTab {
     pub const fn defines(&self) -> Option<&TableRef> {
         match &self.content {
             TabContent::Definition { table, .. } => Some(table),
-            TabContent::Preview(_) | TabContent::Sql { .. } => None,
+            TabContent::Preview(_) | TabContent::Sql { .. } | TabContent::History { .. } => None,
         }
     }
 
@@ -146,6 +172,7 @@ impl TabContent {
             // Named apart from the preview of the same relation, because two
             // tabs reading `users` would otherwise be two tabs called `users`.
             Self::Definition { table, .. } => Cow::Owned(format!("{}: def", table.name())),
+            Self::History { .. } => Cow::Borrowed("History"),
         }
     }
 }
@@ -801,7 +828,7 @@ impl UiState {
     pub fn section_of(&self, tab: TabId) -> Option<usize> {
         match &self.tabs.iter().find(|t| t.id == tab)?.content {
             TabContent::Definition { section, .. } => Some(*section),
-            TabContent::Preview(_) | TabContent::Sql { .. } => None,
+            TabContent::Preview(_) | TabContent::Sql { .. } | TabContent::History { .. } => None,
         }
     }
 
@@ -813,12 +840,48 @@ impl UiState {
         self.active_tab = Some(id);
     }
 
+    /// What the history's box holds now, and the search that follows from it.
+    fn set_history_terms(&mut self, next: Option<Filter>) -> Option<Action> {
+        let tab = self.active_tab?;
+        let content = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab)
+            .map(|t| &mut t.content)?;
+        let TabContent::History { filter } = content else {
+            return None;
+        };
+        // Closing the box leaves the search it made: `Esc` puts the keyboard
+        // back in the grid, and a list that emptied when it did would be one
+        // nobody could then read.
+        *filter = next.unwrap_or(Filter {
+            text: filter.text.clone(),
+            editing: false,
+        });
+        // The rows this tab shows are the store's, and the words just changed.
+        Some(Action::SearchHistory {
+            terms: self.history_terms(),
+        })
+    }
+
+    /// What the open history tab is searching for.
+    #[must_use]
+    fn history_terms(&self) -> String {
+        self.tabs
+            .iter()
+            .find_map(|tab| tab.searching())
+            .map(|filter| filter.text.clone())
+            .unwrap_or_default()
+    }
+
     /// One tab's SQL, or `None` when it is a preview or gone.
     #[must_use]
     pub fn buffer_of(&self, tab: TabId) -> Option<&str> {
         match &self.tabs.iter().find(|t| t.id == tab)?.content {
             TabContent::Sql { text, .. } => Some(text),
-            TabContent::Preview(_) | TabContent::Definition { .. } => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } | TabContent::History { .. } => {
+                None
+            }
         }
     }
 
@@ -827,7 +890,9 @@ impl UiState {
     pub fn query_of(&self, tab: TabId) -> Option<QueryId> {
         match &self.tabs.iter().find(|t| t.id == tab)?.content {
             TabContent::Sql { query, .. } => *query,
-            TabContent::Preview(_) | TabContent::Definition { .. } => None,
+            TabContent::Preview(_) | TabContent::Definition { .. } | TabContent::History { .. } => {
+                None
+            }
         }
     }
 
@@ -1277,6 +1342,32 @@ impl UiState {
                     },
                 );
             }
+            ViewCmd::OpenHistoryTab { conn } => {
+                // Raised rather than opened twice: two histories are two
+                // copies of one list, and the second would be the one nobody
+                // notices is stale.
+                if let Some(open) = self
+                    .tabs
+                    .iter()
+                    .find(|t| matches!(t.content, TabContent::History { .. }))
+                    .map(|t| t.id)
+                {
+                    self.active_tab = Some(open);
+                } else {
+                    self.open(
+                        conn,
+                        TabContent::History {
+                            filter: Filter::opening(),
+                        },
+                    );
+                }
+                // Opening it is what searches: the pane has nothing to draw
+                // until the store has looked.
+                return Some(Action::SearchHistory {
+                    terms: self.history_terms(),
+                });
+            }
+            ViewCmd::SetHistoryTerms(next) => return self.set_history_terms(next),
             ViewCmd::SelectTab(id) => {
                 if self.tabs.iter().any(|t| t.id == id) {
                     self.active_tab = Some(id);
@@ -1663,6 +1754,14 @@ impl UiState {
             TabContent::Sql { query, .. } => snapshot.query((*query)?)?.data.ready().cloned(),
             // The section this tab is looking at, which is a different grid
             // per tab even for the same relation.
+            // Shaped here rather than cached like a definition: the rows
+            // change on every keystroke, so a cache keyed on "the same answer
+            // as last time" would miss on almost every frame and cost a
+            // comparison to find that out.
+            TabContent::History { .. } => Some(Arc::new(crate::history::rows(
+                snapshot.history.data.ready()?,
+                time::OffsetDateTime::now_utc(),
+            ))),
             TabContent::Definition { table, section } => {
                 let detail = snapshot.definition(open.conn, table)?.data.ready()?;
                 match self.laid.get(&tab) {
