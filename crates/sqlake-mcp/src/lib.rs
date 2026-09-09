@@ -97,8 +97,19 @@ impl Server {
         }
         let mut backend = self.backend.lock().await;
         if tools::takes_a_connection(kind) && !fields.contains_key("connection") {
-            let picked = pick(&mut backend, self.connect.as_deref(), kind).await?;
-            fields.insert("connection".to_owned(), Json::from(picked));
+            match pick(&mut backend, self.connect.as_deref(), kind).await {
+                Ok(picked) => {
+                    fields.insert("connection".to_owned(), Json::from(picked));
+                }
+                // A tool whose `connection` is optional is still answerable
+                // without one, and refusing here would make this wrapper
+                // stricter than the protocol it is a wrapper for.
+                // Nothing is logged: this server speaks on stdout, the
+                // failure is not one, and the answer the caller gets says
+                // everything there is to say.
+                Err(_) if tools::connection_is_optional(kind) => {}
+                Err(why) => return Err(why),
+            }
         }
 
         // Through the protocol's own deserialiser, so `deny_unknown_fields`

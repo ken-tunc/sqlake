@@ -88,6 +88,17 @@ pub const fn takes_a_connection(kind: RequestKind) -> bool {
     )
 }
 
+/// Whether a tool can be answered without a connection at all.
+///
+/// Only where the request's own `connection` is optional. The server fills one
+/// in wherever it can, and for these it carries on when it cannot: filling a
+/// template in needs quoting rules rather than a database, and a session with
+/// nothing open still has the standard's.
+#[must_use]
+pub const fn connection_is_optional(kind: RequestKind) -> bool {
+    matches!(kind, RequestKind::TemplateApply)
+}
+
 /// What the tool is for, in one line an agent reads before choosing it.
 #[must_use]
 pub const fn describes(kind: RequestKind) -> &'static str {
@@ -373,6 +384,27 @@ mod tests {
         // undone by the database rather than by this flag.
         assert!(!is_destructive(RequestKind::ConnectionOpen));
         assert!(!is_destructive(RequestKind::TablePreview));
+    }
+
+    #[test]
+    fn a_tool_whose_connection_is_optional_says_so_in_its_schema() {
+        // The pair has to agree in both directions. A kind this calls optional
+        // while its request demands one would answer every connectionless call
+        // with a deserialiser complaint; a kind whose request allows none
+        // while this insists would refuse a call the protocol accepts, which
+        // is the bug it was written after.
+        let document = schema();
+        for kind in RequestKind::ALL {
+            if !offered(*kind) || !takes_a_connection(*kind) {
+                continue;
+            }
+            let branch = branch_for(&document, *kind).expect("a branch");
+            let demanded = branch
+                .get("required")
+                .and_then(Json::as_array)
+                .is_some_and(|names| names.iter().any(|name| name == "connection"));
+            assert_eq!(!demanded, connection_is_optional(*kind), "{}", kind.tag());
+        }
     }
 
     #[test]

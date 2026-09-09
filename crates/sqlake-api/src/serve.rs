@@ -634,9 +634,13 @@ impl Service {
 
     /// Whose quoting rules to fill a template in with.
     ///
-    /// The named connection, or the session's one, or — with none open — the
+    /// The named connection, the first ready one, or — with none open — the
     /// standard's. Refusing to fill in a template because nothing is connected
     /// would make quoting a reason somebody cannot write a statement.
+    ///
+    /// The *first* is a guess, and it is the caller's to correct: two
+    /// connections to different drivers quote differently, which is what the
+    /// `connection` field is for.
     async fn dialect(&self, connection: Option<&str>) -> Result<Dialect, Failure> {
         let standard = Dialect {
             quote_style: QuoteStyle::DoubleQuote,

@@ -4167,6 +4167,7 @@ dependencies = [
  "sqlake-app",
  "sqlake-core",
  "sqlake-driver-mock",
+ "sqlake-library",
  "tokio",
 ]
 
