@@ -1402,6 +1402,21 @@ impl UiState {
                 }
             }
             ViewCmd::CommitTemplate => return self.commit_template(snapshot),
+            ViewCmd::ReuseRun(id) => {
+                if let Some(sql) = snapshot
+                    .history
+                    .data
+                    .ready()
+                    .and_then(|found| found.iter().find(|entry| entry.id == id))
+                    .map(|entry| entry.sql.clone())
+                {
+                    // Put back, not run. Running it is `r`, through the same
+                    // estimate and the same budget it went through the first
+                    // time — and the query worth finding again is exactly the
+                    // one whose cost was worth being asked about.
+                    self.insert(sql, snapshot);
+                }
+            }
             ViewCmd::UseTemplate(id) => self.use_template(id, snapshot),
             ViewCmd::SubmitTemplate => self.submit_template(snapshot),
             ViewCmd::ConfirmDeleteTemplate { id, name } => {
@@ -2601,6 +2616,85 @@ mod tests {
             .find(|t| t.name == name)
             .expect("that template")
             .id
+    }
+
+    fn with_history(mut snap: Snapshot, statements: &[&str]) -> Snapshot {
+        snap.history = sqlake_app::snapshot::HistoryView {
+            terms: String::new(),
+            data: LoadState::Ready(Arc::new(
+                statements
+                    .iter()
+                    .enumerate()
+                    .map(|(at, sql)| sqlake_core::library::HistoryEntry {
+                        id: sqlake_core::library::RunId::new(at as i64 + 1),
+                        connection: "c".to_owned(),
+                        driver: None,
+                        sql: (*sql).to_owned(),
+                        started_at: time::OffsetDateTime::UNIX_EPOCH,
+                        status: Some("ok".to_owned()),
+                        duration_ms: Some(1),
+                        row_count: Some(0),
+                        bytes_processed: None,
+                        error: None,
+                    })
+                    .collect(),
+            )),
+        };
+        snap
+    }
+
+    #[test]
+    fn a_run_goes_back_into_a_buffer_and_is_not_run() {
+        // Running it is `r`, through the same estimate and the same budget it
+        // went through the first time — and the query worth finding again is
+        // exactly the one whose cost was worth being asked about.
+        let conn = ConnId::new();
+        let snap = with_history(snapshot(conn, 3, 10, 3), &["select * from orders"]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+
+        let _ = ui.apply(
+            ViewCmd::ReuseRun(sqlake_core::library::RunId::new(1)),
+            &snap,
+        );
+        assert_eq!(ui.active_sql(), Some("select * from orders"));
+        assert!(
+            snap.queries.is_empty(),
+            "nothing was run by putting it back"
+        );
+    }
+
+    #[test]
+    fn a_run_put_back_never_writes_over_a_buffer_either() {
+        // The same rule a template follows, because it is the same insertion.
+        let conn = ConnId::new();
+        let snap = with_history(snapshot(conn, 3, 10, 3), &["select * from orders"]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let started = ui.active_tab.expect("a tab");
+        ui.set_buffer(started, "select mine".to_owned());
+
+        let _ = ui.apply(
+            ViewCmd::ReuseRun(sqlake_core::library::RunId::new(1)),
+            &snap,
+        );
+        assert_eq!(ui.buffer_of(started), Some("select mine"));
+        assert_ne!(ui.active_tab, Some(started));
+    }
+
+    #[test]
+    fn a_run_that_is_no_longer_in_the_list_does_nothing() {
+        // The list is re-searched on every keystroke, so the id is the only
+        // thing that still means the run that was pointed at.
+        let conn = ConnId::new();
+        let snap = with_history(snapshot(conn, 3, 10, 3), &["select 1"]);
+        let mut ui = UiState::new();
+        let _ = ui.apply(ViewCmd::OpenSqlTab { conn }, &snap);
+        let _ = ui.apply(
+            ViewCmd::ReuseRun(sqlake_core::library::RunId::new(99)),
+            &snap,
+        );
+        assert_eq!(ui.active_sql(), Some(""));
     }
 
     #[test]
