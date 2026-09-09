@@ -903,7 +903,17 @@ fn mouse_intents(target: Target, gesture: Gesture, ctx: &InputContext<'_>) -> Ve
             vec![ViewCmd::DismissModal.into()]
         }
         (Target::Toast(id), Gesture::Click) => vec![ViewCmd::DismissToast(id).into()],
-        (Target::Backdrop, Gesture::Click) => vec![ViewCmd::DismissModal.into()],
+        // Whichever overlay the backdrop is behind. A dialog wins when both
+        // are up, because it is the one on top and the one that has to be
+        // answered — and because closing the palette underneath it would
+        // leave the click having done something invisible.
+        (Target::Backdrop, Gesture::Click) => {
+            if ctx.palette.is_some() && !ctx.modal_open {
+                vec![ViewCmd::Palette(None).into()]
+            } else {
+                vec![ViewCmd::DismissModal.into()]
+            }
+        }
 
         // Presses, releases and hover carry no action of their own; they exist
         // so the view can show feedback.
@@ -2008,6 +2018,28 @@ mod tests {
         let f = fixture();
         assert_eq!(
             on_mouse(Target::Backdrop, Gesture::Click, &f.ctx(PaneId::Grid)),
+            [Intent::View(ViewCmd::DismissModal)]
+        );
+    }
+
+    #[test]
+    fn clicking_outside_the_palette_closes_it() {
+        // It draws a backdrop, so a click outside has to mean something. It
+        // meant `DismissModal`, which closes a dialog that is not there and
+        // leaves the palette exactly where it was.
+        let f = fixture();
+        let mut c = f.ctx(PaneId::Grid);
+        c.palette = Some(&f.palettes[0]);
+        assert_eq!(
+            on_mouse(Target::Backdrop, Gesture::Click, &c),
+            [Intent::View(ViewCmd::Palette(None))]
+        );
+
+        // And a dialog over it still wins: it is on top, and it is the one
+        // that has to be answered.
+        c.modal_open = true;
+        assert_eq!(
+            on_mouse(Target::Backdrop, Gesture::Click, &c),
             [Intent::View(ViewCmd::DismissModal)]
         );
     }
