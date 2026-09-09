@@ -219,8 +219,8 @@ What that mechanism does not cover:
   entry needs a key binding, and the menu itself does too — for those terminals it does not
   exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
   cannot, because it only ever clicks the menu's first line.
-- Reserved keys: `Ctrl-p` for the command palette (M7, with the templates it exists to insert).
-  `e` opens `$EDITOR` and is bound; see `KEYMAP`.
+- `Ctrl-p` opens the palette of saved statements, `Ctrl-s` keeps the one in the buffer, and `e`
+  opens `$EDITOR`; see `KEYMAP`.
 
 ---
 
@@ -244,8 +244,8 @@ Built: `Intent::Handover` in `sqlake-tui`, answered by `run`'s loop, over `edito
 another program has to happen between two frames, on the thread that owns the terminal, with the
 loop stopped.
 
-Still to come: `Ctrl-Enter` or the run button handing off to the `RunQuery` use case — estimate,
-approve, run — and recording a changed buffer as a draft in history (M8).
+Still to come: recording a changed buffer as a draft in history (M8). Runs themselves are
+already recorded — M7 writes a row per statement sent.
 
 ### 7.3 Caveats
 
@@ -454,7 +454,7 @@ asks about — the reasoning is in `tests/conformance.rs`.
 | **M4 — Running SQL** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M5 — Table definitions** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
-| **M7** | SQL templates (feature 7) | Save, parameter entry, insert from the palette |
+| **M7 — SQL templates** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M8** | Query history (feature 8) | FTS search, re-run, promote to template |
 
 The agent surface (§8) runs as a track alongside these rather than after them, because each
@@ -496,9 +496,6 @@ The workspace `Cargo.toml` is the record of what is in use. What is not there ye
 choice already made:
 
 ```toml
-# persistence (M7, M8)
-rusqlite = { version = "0.37", features = ["bundled"] }
-
 # proxying (M6) — BigQuery is HTTPS, so its tunnel is a reqwest concern
 reqwest = { version = "0.12", features = ["socks"] }
 ```
