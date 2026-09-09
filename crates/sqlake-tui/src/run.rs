@@ -2012,6 +2012,7 @@ mod tests {
                 driver: sqlake_core::capability::DriverKind::Mock,
                 sql: sql.to_owned(),
                 started_at: started - ago,
+                issuer: sqlake_core::library::Issuer::Human,
             };
             let id = sqlake_core::library::Library::started(&library, run).expect("it records");
             sqlake_core::library::Library::settled(

@@ -31,6 +31,7 @@ pub fn rows(entries: &[HistoryEntry], now: OffsetDateTime) -> PagedResult {
     let result = ResultSet::new(
         vec![
             Column::new("when", "text", false),
+            Column::new("by", "text", true),
             Column::new("status", "text", true),
             Column::new("took", "text", true),
             Column::new("rows", "text", true),
@@ -42,6 +43,12 @@ pub fn rows(entries: &[HistoryEntry], now: OffsetDateTime) -> PagedResult {
             .map(|entry| {
                 Row(vec![
                     Value::Text(ago(entry.started_at, now)),
+                    // Who asked for it, and empty for a row written before
+                    // this client kept the answer — which is not "a person",
+                    // and saying so would be a guess written as a fact.
+                    entry
+                        .issuer
+                        .map_or(Value::Null, |who| Value::Text(who.as_str().to_owned())),
                     // Empty rather than "running": the `when` column already
                     // says it started, and a word that appears only while
                     // somebody is looking is a row that changes under them.
@@ -156,6 +163,7 @@ mod tests {
         HistoryEntry {
             id: RunId::new(1),
             connection: "c".to_owned(),
+            issuer: Some(sqlake_core::library::Issuer::Human),
             driver: Some(DriverKind::Mock),
             sql: sql.to_owned(),
             started_at: at,
@@ -175,7 +183,7 @@ mod tests {
         let now = OffsetDateTime::UNIX_EPOCH;
         let rows = rows(&[entry("select *\n  from users", now)], now);
         assert_eq!(
-            rows.value(0, 4),
+            rows.value(0, 5),
             Some(&Value::Text("select * from users".to_owned()))
         );
     }
@@ -213,8 +221,8 @@ mod tests {
         running.duration_ms = None;
         running.row_count = None;
         let rows = rows(&[running], now);
-        assert_eq!(rows.value(0, 1), Some(&Value::Null));
         assert_eq!(rows.value(0, 2), Some(&Value::Null));
+        assert_eq!(rows.value(0, 3), Some(&Value::Null));
     }
 
     #[test]

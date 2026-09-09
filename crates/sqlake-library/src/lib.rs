@@ -21,8 +21,8 @@ use time::OffsetDateTime;
 
 use sqlake_core::capability::DriverKind;
 use sqlake_core::library::{
-    HistoryEntry, Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart,
-    Search, Template, TemplateId,
+    HistoryEntry, Issuer, Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome,
+    RunStart, Search, Template, TemplateId,
 };
 
 use crate::error::{taken, translate};
@@ -249,13 +249,14 @@ impl Library for Sqlite {
         self.with(|connection| {
             connection
                 .execute(
-                    "INSERT INTO query_history (connection_id, driver, sql, started_at) \
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO query_history (connection_id, driver, sql, started_at, issuer) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         run.connection.to_string(),
                         kind(run.driver),
                         run.sql,
                         millis(run.started_at),
+                        run.issuer.as_str(),
                     ],
                 )
                 .map_err(translate)?;
@@ -273,7 +274,7 @@ impl Library for Sqlite {
             let (sql, matching): (&str, &[&dyn rusqlite::ToSql]) = match &wanted {
                 Some(expression) => (
                     "SELECT h.id, h.connection_id, h.driver, h.sql, h.started_at, h.status, \
-                     h.duration_ms, h.row_count, h.bytes_processed, h.error \
+                     h.duration_ms, h.row_count, h.bytes_processed, h.error, h.issuer \
                      FROM query_history h \
                      JOIN query_history_fts f ON f.rowid = h.id \
                      WHERE query_history_fts MATCH ?2 \
@@ -282,7 +283,7 @@ impl Library for Sqlite {
                 ),
                 None => (
                     "SELECT id, connection_id, driver, sql, started_at, status, duration_ms, \
-                     row_count, bytes_processed, error FROM query_history \
+                     row_count, bytes_processed, error, issuer FROM query_history \
                      ORDER BY started_at DESC, id DESC LIMIT ?1",
                     &[],
                 ),
@@ -305,6 +306,10 @@ impl Library for Sqlite {
                         row_count: row.get::<_, Option<i64>>(7)?.map(unsign),
                         bytes_processed: row.get::<_, Option<i64>>(8)?.map(unsign),
                         error: row.get(9)?,
+                        issuer: row
+                            .get::<_, Option<String>>(10)?
+                            .as_deref()
+                            .and_then(Issuer::named),
                     })
                 })
                 .map_err(translate)?;
@@ -511,6 +516,7 @@ mod tests {
             driver: DriverKind::Mock,
             sql: "select 1".to_owned(),
             started_at: OffsetDateTime::now_utc(),
+            issuer: Issuer::Human,
         }
     }
 
@@ -862,6 +868,76 @@ mod tests {
                 })
                 .expect("it records");
         }
+    }
+
+    #[test]
+    fn who_asked_for_a_run_is_kept_with_it() {
+        // One history holds both, which is the point: when something
+        // unexpected has happened to the data, the answer to "was that me?"
+        // is in the same place as the statement.
+        let library = library();
+        for issuer in [Issuer::Human, Issuer::Agent] {
+            library
+                .started(RunStart {
+                    sql: format!("select {}", issuer.as_str()),
+                    issuer,
+                    ..run()
+                })
+                .expect("it records");
+        }
+        let held = library.search(&Search::newest(10)).expect("it reads");
+        assert_eq!(
+            held.iter().filter_map(|e| e.issuer).collect::<Vec<_>>(),
+            [Issuer::Agent, Issuer::Human]
+        );
+    }
+
+    #[test]
+    fn a_row_from_before_the_column_says_nothing_about_who_ran_it() {
+        // Rather than "human", which would be a guess written as a fact — and
+        // a file that has been through the v2 migration is full of them.
+        let library = library();
+        library.started(run()).expect("it records");
+        library
+            .with(|connection| {
+                connection
+                    .execute("UPDATE query_history SET issuer = NULL", [])
+                    .map_err(translate)
+            })
+            .expect("it is cleared");
+        assert_eq!(
+            library.search(&Search::newest(1)).expect("it reads")[0].issuer,
+            None
+        );
+    }
+
+    #[test]
+    fn a_file_at_v1_gains_the_column_rather_than_being_rebuilt() {
+        // What the migration list is for: a file this build has never seen is
+        // brought forward, and what was in it is still in it.
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("library.db");
+        let old = Sqlite::open(&path).expect("it opens");
+        old.add(template("kept")).expect("it saves");
+        old.started(run()).expect("it records");
+        // Back to v1, and without the column: what a build from before this
+        // one would have left behind.
+        old.with(|connection| {
+            connection
+                .execute_batch(
+                    "ALTER TABLE query_history DROP COLUMN issuer; PRAGMA user_version = 1;",
+                )
+                .map_err(translate)
+        })
+        .expect("it is rolled back");
+        drop(old);
+
+        let now = Sqlite::open(&path).expect("it opens again");
+        assert_eq!(now.version().expect("a version"), Sqlite::latest_version());
+        assert_eq!(now.templates().expect("listed").len(), 1);
+        let held = now.search(&Search::newest(10)).expect("it reads");
+        assert_eq!(held.len(), 1, "the runs are still there");
+        assert_eq!(held[0].issuer, None);
     }
 
     #[test]

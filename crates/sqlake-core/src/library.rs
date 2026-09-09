@@ -108,6 +108,46 @@ pub struct RunStart {
     pub driver: DriverKind,
     pub sql: String,
     pub started_at: OffsetDateTime,
+    pub issuer: Issuer,
+}
+
+/// Who asked for a statement to be run.
+///
+/// One history holds both, which is the point: when something unexpected has
+/// happened to the data, there is one place to look and the answer to "was
+/// that me?" is in it. Not a name — this client has no idea who is at the
+/// keyboard — but which side of the socket the request came from, which is the
+/// half it can actually know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Issuer {
+    /// Somebody at this terminal.
+    #[default]
+    Human,
+    /// Something on the socket: an agent, or a one-shot command.
+    Agent,
+}
+
+impl Issuer {
+    /// The word the file keeps, which outlives the build that wrote it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+        }
+    }
+
+    /// And back. An unknown word is `None` rather than a guess: a later build
+    /// may write one this does not know, and reading it as "human" would be
+    /// the one answer that is never worth inventing.
+    #[must_use]
+    pub fn named(word: &str) -> Option<Self> {
+        match word {
+            "human" => Some(Self::Human),
+            "agent" => Some(Self::Agent),
+            _ => None,
+        }
+    }
 }
 
 /// How a run ended, and what it cost.
@@ -248,6 +288,9 @@ impl Search {
 pub struct HistoryEntry {
     pub id: RunId,
     pub connection: String,
+    /// `None` for a row written before this build, or by a later one whose
+    /// word for it this does not know.
+    pub issuer: Option<Issuer>,
     pub driver: Option<DriverKind>,
     pub sql: String,
     pub started_at: OffsetDateTime,

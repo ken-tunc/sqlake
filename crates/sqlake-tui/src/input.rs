@@ -1882,6 +1882,7 @@ mod tests {
                     sqlake_core::library::HistoryEntry {
                         id: sqlake_core::library::RunId::new(1),
                         connection: conn.to_string(),
+                        issuer: Some(sqlake_core::library::Issuer::Human),
                         driver: Some(DriverKind::Mock),
                         sql: "select * from public.users".to_owned(),
                         started_at: time::OffsetDateTime::UNIX_EPOCH,
