@@ -434,6 +434,17 @@ CREATE TABLE templates (
   "the expensive one I decided against" is a thing people go looking for, and a statement that
   vanished from the history the moment the budget stopped it would look like one nobody typed.
 
+Two questions M8 deliberately did not answer, kept here because the file goes on growing while
+they are open:
+
+- **Whether a history is ever pruned.** A few hundred bytes a run, so a year of heavy use is a
+  few megabytes — the honest answer may be that it is not a question yet. `pinned` is a column
+  nothing writes, put there for the day it is.
+- **What to do about a password in a statement.** `CREATE ROLE … PASSWORD` is recorded like
+  everything else. Redacting on the way in needs this client to know which statements carry
+  secrets, which is a parser it does not have; redacting on the way out leaves the file holding
+  what the screen refuses to show. What protects it today is that the file is the owner's alone.
+
 ---
 
 ## 13. Testing
@@ -459,7 +470,7 @@ asks about — the reasoning is in `tests/conformance.rs`.
 | **M5 — Table definitions** ✅ | — | Done. `crates/` and `git log` are the record |
 | **M6** | Proxy settings (feature 6) | `command` tunnels, HTTP proxy |
 | **M7 — SQL templates** ✅ | — | Done. `crates/` and `git log` are the record |
-| **M8** | Query history (feature 8) | FTS search, re-run, promote to template |
+| **M8 — Query history** ✅ | — | Done. `crates/` and `git log` are the record |
 
 The agent surface (§8) runs as a track alongside these rather than after them, because each
 of its parts becomes possible at a different point:
@@ -467,10 +478,12 @@ of its parts becomes possible at a different point:
 | # | Lands after | Content |
 | --- | --- | --- |
 | **A1** | M2 | Read-only CLI and socket API — **built**. Needs no terminal, and exercises `sqlake-app` through a second front-end while the interactive client is still half-written |
-| **A2** | M4 | Query execution over the API, where `ApprovedQuery` and the byte budget arrive |
-| **A3** | A2 | MCP server |
+| **A2** | M4 | Query execution over the API — **built** |
+| **A3** | A2 | MCP server — **built** |
 
-Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
+Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M7 → M8**, with **M6** left
+until last. It was deferred deliberately rather than skipped: nothing in M7 or M8 needed a
+tunnel, and a proxy is the one feature whose absence is obvious the moment somebody needs it.
 
 ---
 
