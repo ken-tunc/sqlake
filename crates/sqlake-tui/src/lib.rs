@@ -18,6 +18,7 @@ pub mod definition;
 pub mod detail;
 pub mod editor;
 pub mod grid;
+pub mod history;
 pub mod hit;
 pub mod input;
 pub mod intent;

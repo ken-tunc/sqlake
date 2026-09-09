@@ -219,8 +219,9 @@ What that mechanism does not cover:
   entry needs a key binding, and the menu itself does too — for those terminals it does not
   exist. `every_menu_entry_has_a_key_binding` is what enforces it; the coverage sweep alone
   cannot, because it only ever clicks the menu's first line.
-- `Ctrl-p` opens the palette of saved statements, `Ctrl-s` keeps the one in the buffer, and `e`
-  opens `$EDITOR`; see `KEYMAP`.
+- `Ctrl-p` opens the palette of saved statements, `Ctrl-s` keeps the one in the buffer, `Ctrl-r`
+  opens the history — the key a shell searches its own with — and `e` opens `$EDITOR`; see
+  `KEYMAP`. Not `Ctrl-h`: terminals send it for `Backspace`.
 
 ---
 

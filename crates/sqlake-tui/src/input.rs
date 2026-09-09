@@ -140,6 +140,16 @@ pub const KEYMAP: &[KeyBinding] = &[
         context: Context::Filter,
         kind: IntentKind::Filter,
     },
+    // `Ctrl-r` for the history, which is the key a shell searches its own with
+    // — and a chord rather than a letter because the pane it opens is a search
+    // box, so a letter would be the first thing typed into it as often as it
+    // opened it. Not `Ctrl-h`: terminals send that for `Backspace`, which is
+    // why it is already the backwards half of `Tab`.
+    KeyBinding {
+        keys: &[KeyCombo::ctrl(KeyCode::Char('r'))],
+        context: Context::Global,
+        kind: IntentKind::History,
+    },
     // `Ctrl-p`, which design.md §6 has reserved for this since before there
     // was anything to put in it. A chord rather than a letter because it has
     // to work while a SQL tab has the keyboard, which is where somebody wants
@@ -602,6 +612,12 @@ impl InputContext<'_> {
             .is_some_and(|(top, left, bottom, right)| top != bottom || left != right)
     }
 
+    /// The history's search box, when its tab is the one in front.
+    fn searching(&self) -> Option<&Filter> {
+        let tab = self.active_tab?;
+        self.tabs.iter().find(|t| t.id == tab)?.searching()
+    }
+
     /// The context a keystroke is read in. A modal takes the keyboard over
     /// entirely, which is why `Esc` can mean two different things without
     /// being ambiguous.
@@ -613,7 +629,14 @@ impl InputContext<'_> {
             // deliberately and typed into, and a dialog on top of it is
             // something that has to be answered first.
             Context::Palette
-        } else if self.filter.is_some_and(|f| f.editing) {
+        // Whichever box is in front owns the keyboard. The explorer's search
+        // can be left open behind the history tab, and a keystroke that went
+        // to it would be typed into something nobody is looking at — while the
+        // box in front sat there apparently ignoring it.
+        } else if match self.searching() {
+            Some(history) => history.editing,
+            None => self.filter.is_some_and(|f| f.editing),
+        } {
             Context::Filter
         } else {
             match self.focus {
@@ -1280,7 +1303,15 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
             .map(|_| vec![ViewCmd::ToggleDetail.into()])
             .unwrap_or_default(),
         IntentKind::DismissModal => vec![ViewCmd::DismissModal.into()],
-        IntentKind::Filter => vec![ViewCmd::SetFilter(next_filter(event, ctx)).into()],
+        // Whichever box is in front. The history's when its tab is open,
+        // because that pane is a search with rows under it; the explorer's
+        // otherwise. One capability either way — a key that searched the
+        // explorer from inside the history would be searching what somebody
+        // is not looking at.
+        IntentKind::Filter => match ctx.searching() {
+            Some(box_) => vec![ViewCmd::SetHistoryTerms(next_filter(event, Some(box_))).into()],
+            None => vec![ViewCmd::SetFilter(next_filter(event, ctx.filter)).into()],
+        },
 
         IntentKind::Connect => ctx
             .connectable_profile()
@@ -1392,12 +1423,10 @@ fn materialise(kind: IntentKind, event: KeyEvent, ctx: &InputContext<'_>) -> Vec
         IntentKind::Quit => vec![Action::Quit.into()],
         IntentKind::Palette => palette(event, ctx),
         IntentKind::UseTemplate => use_template(ctx),
-        // No key yet: the pane it belongs to is T2's, and a key that searched
-        // a history nothing draws would be one that does nothing visible.
-        // `IntentKind::of` still has to name it, which is what makes that
-        // pane's bindings a compile-time question rather than something to
-        // remember.
-        IntentKind::History => Vec::new(),
+        IntentKind::History => ctx
+            .connection
+            .map(|conn| vec![ViewCmd::OpenHistoryTab { conn }.into()])
+            .unwrap_or_default(),
         IntentKind::SaveTemplate => save_template(ctx),
         IntentKind::DeleteTemplate => delete_template(ctx),
     }
@@ -1552,8 +1581,8 @@ fn templates<'a>(ctx: &InputContext<'a>) -> Option<&'a [Template]> {
 /// both are ways of saying "done", and a filter that outlived its box would
 /// hide rows with nothing on screen to explain why. `Backspace` on an empty
 /// box closes it too, which is where the user's fingers already are.
-fn next_filter(event: KeyEvent, ctx: &InputContext<'_>) -> Option<Filter> {
-    let Some(current) = ctx.filter else {
+fn next_filter(event: KeyEvent, current: Option<&Filter>) -> Option<Filter> {
+    let Some(current) = current else {
         // No search yet, so this is the `/` that starts one — and `/` is a
         // character the box would otherwise have taken as its first letter.
         return Some(Filter::opening());
@@ -2098,6 +2127,73 @@ mod tests {
         assert_eq!(
             on_mouse(Target::Backdrop, Gesture::Click, &f.ctx(PaneId::Grid)),
             [Intent::View(ViewCmd::DismissModal)]
+        );
+    }
+
+    #[test]
+    fn typing_in_the_history_searches_the_history_and_not_the_explorer() {
+        // One capability, two boxes. A key that searched the explorer from
+        // inside the history would be searching what nobody is looking at.
+        let mut f = fixture();
+        let history = TabId::new(60);
+        f.tabs.push(OpenTab {
+            id: history,
+            conn: f.conn,
+            content: TabContent::History {
+                filter: Filter::opening(),
+            },
+        });
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(history);
+
+        let out = on_key(press(KeyCode::Char('o')), &c);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Intent::View(ViewCmd::SetHistoryTerms(Some(box_)))] if box_.text == "o"
+            ),
+            "{out:?}"
+        );
+
+        // And with a tab that is not the history in front, the same key is the
+        // explorer's.
+        let mut elsewhere = f.ctx(PaneId::Grid);
+        elsewhere.active_tab = Some(TabId::new(1));
+        elsewhere.filter = Some(&f.searches[0]);
+        assert!(matches!(
+            on_key(press(KeyCode::Char('o')), &elsewhere).as_slice(),
+            [Intent::View(ViewCmd::SetFilter(_))]
+        ));
+    }
+
+    #[test]
+    fn the_box_in_front_owns_the_keyboard() {
+        // The explorer's search can be left open behind the history tab. A
+        // keystroke that reached it would be typed into something nobody is
+        // looking at, while the box in front sat there apparently ignoring it.
+        let mut f = fixture();
+        let history = TabId::new(61);
+        f.tabs.push(OpenTab {
+            id: history,
+            conn: f.conn,
+            content: TabContent::History {
+                filter: Filter {
+                    text: String::new(),
+                    editing: false,
+                },
+            },
+        });
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(history);
+        // Editing, and behind the history tab.
+        c.filter = Some(&f.searches[0]);
+
+        // `q` is the explorer box's letter only while that box has the
+        // keyboard. In front of a history tab whose own box is closed, it is
+        // the global binding again.
+        assert_eq!(
+            on_key(press(KeyCode::Char('q')), &c),
+            [Intent::App(Action::Quit)]
         );
     }
 

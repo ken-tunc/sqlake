@@ -177,6 +177,19 @@ pub enum ViewCmd {
     /// Which section of the open definition is drawn, by position in its own
     /// list. `delta` moves; `at` picks.
     SelectSection(SectionPick),
+    /// Open the history, focused, with its search box ready to type in.
+    ///
+    /// `conn` is where a statement picked out of it would go, which is the
+    /// only thing a history tab needs one for.
+    OpenHistoryTab {
+        conn: ConnId,
+    },
+    /// What the history's search box holds, or `None` to close it.
+    ///
+    /// The whole box each time, for the reason [`ViewCmd::SetFilter`] carries
+    /// the whole string: the key that changed it is the only thing that knows
+    /// what it did.
+    SetHistoryTerms(Option<crate::ui::Filter>),
     /// Open an empty SQL tab on a connection, focused.
     OpenSqlTab {
         conn: ConnId,
@@ -303,7 +316,10 @@ impl IntentKind {
                 ViewCmd::ScrollToStart(_) | ViewCmd::ScrollToEnd(_) => Self::ScrollEdge,
                 ViewCmd::ScrollXBy { .. } => Self::ScrollHorizontally,
                 ViewCmd::SelectTreeRow(_) | ViewCmd::MoveTreeSelection(_) => Self::TreeSelection,
-                ViewCmd::SetFilter(_) => Self::Filter,
+                // One capability, two boxes: searching what is in front of
+                // you. Which box a keystroke reaches is a fact about which
+                // pane is open, not about what the key is for.
+                ViewCmd::SetFilter(_) | ViewCmd::SetHistoryTerms(_) => Self::Filter,
                 ViewCmd::SelectCell { .. } | ViewCmd::MoveCellSelection { .. } => {
                     Self::GridSelection
                 }
@@ -322,6 +338,7 @@ impl IntentKind {
                 ViewCmd::OpenTab { .. } => Self::PreviewTable,
                 ViewCmd::OpenDefinition { .. } => Self::DescribeTable,
                 ViewCmd::SelectSection(_) => Self::SelectSection,
+                ViewCmd::OpenHistoryTab { .. } => Self::History,
                 ViewCmd::OpenSqlTab { .. } => Self::OpenSqlTab,
                 ViewCmd::SelectTab(_) => Self::SelectTab,
                 ViewCmd::CloseTab(_) => Self::CloseTab,
