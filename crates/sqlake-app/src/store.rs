@@ -13,10 +13,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use time::OffsetDateTime;
+
 use sqlake_core::capability::{Capabilities, DriverKind};
 use sqlake_core::driver::Driver;
 use sqlake_core::id::{ConnId, ProfileId, QueryId};
-use sqlake_core::library::{Library, LibraryResult, Template};
+use sqlake_core::library::{
+    Library, LibraryError, LibraryResult, RunId, RunOutcome, RunStart, Template,
+};
 use sqlake_core::node::{NodeRef, TableRef};
 use sqlake_core::profile::{ProfileSummary, Profiles};
 use sqlake_core::result::{PageRequest, Sort, SortDir};
@@ -187,6 +191,7 @@ impl Store {
             budget,
             library,
             templates: TemplatesView::default(),
+            runs: HashMap::new(),
             events: event_tx,
             conns: Vec::new(),
             previews: Vec::new(),
@@ -241,6 +246,17 @@ impl Store {
     }
 }
 
+/// A run's history row, which may not exist yet.
+///
+/// The row is written on a blocking task and a fast query can finish before
+/// that task lands. Without somewhere to hold the outcome, the fast queries —
+/// the ordinary ones — would be the ones the history never says the end of.
+#[derive(Debug)]
+enum Recording {
+    Starting(Option<RunOutcome>),
+    Row(RunId),
+}
+
 #[derive(Debug)]
 enum Event {
     Connected {
@@ -272,6 +288,14 @@ enum Event {
         table: TableRef,
         busy: BusyId,
         result: AppResult<sqlake_core::detail::TableDetail>,
+    },
+    /// A run's history row exists, and this is its id.
+    ///
+    /// Its own event because the row is written on a blocking task and the
+    /// query may finish first — which is what [`Recording`] is for.
+    Recorded {
+        query: QueryId,
+        result: LibraryResult<RunId>,
     },
     /// The library answered, and the answer is always the whole list: a write
     /// is followed by a read in the same trip to the file, because another
@@ -415,6 +439,11 @@ struct Runtime {
     /// call on it goes through `spawn_blocking`.
     library: Option<Arc<dyn Library>>,
     templates: TemplatesView,
+    /// The history row each running query is being kept in.
+    ///
+    /// Not in the snapshot: a `RunId` is bookkeeping between this store and a
+    /// file, and no front-end has anything to do with one.
+    runs: HashMap<QueryId, Recording>,
     events: mpsc::UnboundedSender<Event>,
     conns: Vec<Conn>,
     previews: Vec<Preview>,
@@ -1047,7 +1076,10 @@ impl Runtime {
             needs_approval: None,
             data: LoadState::Loading,
             failed_at: None,
+            started_at: Instant::now(),
+            took: None,
         });
+        self.record_start(id, conn_id, &sql);
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running a query");
         let events = self.events.clone();
@@ -1101,7 +1133,10 @@ impl Runtime {
             needs_approval: None,
             data: LoadState::Loading,
             failed_at: None,
+            started_at: Instant::now(),
+            took: None,
         });
+        self.record_start(id, conn_id, &sql);
 
         let busy = self.begin_busy(BusyOwner::Query(id), "estimating a query");
         let events = self.events.clone();
@@ -1164,6 +1199,14 @@ impl Runtime {
             return;
         };
         query.data = LoadState::Loading;
+        // A second run, so a second row: the first is the one that was refused
+        // and is still true. Its timing starts again here — a duration counted
+        // from before the dialog would be however long somebody took to read
+        // it.
+        query.started_at = Instant::now();
+        query.took = None;
+        let sql = query.sql.clone();
+        self.record_start(id, conn_id, &sql);
 
         let busy = self.begin_busy(BusyOwner::Query(id), "running an approved query");
         let events = self.events.clone();
@@ -1183,12 +1226,36 @@ impl Runtime {
             return;
         };
         query.failed_at = None;
-        match result {
+        query.took = Some(query.started_at.elapsed());
+        let duration_ms = u64::try_from(query.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let outcome = match result {
             Ok(RunQueryOutput::Ran { estimate, result }) => {
                 query.estimate = Some(estimate);
+                let rows = result.rows.len();
                 query.data = LoadState::Ready(Arc::new(PagedResult::new(&result)));
+                RunOutcome::Ok {
+                    duration_ms,
+                    row_count: Some(rows as u64),
+                    // What the statement was *estimated* to cost is not what it
+                    // cost, and writing an estimate into a column called
+                    // `bytes_processed` would be a number nobody could tell
+                    // apart from a measurement.
+                    bytes_processed: None,
+                }
             }
             Ok(RunQueryOutput::NeedsApproval(over)) => {
+                // The estimate and the ceiling it exceeded, in bytes. Read
+                // back out of the history, "5.2 GB against a 1 GB budget" is
+                // the whole of why the run did not happen.
+                let message = format!(
+                    "over the budget: {} against {} bytes",
+                    match over.estimate {
+                        Estimate::Bytes(bytes) => format!("{bytes} bytes"),
+                        Estimate::Cost(cost) => format!("a plan cost of {cost}"),
+                        Estimate::Unknown => "an unknown cost".to_owned(),
+                    },
+                    over.budget
+                );
                 query.estimate = Some(over.estimate);
                 query.needs_approval = Some(Arc::new(*over));
                 // Not `Loading`: nothing is on its way, and a spinner over a
@@ -1196,12 +1263,25 @@ impl Runtime {
                 // itself. `Idle` is "not requested", which is what this is
                 // until somebody says yes.
                 query.data = LoadState::Idle;
+                // Nothing ran, and nothing went wrong. Saying so is what makes
+                // "the expensive one I decided against" findable later —
+                // approving it writes a second row, which is the run.
+                RunOutcome::Refused {
+                    duration_ms,
+                    message,
+                }
             }
             Err(err) => {
                 query.failed_at = err.at();
-                query.data = LoadState::Failed(err.user_message());
+                let message = err.user_message();
+                query.data = LoadState::Failed(message.clone());
+                RunOutcome::Failed {
+                    duration_ms,
+                    message,
+                }
             }
-        }
+        };
+        self.record_end(id, outcome);
     }
 
     fn forget_query(&mut self, id: QueryId) {
@@ -1286,6 +1366,98 @@ impl Runtime {
     /// more, which is what that flag says.
     ///
     /// [`Capabilities::cancel`]: sqlake_core::capability::Capabilities::cancel
+    /// Write the row that says this statement was sent.
+    ///
+    /// Before it has an answer, so that the query somebody is waiting on — the
+    /// one they are most likely to go looking for — is in the history while
+    /// they wait. Nothing here is on the path of the query itself: the write
+    /// is a blocking task of its own, and a library that refuses only costs a
+    /// line in the log.
+    fn record_start(&mut self, query: QueryId, conn: ConnId, sql: &str) {
+        let (Some(library), Some(driver)) = (
+            self.library.clone(),
+            self.conns.iter().find(|c| c.id == conn).map(|c| c.kind),
+        ) else {
+            return;
+        };
+        self.runs.insert(query, Recording::Starting(None));
+
+        let events = self.events.clone();
+        let run = RunStart {
+            connection: conn,
+            driver,
+            sql: sql.to_owned(),
+            started_at: OffsetDateTime::now_utc(),
+        };
+        // Not a `spawn_task`: it has no busy row, because it is not something
+        // anybody asked for or would cancel. The query it describes has one.
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || library.started(run))
+                .await
+                .unwrap_or_else(|why| Err(LibraryError::Failed(why.to_string())));
+            let _ = events.send(Event::Recorded { query, result });
+        });
+    }
+
+    fn recorded(&mut self, query: QueryId, result: LibraryResult<RunId>) {
+        let row = match result {
+            Ok(row) => row,
+            Err(why) => {
+                // Said once, in the log. A history that could not be written
+                // is not a reason to interrupt somebody reading a result.
+                tracing::warn!(query = %query.short(), "not recorded: {why}");
+                self.runs.remove(&query);
+                return;
+            }
+        };
+        match self.runs.remove(&query) {
+            // The query finished before the row existed. Now it does, so the
+            // outcome that was waiting for it can be written.
+            Some(Recording::Starting(Some(outcome))) => self.write_outcome(row, outcome),
+            Some(Recording::Starting(None)) => {
+                self.runs.insert(query, Recording::Row(row));
+            }
+            // Forgotten while the row was being written — the tab was closed.
+            // The row stays, unsettled, which is what it is: a statement that
+            // was sent and whose end nobody kept.
+            Some(Recording::Row(_)) | None => {}
+        }
+    }
+
+    /// Record how a run ended, or hold the answer until its row exists.
+    fn record_end(&mut self, query: QueryId, outcome: RunOutcome) {
+        match self.runs.remove(&query) {
+            Some(Recording::Row(row)) => self.write_outcome(row, outcome),
+            Some(Recording::Starting(_)) => {
+                self.runs.insert(query, Recording::Starting(Some(outcome)));
+            }
+            None => {}
+        }
+    }
+
+    fn write_outcome(&self, row: RunId, outcome: RunOutcome) {
+        let Some(library) = self.library.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let settled = tokio::task::spawn_blocking(move || library.settled(row, outcome)).await;
+            if let Ok(Err(why)) = settled {
+                tracing::warn!(run = %row, "not settled: {why}");
+            }
+        });
+    }
+
+    /// How long a run took, from the moment the store dispatched it.
+    ///
+    /// Monotonic rather than wall clock: a clock that steps back over a
+    /// running query would otherwise record a negative duration as a very
+    /// large one.
+    fn ran_for(&self, query: QueryId) -> u64 {
+        self.queries.iter().find(|q| q.id == query).map_or(0, |q| {
+            u64::try_from(q.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
+    }
+
     /// Every library operation is a write, then a read, on one blocking task.
     ///
     /// The read happens even when nothing was written, and even when the write
@@ -1418,9 +1590,25 @@ impl Runtime {
                 }
             }
             BusyOwner::Query(id) => {
+                let duration_ms = self.ran_for(*id);
                 if let Some(query) = self.queries.iter_mut().find(|q| q.id == *id) {
                     query.data = LoadState::Failed(reason.to_owned());
+                    query.took = Some(query.started_at.elapsed());
                 }
+                // Stopped on purpose is not the same as gone wrong, and a
+                // history that files the first under the second reports
+                // somebody's own decisions as failures.
+                self.record_end(
+                    *id,
+                    if reason == CANCELLED {
+                        RunOutcome::Cancelled { duration_ms }
+                    } else {
+                        RunOutcome::Failed {
+                            duration_ms,
+                            message: reason.to_owned(),
+                        }
+                    },
+                );
             }
             BusyOwner::Definition { conn, table } => {
                 if let Some(definition) = self
@@ -1505,6 +1693,7 @@ impl Runtime {
                 wrote,
                 result,
             } => self.library_answered(busy, wrote, result),
+            Event::Recorded { query, result } => self.recorded(query, result),
         }
     }
 
@@ -1984,6 +2173,223 @@ mod tests {
         })
         .await;
         assert_eq!(saved(&snap), ["kept"]);
+    }
+
+    /// A store with a library this test can read back, and the handle to it.
+    fn store_recording() -> (Store, Arc<sqlake_library::Sqlite>) {
+        let library = Arc::new(sqlake_library::Sqlite::in_memory().expect("a library opens"));
+        let store = Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour::instant()))),
+                Arc::new(MockProfiles::default()),
+            )
+            .library(Arc::clone(&library) as Arc<dyn Library>),
+        );
+        (store, library)
+    }
+
+    /// The history, once the writes behind it have landed.
+    ///
+    /// Recording is deliberately off the path of the query — it is a task with
+    /// no busy row, because nobody asked for it and nobody would cancel it —
+    /// so a settled snapshot does not mean the row is written yet.
+    async fn history(
+        library: &sqlake_library::Sqlite,
+        done: impl Fn(&[sqlake_core::library::HistoryEntry]) -> bool,
+    ) -> Vec<sqlake_core::library::HistoryEntry> {
+        for _ in 0..200 {
+            let held = library.history(10).expect("it reads");
+            if done(&held) {
+                return held;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the history never said what was expected");
+    }
+
+    #[tokio::test]
+    async fn a_run_leaves_a_row_saying_what_it_did() {
+        let (store, library) = store_recording();
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+                max_bytes: None,
+            },
+            |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+
+        let held = history(&library, |h| h.first().is_some_and(|e| e.status.is_some())).await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].sql, "select * from public.users");
+        assert_eq!(held[0].status.as_deref(), Some("ok"));
+        assert!(held[0].row_count.is_some_and(|rows| rows > 0));
+        assert_eq!(held[0].driver, Some(DriverKind::Mock));
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_failed_is_recorded_as_one() {
+        // The failures are half of what a history is for: in a personal tool
+        // they are the part somebody goes back to.
+        let (library, store) = {
+            let library = Arc::new(sqlake_library::Sqlite::in_memory().expect("a library opens"));
+            let store = Store::spawn(
+                Wiring::new(
+                    Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
+                        failing_sql: vec!["boom".to_owned()],
+                        ..Behaviour::instant()
+                    }))),
+                    Arc::new(MockProfiles::default()),
+                )
+                .library(Arc::clone(&library) as Arc<dyn Library>),
+            );
+            (library, store)
+        };
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select boom".to_owned(),
+                max_rows: None,
+                max_bytes: None,
+            },
+            |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+
+        let held = history(&library, |h| h.first().is_some_and(|e| e.status.is_some())).await;
+        assert_eq!(held[0].status.as_deref(), Some("error"));
+        assert!(held[0].error.is_some(), "{:?}", held[0]);
+    }
+
+    #[tokio::test]
+    async fn a_query_over_the_budget_is_recorded_as_refused_and_the_run_after_it_as_a_run() {
+        // Two rows for one statement, which is what happened: one attempt that
+        // was costed and stopped, and one that ran.
+        let library = Arc::new(sqlake_library::Sqlite::in_memory().expect("a library opens"));
+        let store = Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(
+                    MockDriver::new(Behaviour {
+                        estimate_bytes: 5_000,
+                        ..Behaviour::instant()
+                    })
+                    .with_capabilities(sqlake_driver_mock::ESTIMATES),
+                )),
+                Arc::new(MockProfiles::default()),
+            )
+            .budget(Some(10))
+            .library(Arc::clone(&library) as Arc<dyn Library>),
+        );
+        let (store, conn) = connected(store).await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+                max_bytes: None,
+            },
+            |s| s.query(id).is_some_and(|q| q.needs_approval.is_some()),
+        )
+        .await;
+        assert!(snap.query(id).expect("a query").needs_approval.is_some());
+
+        let refused = history(&library, |h| h.first().is_some_and(|e| e.status.is_some())).await;
+        assert_eq!(refused[0].status.as_deref(), Some("refused"));
+        assert!(
+            refused[0]
+                .error
+                .as_deref()
+                .is_some_and(|why| why.contains("5000")),
+            "{:?}",
+            refused[0]
+        );
+
+        settled(&store, Action::ApproveQuery(id), |s| {
+            s.query(id).is_some_and(QueryView::is_settled)
+        })
+        .await;
+        let both = history(&library, |h| h.len() == 2 && h[0].status.is_some()).await;
+        assert_eq!(both[0].status.as_deref(), Some("ok"));
+        assert_eq!(both[1].status.as_deref(), Some("refused"));
+    }
+
+    #[tokio::test]
+    async fn a_query_somebody_stopped_is_not_filed_under_failures() {
+        // Cancelling is a decision, not a fault. A history that reports one as
+        // the other is a history that says the user's own choices went wrong.
+        let library = Arc::new(sqlake_library::Sqlite::in_memory().expect("a library opens"));
+        let store = Store::spawn(
+            Wiring::new(
+                Drivers::new().with(Arc::new(MockDriver::new(Behaviour {
+                    query_latency: Duration::from_secs(30),
+                    ..Behaviour::instant()
+                }))),
+                Arc::new(MockProfiles::default()),
+            )
+            .library(Arc::clone(&library) as Arc<dyn Library>),
+        );
+        let (store, conn) = connected(store).await;
+
+        let id = QueryId::new();
+        store.dispatch(Action::RunQuery {
+            conn,
+            query: id,
+            sql: "select * from public.users".to_owned(),
+            max_rows: None,
+            max_bytes: None,
+        });
+        let snap = until(&store, |s| {
+            s.busy
+                .iter()
+                .any(|b| matches!(b.owner, BusyOwner::Query(q) if q == id))
+        })
+        .await;
+        let busy = snap
+            .busy
+            .iter()
+            .find(|b| matches!(b.owner, BusyOwner::Query(q) if q == id))
+            .expect("the query's own row")
+            .id;
+
+        store.dispatch(Action::Cancel(busy));
+        until(&store, |s| s.query(id).is_some_and(QueryView::is_settled)).await;
+
+        let held = history(&library, |h| h.first().is_some_and(|e| e.status.is_some())).await;
+        assert_eq!(held[0].status.as_deref(), Some("cancelled"));
+        assert_eq!(held[0].error, None, "nothing went wrong");
+    }
+
+    #[tokio::test]
+    async fn a_session_keeping_nothing_still_runs_queries() {
+        // The library is where history goes, not something a query needs.
+        let (store, conn) = connected_store().await;
+        let id = QueryId::new();
+        let snap = settled(
+            &store,
+            Action::RunQuery {
+                conn,
+                query: id,
+                sql: "select * from public.users".to_owned(),
+                max_rows: None,
+                max_bytes: None,
+            },
+            |s| s.query(id).is_some_and(QueryView::is_settled),
+        )
+        .await;
+        assert!(snap.query(id).expect("a query").data.ready().is_some());
     }
 
     fn preview_of<'a>(snap: &'a Snapshot, conn: ConnId, table: &TableRef) -> &'a PreviewView {

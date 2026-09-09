@@ -21,8 +21,8 @@ use time::OffsetDateTime;
 
 use sqlake_core::capability::DriverKind;
 use sqlake_core::library::{
-    Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart, Template,
-    TemplateId,
+    HistoryEntry, Library, LibraryError, LibraryResult, NewTemplate, RunId, RunOutcome, RunStart,
+    Template, TemplateId,
 };
 
 use crate::error::{taken, translate};
@@ -263,6 +263,35 @@ impl Library for Sqlite {
         })
     }
 
+    fn history(&self, limit: usize) -> LibraryResult<Vec<HistoryEntry>> {
+        self.with(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, connection_id, driver, sql, started_at, status, duration_ms, \
+                     row_count, bytes_processed, error FROM query_history \
+                     ORDER BY started_at DESC, id DESC LIMIT ?1",
+                )
+                .map_err(translate)?;
+            let rows = statement
+                .query_map([count(limit as u64)], |row| {
+                    Ok(HistoryEntry {
+                        id: RunId::new(row.get(0)?),
+                        connection: row.get(1)?,
+                        driver: driver(&row.get::<_, String>(2)?),
+                        sql: row.get(3)?,
+                        started_at: moment(row.get(4)?),
+                        status: row.get(5)?,
+                        duration_ms: row.get::<_, Option<i64>>(6)?.map(unsign),
+                        row_count: row.get::<_, Option<i64>>(7)?.map(unsign),
+                        bytes_processed: row.get::<_, Option<i64>>(8)?.map(unsign),
+                        error: row.get(9)?,
+                    })
+                })
+                .map_err(translate)?;
+            rows.collect::<Result<_, _>>().map_err(translate)
+        })
+    }
+
     fn settled(&self, id: RunId, outcome: RunOutcome) -> LibraryResult<()> {
         // Widened to `i64` because that is the only integer SQLite has, and
         // a `u64` this client would have to have counted more rows than the
@@ -273,7 +302,9 @@ impl Library for Sqlite {
                 bytes_processed,
                 ..
             } => (row_count.map(count), bytes_processed.map(count), None),
-            RunOutcome::Failed { message, .. } => (None, None, Some(message.clone())),
+            RunOutcome::Failed { message, .. } | RunOutcome::Refused { message, .. } => {
+                (None, None, Some(message.clone()))
+            }
             RunOutcome::Cancelled { .. } => (None, None, None),
         };
         self.with(|connection| {
@@ -319,6 +350,12 @@ fn restrict(path: &Path) -> LibraryResult<()> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path) -> LibraryResult<()> {
     Ok(())
+}
+
+/// Back from the only integer SQLite has. A negative one is a file somebody
+/// edited by hand, and zero is a better answer than a number near `u64::MAX`.
+fn unsign(of: i64) -> u64 {
+    u64::try_from(of).unwrap_or(0)
 }
 
 /// Now, at the precision the file keeps.
@@ -665,6 +702,13 @@ mod tests {
                 "error",
             ),
             (RunOutcome::Cancelled { duration_ms: 7 }, "cancelled"),
+            (
+                RunOutcome::Refused {
+                    duration_ms: 2,
+                    message: "over the budget".to_owned(),
+                },
+                "refused",
+            ),
         ] {
             let id = library.started(run()).expect("it records");
             library.settled(id, outcome).expect("it settles");
@@ -681,6 +725,60 @@ mod tests {
                 .expect("the row is there");
             assert_eq!(status, expected);
         }
+    }
+
+    #[test]
+    fn the_history_reads_back_what_was_written() {
+        let library = library();
+        let id = library.started(run()).expect("it records");
+        library
+            .settled(
+                id,
+                RunOutcome::Ok {
+                    duration_ms: 42,
+                    row_count: Some(7),
+                    bytes_processed: None,
+                },
+            )
+            .expect("it settles");
+
+        let held = library.history(10).expect("it reads");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, id);
+        assert_eq!(held[0].sql, "select 1");
+        assert_eq!(held[0].driver, Some(DriverKind::Mock));
+        assert_eq!(held[0].status.as_deref(), Some("ok"));
+        assert_eq!(held[0].duration_ms, Some(42));
+        assert_eq!(held[0].row_count, Some(7));
+        assert_eq!(held[0].bytes_processed, None);
+    }
+
+    #[test]
+    fn a_running_query_is_in_the_history_with_no_end_on_it() {
+        let library = library();
+        library.started(run()).expect("it records");
+        let held = library.history(10).expect("it reads");
+        assert_eq!(held[0].status, None);
+        assert_eq!(held[0].duration_ms, None);
+    }
+
+    #[test]
+    fn the_newest_run_is_first() {
+        let library = library();
+        for sql in ["first", "second"] {
+            library
+                .started(RunStart {
+                    sql: sql.to_owned(),
+                    ..run()
+                })
+                .expect("it records");
+        }
+        let held = library.history(10).expect("it reads");
+        // Same millisecond, so the id is what breaks the tie — and it has to,
+        // or two runs a second apart from each other read back in either
+        // order.
+        assert_eq!(held[0].sql, "second");
+        assert_eq!(held[1].sql, "first");
     }
 
     #[test]
