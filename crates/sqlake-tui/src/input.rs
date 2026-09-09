@@ -629,9 +629,14 @@ impl InputContext<'_> {
             // deliberately and typed into, and a dialog on top of it is
             // something that has to be answered first.
             Context::Palette
-        } else if self.filter.is_some_and(|f| f.editing)
-            || self.searching().is_some_and(|f| f.editing)
-        {
+        // Whichever box is in front owns the keyboard. The explorer's search
+        // can be left open behind the history tab, and a keystroke that went
+        // to it would be typed into something nobody is looking at — while the
+        // box in front sat there apparently ignoring it.
+        } else if match self.searching() {
+            Some(history) => history.editing,
+            None => self.filter.is_some_and(|f| f.editing),
+        } {
             Context::Filter
         } else {
             match self.focus {
@@ -2159,6 +2164,37 @@ mod tests {
             on_key(press(KeyCode::Char('o')), &elsewhere).as_slice(),
             [Intent::View(ViewCmd::SetFilter(_))]
         ));
+    }
+
+    #[test]
+    fn the_box_in_front_owns_the_keyboard() {
+        // The explorer's search can be left open behind the history tab. A
+        // keystroke that reached it would be typed into something nobody is
+        // looking at, while the box in front sat there apparently ignoring it.
+        let mut f = fixture();
+        let history = TabId::new(61);
+        f.tabs.push(OpenTab {
+            id: history,
+            conn: f.conn,
+            content: TabContent::History {
+                filter: Filter {
+                    text: String::new(),
+                    editing: false,
+                },
+            },
+        });
+        let mut c = f.ctx(PaneId::Grid);
+        c.active_tab = Some(history);
+        // Editing, and behind the history tab.
+        c.filter = Some(&f.searches[0]);
+
+        // `q` is the explorer box's letter only while that box has the
+        // keyboard. In front of a history tab whose own box is closed, it is
+        // the global binding again.
+        assert_eq!(
+            on_key(press(KeyCode::Char('q')), &c),
+            [Intent::App(Action::Quit)]
+        );
     }
 
     #[test]
