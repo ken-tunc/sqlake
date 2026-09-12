@@ -36,7 +36,7 @@ than reuse — which is what the peer relationship in architecture §2 is protec
 Modelled on herdr: a long-lived process holding session state, a socket API against it, and
 thin noun-verb subcommands over that API.
 
-Built, as of A3:
+Built — the whole of it, as of M8:
 
 ```
 sqlake                          launch the TUI (unchanged)
@@ -49,8 +49,8 @@ sqlake connection list
 sqlake connection open|close    against a session that outlives the command
 sqlake schema list              namespaces in a connection
 sqlake table list|preview|describe
-sqlake template list|apply    saved statements; `apply` answers SQL and runs nothing
-sqlake history search         what this session has run, and what each run cost
+sqlake template list|apply      saved statements; `apply` answers SQL and runs nothing
+sqlake history search           what this session has run, and what each run cost
 sqlake query estimate|run|status|wait|cancel
 sqlake mcp                      speak MCP on stdio
 ```
@@ -242,13 +242,14 @@ keeps M1–M8 aligned one-to-one with the eight features.
 | # | Lands after | Content | Done when |
 | --- | --- | --- | --- |
 | **A1** | M2 | Read-only CLI and socket API — **built**, in `sqlake-api` | `connection list`, `schema list`, `table list`, `table preview`, `api snapshot`, `api schema`. JSON output with explicit truncation. Both one-shot and attached modes work against both drivers |
-| **A2** | M4 | Query execution over the API — **built** | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close`. The byte budget and `NeedsApproval`, read-only enforcement. `issuer` in history waits for M8, which is where the history table arrives |
+| **A2** | M4 | Query execution over the API — **built** | `query estimate\|run\|status\|wait\|cancel` and `connection open\|close`. The byte budget and `NeedsApproval`, read-only enforcement. `issuer` arrived with M8, which is where the history table did |
 | **A3** | A2 | MCP server — **built** | `sqlake mcp` exposes the same operations as MCP tools, generated from the same schema |
 
-Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M6 → M7 → M8.**
+Execution order: **M0 → M1 → M2 → A1 → M3 → M4 → A2 → A3 → M5 → M7 → M8**, with **M6** left
+until last.
 
-A3 sitting before M5 is a preference, not a constraint; it can slide later if the interactive
-client turns out to want the attention more.
+A3 sitting before M5 was a preference rather than a constraint. So was deferring M6: nothing
+in M5, M7 or M8 needed a tunnel.
 
 ### Why A1 lands after M2
 

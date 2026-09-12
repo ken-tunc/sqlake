@@ -183,8 +183,9 @@ The UI shows a confirmation dialog on `NeedsApproval` and calls the same use cas
 
 ## 5. Screen layout
 
-Where the layout is heading. Today's is most of it — a tree pane, a grid pane with preview and
-SQL tabs, and the cell-detail pane under it — with the definition tabs arriving in M5.
+Where the layout is heading, and what is now on screen: a tree pane, a grid pane with preview,
+SQL, definition and history tabs, and the cell-detail pane under it. The palette of saved
+statements is drawn over all of it rather than beside it, which is why it is not in the sketch.
 
 ```
 ┌ sqlake ── [● prod-pg] [○ bq-analytics] [+] ─────────────────────── ⚙ ─┐
@@ -245,8 +246,10 @@ Built: `Intent::Handover` in `sqlake-tui`, answered by `run`'s loop, over `edito
 another program has to happen between two frames, on the thread that owns the terminal, with the
 loop stopped.
 
-Still to come: recording a changed buffer as a draft in history (M8). Runs themselves are
-already recorded — M7 writes a row per statement sent.
+What a *run* leaves behind is recorded — M7 writes a row per statement sent, and M8 searches
+them. A changed buffer that was never run is not, and no milestone owns it now: the history is
+about what happened to the database, and a draft is about what somebody was in the middle of
+typing. Two different questions in one table is how the second one goes unasked.
 
 ### 7.3 Caveats
 
@@ -255,9 +258,9 @@ already recorded — M7 writes a row per statement sent.
 - Editor resolution order is `Settings::editor_program`, which states it.
 - The store task keeps running while the editor is open, so streams from running queries are
   still consumed. The display catches up on return.
-- Scratch files are per tab and rewritten from the buffer on every edit. Reloading one on
-  session restore is M8's; until then a file left by a previous session must not become the
-  contents of a tab that never had them, which is what truncating first prevents.
+- Scratch files are per tab and rewritten from the buffer on every edit. There is no session
+  restore and no milestone brings one, so a file left by a previous session must never become
+  the contents of a tab that never had them — which is what truncating first prevents.
 
 ### 7.4 What the SQL tab does own
 
